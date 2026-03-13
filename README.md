@@ -13,6 +13,8 @@
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
 
+---
+
 <h2 align="center">🐳 Now Running in Docker Sandboxes</h2>
 <p align="center">Every agent gets its own isolated container inside a micro VM.<br>Hypervisor-level isolation. Millisecond startup. No complex setup.</p>
 
