@@ -28,6 +28,8 @@ curl -fsSL https://nanoclaw.dev/install-docker-sandboxes.sh | bash
 curl -fsSL https://nanoclaw.dev/install-docker-sandboxes-windows.sh | bash
 ```
 
+<p>Currently supported on macOS (Apple Silicon) and Windows (x86). Linux support coming soon.</p>
+
 <p><a href="https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes">Read the announcement →</a></p>
 <br>
 </div>
