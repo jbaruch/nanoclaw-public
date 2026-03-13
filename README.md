@@ -18,11 +18,13 @@
 <h2>🐳 Now Running in Docker Sandboxes</h2>
 <p>Every agent gets its own isolated container inside a micro VM.<br>Hypervisor-level isolation. Millisecond startup. No complex setup.</p>
 
+**macOS (Apple Silicon)**
 ```bash
-# macOS (Apple Silicon)
 curl -fsSL https://nanoclaw.dev/install-docker-sandboxes.sh | bash
+```
 
-# Windows (WSL)
+**Windows (WSL)**
+```bash
 curl -fsSL https://nanoclaw.dev/install-docker-sandboxes-windows.sh | bash
 ```
 
