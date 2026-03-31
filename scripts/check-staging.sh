@@ -7,7 +7,7 @@
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-GROUP_FOLDER="${GROUP_FOLDER:-telegram_swarm}"
+GROUP_FOLDER="${GROUP_FOLDER:-telegram_main}"
 
 SKILLS_DIR="$NAS_PROJECT_DIR/groups/$GROUP_FOLDER/skills"
 STAGING_DIR="$NAS_PROJECT_DIR/groups/$GROUP_FOLDER/staging"

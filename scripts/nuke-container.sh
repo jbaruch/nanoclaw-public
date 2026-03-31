@@ -3,8 +3,8 @@
 # a fresh one on the next message.
 #
 # Usage:
-#   ./scripts/nuke-container.sh tg:-1003823409399
-#   ./scripts/nuke-container.sh tg:-1003712889701
+#   ./scripts/nuke-container.sh tg:-1001234567890
+#   ./scripts/nuke-container.sh tg:-1009876543210
 #
 # Does NOT touch registration or group folder — only kills the container.
 
@@ -14,7 +14,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 if [ $# -eq 0 ]; then
   echo "Usage: $0 <chat-jid>"
-  echo "Example: $0 tg:-1003823409399"
+  echo "Example: $0 tg:-1001234567890"
   exit 1
 fi
 
