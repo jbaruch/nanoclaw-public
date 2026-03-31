@@ -1,17 +1,40 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  DATA_DIR,
+  IPC_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
+import { sendPoolMessage } from './channels/telegram.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  storeMessage,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendReaction?: (
+    jid: string,
+    messageId: string | undefined,
+    emoji: string,
+  ) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    replyToMessageId?: string,
+  ) => Promise<string | void>;
+  pinMessage?: (jid: string, messageId: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -23,6 +46,7 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  nukeSession: (groupFolder: string) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -73,15 +97,100 @@ export function startIpcWatcher(deps: IpcDeps): void {
           for (const file of messageFiles) {
             const filePath = path.join(messagesDir, file);
             try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > 1_048_576) {
+                logger.warn(
+                  { file, sourceGroup, size: stat.size },
+                  'IPC file exceeds 1MB limit, moving to errors',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+                continue;
+              }
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if (
+                data.type === 'react_to_message' &&
+                data.chatJid &&
+                data.emoji &&
+                deps.sendReaction
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  await deps.sendReaction(
+                    data.chatJid,
+                    data.messageId || undefined,
+                    data.emoji,
+                  );
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      emoji: data.emoji,
+                      sourceGroup,
+                    },
+                    'IPC reaction sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC reaction attempt blocked',
+                  );
+                }
+              } else if (data.type === 'message' && data.chatJid && data.text) {
+                // Strip <internal> tags — if nothing remains, skip silently
+                const cleanText = data.text
+                  .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+                  .trim();
+                if (!cleanText) {
+                  logger.debug(
+                    { sourceGroup },
+                    'IPC message suppressed (all internal)',
+                  );
+                  fs.unlinkSync(filePath);
+                  continue;
+                }
+
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.sender && data.chatJid.startsWith('tg:')) {
+                    await sendPoolMessage(
+                      data.chatJid,
+                      cleanText,
+                      data.sender,
+                      sourceGroup,
+                    );
+                  } else {
+                    const sentMsgId = await deps.sendMessage(
+                      data.chatJid,
+                      cleanText,
+                      data.replyToMessageId,
+                    );
+                    // Pin the message if requested
+                    if (data.pin && sentMsgId && deps.pinMessage) {
+                      await deps.pinMessage(data.chatJid, sentMsgId);
+                    }
+                  }
+                  // Store bot response so heartbeat can track answered messages
+                  storeMessage({
+                    id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                    chat_jid: data.chatJid,
+                    sender: data.sender || ASSISTANT_NAME,
+                    sender_name: data.sender || ASSISTANT_NAME,
+                    content: cleanText,
+                    timestamp: new Date().toISOString(),
+                    is_from_me: true,
+                    is_bot_message: true,
+                  });
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -124,6 +233,20 @@ export function startIpcWatcher(deps: IpcDeps): void {
           for (const file of taskFiles) {
             const filePath = path.join(tasksDir, file);
             try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > 1_048_576) {
+                logger.warn(
+                  { file, sourceGroup, size: stat.size },
+                  'IPC task file exceeds 1MB limit, moving to errors',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+                continue;
+              }
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain, deps);
@@ -173,6 +296,11 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For run_host_script / github_backup / promote_staging
+    requestId?: string;
+    message?: string;
+    tileName?: string;
+    skillName?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -228,11 +356,12 @@ export async function processTaskIpc(
             break;
           }
         } else if (scheduleType === 'interval') {
+          const MIN_INTERVAL_MS = 60_000;
           const ms = parseInt(data.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
+          if (isNaN(ms) || ms < MIN_INTERVAL_MS) {
             logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid interval',
+              { scheduleValue: data.schedule_value, minMs: MIN_INTERVAL_MS },
+              'Invalid interval: must be at least 60s',
             );
             break;
           }
@@ -384,9 +513,20 @@ export async function processTaskIpc(
               break;
             }
           } else if (updatedTask.schedule_type === 'interval') {
+            const MIN_INTERVAL_MS = 60_000;
             const ms = parseInt(updatedTask.schedule_value, 10);
-            if (!isNaN(ms) && ms > 0) {
+            if (!isNaN(ms) && ms >= MIN_INTERVAL_MS) {
               updates.next_run = new Date(Date.now() + ms).toISOString();
+            } else if (!isNaN(ms)) {
+              logger.warn(
+                {
+                  taskId: data.taskId,
+                  value: updatedTask.schedule_value,
+                  minMs: MIN_INTERVAL_MS,
+                },
+                'Invalid interval in task update: must be at least 60s',
+              );
+              break;
             }
           }
         }
@@ -441,9 +581,9 @@ export async function processTaskIpc(
           );
           break;
         }
-        // Defense in depth: agent cannot set isMain via IPC.                                                                                                                                    
-        // Preserve isMain from the existing registration so IPC config                                                                                                                          
-        // updates (e.g. adding additionalMounts) don't strip the flag.                                                                                                                          
+        // Defense in depth: agent cannot set isMain via IPC.
+        // Preserve isMain from the existing registration so IPC config
+        // updates (e.g. adding additionalMounts) don't strip the flag.
         const existingGroup = registeredGroups[data.jid];
         deps.registerGroup(data.jid, {
           name: data.name,
@@ -454,10 +594,338 @@ export async function processTaskIpc(
           requiresTrigger: data.requiresTrigger,
           isMain: existingGroup?.isMain,
         });
+        // Refresh snapshot so available_groups.json reflects new trust config immediately
+        const availableGroups = deps.getAvailableGroups();
+        deps.writeGroupsSnapshot(
+          sourceGroup,
+          true,
+          availableGroups,
+          new Set(Object.keys(registeredGroups)),
+        );
       } else {
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'nuke_session':
+      if (data.groupFolder) {
+        logger.info(
+          { groupFolder: data.groupFolder, sourceGroup },
+          'Session nuke requested via IPC',
+        );
+        deps.nukeSession(sourceGroup);
+      }
+      break;
+
+    case 'run_host_script':
+      if (data.script && data.requestId) {
+        // Security: only allow .py/.js/.mjs/.sh scripts, no path traversal
+        const scriptName = path.basename(data.script);
+        const allowedExts = ['.py', '.js', '.mjs', '.sh'];
+        if (
+          scriptName !== data.script ||
+          !allowedExts.some((ext) => scriptName.endsWith(ext))
+        ) {
+          logger.warn(
+            { script: data.script, sourceGroup },
+            'Invalid host script name',
+          );
+          break;
+        }
+
+        const groupDir = path.resolve(process.cwd(), 'groups', sourceGroup);
+        const scriptPath = path.join(groupDir, 'scripts', scriptName);
+        if (!fs.existsSync(scriptPath)) {
+          logger.warn({ scriptPath, sourceGroup }, 'Host script not found');
+          // Write error result so the MCP tool doesn't hang
+          const errResultPath = path.join(
+            DATA_DIR,
+            'ipc',
+            sourceGroup,
+            'input',
+            `_script_result_${data.requestId}.json`,
+          );
+          fs.writeFileSync(
+            errResultPath,
+            JSON.stringify({ error: `Script not found: ${scriptName}` }),
+          );
+          break;
+        }
+
+        logger.info({ script: scriptName, sourceGroup }, 'Running host script');
+
+        // Run with all host env vars (credentials available on orchestrator).
+        // Scripts hardcode /workspace/group/ paths. Create a per-execution
+        // wrapper that patches those paths to the real group directory.
+        const { readEnvFile: readEnv } = await import('./env.js');
+        const allEnvVars = readEnv([
+          'TRIPIT_ICAL_URL',
+          'TRIPIT_IGNORE_TRIPS',
+          'TRIPIT_IGNORE_KEYWORDS',
+          'RECLAIM_API_TOKEN',
+          'GOOGLE_CLIENT_ID',
+          'GOOGLE_CLIENT_SECRET',
+          'GOOGLE_REFRESH_TOKEN',
+          'OPENAI_API_KEY',
+          'TRAKT_CLIENT_ID',
+          'TRAKT_CLIENT_SECRET',
+          'TRAKT_ACCESS_TOKEN',
+          'TRAKT_REFRESH_TOKEN',
+        ]);
+        const env = {
+          ...process.env,
+          ...Object.fromEntries(
+            Object.entries(allEnvVars).filter(([, v]) => v),
+          ),
+        };
+
+        // Read the script, replace /workspace/group with the real path
+        const scriptContent = fs.readFileSync(scriptPath, 'utf-8');
+        const patchedContent = scriptContent.replace(
+          /\/workspace\/group/g,
+          groupDir,
+        );
+        const tmpScript = path.join(groupDir, `.tmp_host_${scriptName}`);
+        fs.writeFileSync(tmpScript, patchedContent);
+
+        // Select runtime by extension
+        const runtime = scriptName.endsWith('.py')
+          ? 'python3'
+          : scriptName.endsWith('.sh')
+            ? 'bash'
+            : 'node';
+
+        execFile(
+          runtime,
+          [tmpScript],
+          {
+            cwd: groupDir,
+            env,
+            timeout: 120_000,
+            maxBuffer: 1024 * 1024,
+          },
+          (error, stdout, stderr) => {
+            const resultPath = path.join(
+              DATA_DIR,
+              'ipc',
+              sourceGroup,
+              'input',
+              `_script_result_${data.requestId}.json`,
+            );
+            if (error) {
+              logger.error(
+                {
+                  script: scriptName,
+                  sourceGroup,
+                  error: error.message,
+                  stderr,
+                },
+                'Host script failed',
+              );
+              fs.writeFileSync(
+                resultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                }),
+              );
+              try {
+                fs.unlinkSync(tmpScript);
+              } catch {
+                /* best effort */
+              }
+            } else {
+              logger.info(
+                { script: scriptName, sourceGroup, stdoutLen: stdout.length },
+                'Host script completed',
+              );
+              logger.info(
+                { resultPath, requestId: data.requestId },
+                'Writing script result file',
+              );
+              fs.writeFileSync(
+                resultPath,
+                JSON.stringify({ stdout, stderr: stderr || undefined }),
+              );
+              logger.info(
+                {
+                  resultPath,
+                  exists: fs.existsSync(resultPath),
+                  size: fs.statSync(resultPath).size,
+                },
+                'Script result file written',
+              );
+            }
+            // Clean up temp script
+            try {
+              fs.unlinkSync(tmpScript);
+            } catch {
+              /* best effort */
+            }
+          },
+        );
+      }
+      break;
+
+    case 'github_backup':
+      if (data.requestId) {
+        const backupDir = path.join(
+          process.cwd(),
+          'groups',
+          sourceGroup,
+          'backup-repo',
+        );
+        const resultPath = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'input',
+          `_script_result_${data.requestId}.json`,
+        );
+
+        if (!fs.existsSync(backupDir)) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({ error: `backup-repo not found at ${backupDir}` }),
+          );
+          break;
+        }
+
+        const commitMsg =
+          data.message || `backup: ${new Date().toISOString().split('T')[0]}`;
+        logger.info(
+          { sourceGroup, backupDir, commitMsg },
+          'Running github_backup',
+        );
+
+        // Read GitHub token for push auth
+        const { readEnvFile: readBackupEnv } = await import('./env.js');
+        const backupEnvVars = readBackupEnv(['GITHUB_TOKEN']);
+        const ghToken = backupEnvVars.GITHUB_TOKEN;
+
+        execFile(
+          'bash',
+          [
+            '-c',
+            `cd "${backupDir}" && git add -A && git diff --cached --quiet && echo '{"stdout":"Nothing to commit."}' || (git commit -m "${commitMsg.replace(/"/g, '\\"')}" && git push && echo '{"stdout":"Committed and pushed."}')`,
+          ],
+          {
+            timeout: 60_000,
+            maxBuffer: 1024 * 1024,
+            env: {
+              ...process.env,
+              ...(ghToken
+                ? {
+                    GIT_ASKPASS: 'echo',
+                    GIT_TERMINAL_PROMPT: '0',
+                    GITHUB_TOKEN: ghToken,
+                    GIT_CONFIG_COUNT: '1',
+                    GIT_CONFIG_KEY_0:
+                      'url.https://x-access-token:' +
+                      ghToken +
+                      '@github.com/.insteadOf',
+                    GIT_CONFIG_VALUE_0: 'https://github.com/',
+                  }
+                : {}),
+            },
+          },
+          (error, stdout, stderr) => {
+            if (error) {
+              logger.error(
+                { sourceGroup, error: error.message, stderr },
+                'github_backup failed',
+              );
+              fs.writeFileSync(
+                resultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                }),
+              );
+            } else {
+              // stdout is the JSON echo from the bash script
+              try {
+                const parsed = JSON.parse(stdout.trim().split('\n').pop()!);
+                fs.writeFileSync(resultPath, JSON.stringify(parsed));
+              } catch {
+                fs.writeFileSync(
+                  resultPath,
+                  JSON.stringify({ stdout: stdout.trim() }),
+                );
+              }
+              logger.info({ sourceGroup }, 'github_backup completed');
+            }
+          },
+        );
+      }
+      break;
+
+    case 'promote_staging':
+      if (data.requestId && data.tileName && data.skillName) {
+        if (!isMain) {
+          logger.warn({ sourceGroup }, 'Unauthorized promote_staging attempt');
+          break;
+        }
+
+        const promoteResultPath = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'input',
+          `_script_result_${data.requestId}.json`,
+        );
+
+        const promoteScript = path.join(
+          process.cwd(),
+          'scripts',
+          'promote-from-orchestrator.sh',
+        );
+
+        if (!fs.existsSync(promoteScript)) {
+          fs.writeFileSync(
+            promoteResultPath,
+            JSON.stringify({ error: 'promote-from-orchestrator.sh not found' }),
+          );
+          break;
+        }
+
+        logger.info(
+          { sourceGroup, tileName: data.tileName, skillName: data.skillName },
+          'Running promote_staging',
+        );
+
+        execFile(
+          'bash',
+          [promoteScript, sourceGroup, data.tileName, data.skillName],
+          { timeout: 300_000, maxBuffer: 5 * 1024 * 1024 },
+          (error, stdout, stderr) => {
+            if (error) {
+              logger.error(
+                {
+                  sourceGroup,
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                },
+                'promote_staging failed',
+              );
+              fs.writeFileSync(
+                promoteResultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                }),
+              );
+            } else {
+              logger.info({ sourceGroup }, 'promote_staging completed');
+              fs.writeFileSync(
+                promoteResultPath,
+                JSON.stringify({ stdout: stdout.trim() }),
+              );
+            }
+          },
         );
       }
       break;

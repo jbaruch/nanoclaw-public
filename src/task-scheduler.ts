@@ -187,13 +187,19 @@ async function runTask(
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
-          scheduleClose();
+          // Strip <internal> tags — suppress entirely if nothing remains
+          const cleanResult = streamedOutput.result
+            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+            .trim();
+          if (cleanResult) {
+            await deps.sendMessage(task.chat_jid, cleanResult);
+          }
+          // Don't close here — agent may still be polling for host script results.
+          // Close only on final 'success' status below.
         }
         if (streamedOutput.status === 'success') {
           deps.queue.notifyIdle(task.chat_jid);
-          scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
+          scheduleClose();
         }
         if (streamedOutput.status === 'error') {
           error = streamedOutput.error || 'Unknown error';
@@ -262,6 +268,15 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
           continue;
+        }
+
+        // Pre-advance next_run before dispatch to prevent double-fire on crash.
+        const claimedNextRun = computeNextRun(currentTask);
+        if (claimedNextRun !== null) {
+          updateTask(currentTask.id, { next_run: claimedNextRun });
+        } else {
+          // once-task: mark completed before dispatch
+          updateTask(currentTask.id, { status: 'completed' });
         }
 
         deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>

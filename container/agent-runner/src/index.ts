@@ -29,6 +29,7 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  replyToMessageId?: string;
 }
 
 interface ContainerOutput {
@@ -36,6 +37,7 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  streamText?: string;
 }
 
 interface SessionEntry {
@@ -275,14 +277,17 @@ function shouldClose(): boolean {
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
  */
+const REPLY_TO_FILE = path.join(IPC_INPUT_DIR, '_reply_to');
+
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
+      .filter(f => f.endsWith('.json') && !f.startsWith('_script_result_'))
       .sort();
 
     const messages: string[] = [];
+    let latestReplyTo: string | undefined;
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
@@ -290,11 +295,18 @@ function drainIpcInput(): string[] {
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
           messages.push(data.text);
+          if (data.replyToMessageId) {
+            latestReplyTo = data.replyToMessageId;
+          }
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
       }
+    }
+    // Write the latest replyToMessageId so the MCP server can pick it up
+    if (latestReplyTo) {
+      try { fs.writeFileSync(REPLY_TO_FILE, latestReplyTo); } catch { /* ignore */ }
     }
     return messages;
   } catch (err) {
@@ -368,12 +380,20 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  // Streaming preview: accumulate assistant text and emit throttled
+  let streamingTextAccum = '';
+  let lastStreamEmit = 0;
+  const STREAM_THROTTLE_MS = 300;
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
+
+  // Rules are loaded by the SDK via the tessl chain: CLAUDE.md → AGENTS.md → .tessl/RULES.md
+  // For untrusted groups, the orchestrator copies .tessl from a main group's session.
 
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
@@ -423,8 +443,30 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            ...(containerInput.replyToMessageId
+              ? { NANOCLAW_REPLY_TO_MESSAGE_ID: containerInput.replyToMessageId }
+              : {}),
           },
         },
+        ...(process.env.COMPOSIO_API_KEY
+          ? {
+              composio: {
+                type: 'http' as const,
+                url: 'https://connect.composio.dev/mcp',
+                headers: {
+                  'x-consumer-api-key': process.env.COMPOSIO_API_KEY,
+                },
+              },
+            }
+          : {}),
+        ...(fs.existsSync('/home/node/.tessl/api-credentials.json')
+          ? {
+              tessl: {
+                command: 'tessl',
+                args: ['mcp', 'start'],
+              },
+            }
+          : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
@@ -437,6 +479,22 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Extract text content for streaming preview
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+      if (content) {
+        const text = content
+          .filter((c) => c.type === 'text' && c.text)
+          .map((c) => c.text!)
+          .join('');
+        if (text) {
+          streamingTextAccum = text;
+          const now = Date.now();
+          if (now - lastStreamEmit >= STREAM_THROTTLE_MS) {
+            writeOutput({ status: 'success', result: null, streamText: streamingTextAccum, newSessionId });
+            lastStreamEmit = now;
+          }
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -582,7 +640,20 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      let queryResult;
+      try {
+        queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      } catch (resumeErr) {
+        const msg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+        if (sessionId && /session|conversation not found|resume/i.test(msg)) {
+          log(`Session resume failed (${msg}), retrying with fresh session`);
+          sessionId = undefined;
+          resumeAt = undefined;
+          queryResult = await runQuery(prompt, undefined, mcpServerPath, containerInput, sdkEnv, undefined);
+        } else {
+          throw resumeErr;
+        }
+      }
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }

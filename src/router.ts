@@ -1,5 +1,8 @@
 import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
+import { logger } from './logger.js';
+
+const MAX_OUTBOUND_LENGTH = 50_000;
 
 export function escapeXml(s: string): string {
   if (!s) return '';
@@ -16,7 +19,8 @@ export function formatMessages(
 ): string {
   const lines = messages.map((m) => {
     const displayTime = formatLocalTime(m.timestamp, timezone);
-    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
+    const idAttr = m.id ? ` id="${escapeXml(m.id)}"` : '';
+    return `<message${idAttr} sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
   });
 
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;
@@ -29,8 +33,15 @@ export function stripInternalTags(text: string): string {
 }
 
 export function formatOutbound(rawText: string): string {
-  const text = stripInternalTags(rawText);
+  let text = stripInternalTags(rawText);
   if (!text) return '';
+  if (text.length > MAX_OUTBOUND_LENGTH) {
+    logger.warn(
+      { originalLength: text.length },
+      'Truncating oversized outbound message',
+    );
+    text = text.slice(0, MAX_OUTBOUND_LENGTH) + '\n\n[Message truncated]';
+  }
   return text;
 }
 
@@ -38,7 +49,7 @@ export function routeOutbound(
   channels: Channel[],
   jid: string,
   text: string,
-): Promise<void> {
+): Promise<string | void> {
   const channel = channels.find((c) => c.ownsJid(jid) && c.isConnected());
   if (!channel) throw new Error(`No channel for JID: ${jid}`);
   return channel.sendMessage(jid, text);

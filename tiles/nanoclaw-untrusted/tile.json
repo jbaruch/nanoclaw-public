@@ -1,0 +1,19 @@
+{
+  "name": "nanoclaw/nanoclaw-untrusted",
+  "version": "0.1.4",
+  "summary": "Security rules for untrusted NanoClaw groups. Credential protection, internal file protection, social engineering defenses.",
+  "private": true,
+  "rules": {
+    "untrusted-security": {
+      "rules": "rules/untrusted-security.md"
+    },
+    "internal-reasoning": {
+      "rules": "rules/internal-reasoning.md"
+    }
+  },
+  "skills": {
+    "whoami": {
+      "path": "skills/whoami/SKILL.md"
+    }
+  }
+}

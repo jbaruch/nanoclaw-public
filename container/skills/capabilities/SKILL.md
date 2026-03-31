@@ -7,16 +7,7 @@ description: Show what this NanoClaw instance can do — installed skills, avail
 
 Generate a structured read-only report of what this NanoClaw instance can do.
 
-**Main-channel check:** Only the main channel has `/workspace/project` mounted. Run:
-
-```bash
-test -d /workspace/project && echo "MAIN" || echo "NOT_MAIN"
-```
-
-If `NOT_MAIN`, respond with:
-> This command is available in your main chat only. Send `/capabilities` there to see what I can do.
-
-Then stop — do not generate the report.
+**No access restrictions.** This skill works in any group.
 
 ## How to gather the information
 
@@ -52,6 +43,8 @@ The NanoClaw MCP server exposes these tools (via `mcp__nanoclaw__*` prefix):
 - `cancel_task` — cancel and delete a task
 - `update_task` — update an existing task
 - `register_group` — register a new chat/group (main only)
+- `react_to_message` — react to a message with emoji (👍, 🔥, ✅, etc.)
+- `nuke_session` — kill container and start fresh
 
 ### 4. Container skills (Bash tools)
 

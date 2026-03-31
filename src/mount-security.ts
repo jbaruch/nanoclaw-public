@@ -173,6 +173,13 @@ function findAllowedRoot(
   allowedRoots: AllowedRoot[],
 ): AllowedRoot | null {
   for (const root of allowedRoots) {
+    if (!root.path || typeof root.path !== 'string') {
+      console.warn(
+        'mount-security: skipping allowedRoot with missing or invalid path:',
+        JSON.stringify(root),
+      );
+      continue;
+    }
     const expandedRoot = expandPath(root.path);
     const realRoot = getRealPath(expandedRoot);
 
@@ -244,6 +251,14 @@ export function validateMount(
     };
   }
 
+  // Guard against missing hostPath (e.g. malformed config stored in DB)
+  if (!mount.hostPath) {
+    return {
+      allowed: false,
+      reason: `Mount entry is missing required "hostPath" field`,
+    };
+  }
+
   // Derive containerPath from hostPath basename if not specified
   const containerPath = mount.containerPath || path.basename(mount.hostPath);
 
@@ -284,6 +299,7 @@ export function validateMount(
     return {
       allowed: false,
       reason: `Path "${realPath}" is not under any allowed root. Allowed roots: ${allowlist.allowedRoots
+        .filter((r) => r.path)
         .map((r) => expandPath(r.path))
         .join(', ')}`,
     };

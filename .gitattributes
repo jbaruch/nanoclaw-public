@@ -1,0 +1,6 @@
+# When merging from public fork into private fork, always keep private's version
+# of these personalized files. Set up with: git config merge.ours.driver true
+groups/global/SOUL.md merge=ours
+groups/global/CLAUDE.md merge=ours
+groups/main/CLAUDE.md merge=ours
+tiles/nanoclaw-admin/** merge=ours

@@ -10,25 +10,29 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
+  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
+  HOST_GID,
+  HOST_PROJECT_ROOT,
+  HOST_UID,
   IDLE_TIMEOUT,
-  ONECLI_URL,
+  TILE_OWNER,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { OneCLI } from '@onecli-sh/sdk';
+import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
-
-const onecli = new OneCLI({ url: ONECLI_URL });
+import { readEnvFile } from './env.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -43,6 +47,7 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  replyToMessageId?: string;
 }
 
 export interface ContainerOutput {
@@ -50,6 +55,7 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  streamText?: string;
 }
 
 interface VolumeMount {
@@ -58,65 +64,69 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+/**
+ * Translate a local container path to a host path for docker -v arguments.
+ * In Docker-out-of-Docker, the orchestrator's filesystem (/app/...) differs
+ * from the host's (HOST_PROJECT_ROOT/...). Mount paths must use host paths.
+ */
+function toHostPath(localPath: string): string {
+  const projectRoot = process.cwd();
+  if (HOST_PROJECT_ROOT === projectRoot) return localPath; // running directly on host
+  const rel = path.relative(projectRoot, localPath);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return localPath; // outside project
+  return path.join(HOST_PROJECT_ROOT, rel);
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
-  const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
 
-  if (isMain) {
-    // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .claude/) are mounted separately below.
-    // Read-only prevents the agent from modifying host application code
-    // (src/, dist/, package.json, etc.) which would bypass the sandbox
-    // entirely on next restart.
-    mounts.push({
-      hostPath: projectRoot,
-      containerPath: '/workspace/project',
-      readonly: true,
-    });
+  // Group folder mount. Untrusted groups get read-only (disk exhaustion protection).
+  mounts.push({
+    hostPath: toHostPath(groupDir),
+    containerPath: '/workspace/group',
+    readonly: !isMain && !group.containerConfig?.trusted,
+  });
 
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Credentials are injected by the OneCLI gateway, never exposed to containers.
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
+  // Global memory directory (SOUL.md, shared CLAUDE.md).
+  // All groups get this — main used to get it via /workspace/project, but that mount
+  // was removed for NAS. Now mounted explicitly for everyone.
+  const globalDir = path.join(GROUPS_DIR, 'global');
+  if (fs.existsSync(globalDir)) {
+    mounts.push({
+      hostPath: toHostPath(globalDir),
+      containerPath: '/workspace/global',
+      readonly: !isMain, // main can update global memory, others read-only
+    });
+  }
+
+  // Shared trusted directory — writable space for trusted containers.
+  if (isMain || group.containerConfig?.trusted) {
+    const trustedDir = path.join(process.cwd(), 'trusted');
+    if (fs.existsSync(trustedDir)) {
       mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
-
-    // Main also gets its group folder as the working directory
-    mounts.push({
-      hostPath: groupDir,
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-  } else {
-    // Other groups only get their own folder
-    mounts.push({
-      hostPath: groupDir,
-      containerPath: '/workspace/group',
-      readonly: false,
-    });
-
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
+        hostPath: toHostPath(trustedDir),
+        containerPath: '/workspace/trusted',
+        readonly: false,
       });
     }
   }
 
+  // Store directory (messages.db) — read-only access for all groups.
+  // Needed for heartbeat checks (unanswered messages, stuck tasks, DB size).
+  const storeDir = path.join(process.cwd(), 'store');
+  if (fs.existsSync(storeDir)) {
+    mounts.push({
+      hostPath: toHostPath(storeDir),
+      containerPath: '/workspace/store',
+      readonly: true,
+    });
+  }
+
   // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
@@ -125,21 +135,20 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
+  // Always write — settings may have changed (model, memory, teams)
+  {
     fs.writeFileSync(
       settingsFile,
       JSON.stringify(
         {
           env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+            CLAUDE_CODE_MODEL: 'claude-opus-4-6',
+            CLAUDE_CODE_MAX_CONTEXT_WINDOW: '1000000',
             CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
             CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+            // Disable auto-memory for untrusted groups to prevent persistent injection
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY:
+              isMain || group.containerConfig?.trusted ? '0' : '1',
           },
         },
         null,
@@ -148,69 +157,150 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  // Tile delivery — all host-side, no tessl CLI in containers.
+  // Build .tessl structure and skills/ from tiles/ directory (checked into git).
+  // Main/trusted get all tiles. Others get nanoclaw-core only.
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
+  if (fs.existsSync(skillsDst)) {
+    fs.rmSync(skillsDst, { recursive: true, force: true });
+  }
+  fs.mkdirSync(skillsDst, { recursive: true });
+
+  const dstTessl = path.join(groupSessionsDir, '.tessl');
+  if (fs.existsSync(dstTessl)) {
+    fs.rmSync(dstTessl, { recursive: true, force: true });
+  }
+
+  // Tiles come from the tessl registry (installed by orchestrator).
+  // Main/trusted: all tiles. Others: nanoclaw-core only.
+  const trustedTiles = [
+    'nanoclaw-core',
+    'nanoclaw-admin',
+    // reclaim-tripit-sync removed — sync runs host-side via run_host_script
+  ];
+  const untrustedTiles = ['nanoclaw-core', 'nanoclaw-untrusted'];
+  const tilesToInstall =
+    isMain || group.containerConfig?.trusted ? trustedTiles : untrustedTiles;
+
+  const registryTiles = path.join(
+    process.cwd(),
+    'tessl-workspace',
+    '.tessl',
+    'tiles',
+    TILE_OWNER,
+  );
+  const rulesContent: string[] = [];
+  for (const tileName of tilesToInstall) {
+    const tileSrc = path.join(registryTiles, tileName);
+    if (!fs.existsSync(tileSrc)) {
+      logger.warn(
+        { tileName, path: tileSrc },
+        'Tile not found — run tessl install in orchestrator',
+      );
+      continue;
+    }
+
+    const dstTileDir = path.join(dstTessl, 'tiles', TILE_OWNER, tileName);
+
+    // Copy rules
+    const rulesDir = path.join(tileSrc, 'rules');
+    if (fs.existsSync(rulesDir)) {
+      for (const ruleFile of fs.readdirSync(rulesDir)) {
+        if (!ruleFile.endsWith('.md')) continue;
+        const ruleSrcFile = path.join(rulesDir, ruleFile);
+        const ruleDst = path.join(dstTileDir, 'rules', ruleFile);
+        fs.mkdirSync(path.dirname(ruleDst), { recursive: true });
+        fs.cpSync(ruleSrcFile, ruleDst);
+        rulesContent.push(fs.readFileSync(ruleSrcFile, 'utf8'));
+      }
+    }
+
+    // Copy skills and their scripts
+    const tileSkillsDir = path.join(tileSrc, 'skills');
+    if (fs.existsSync(tileSkillsDir)) {
+      for (const skillDir of fs.readdirSync(tileSkillsDir)) {
+        const skillSrcDir = path.join(tileSkillsDir, skillDir);
+        if (!fs.statSync(skillSrcDir).isDirectory()) continue;
+        fs.cpSync(skillSrcDir, path.join(dstTileDir, 'skills', skillDir), {
+          recursive: true,
+        });
+        fs.cpSync(skillSrcDir, path.join(skillsDst, `tessl__${skillDir}`), {
+          recursive: true,
+        });
+        // Copy bundled scripts to group's scripts/ dir (used by run_host_script)
+        const skillScriptsDir = path.join(skillSrcDir, 'scripts');
+        if (fs.existsSync(skillScriptsDir)) {
+          const groupScriptsDir = path.join(groupDir, 'scripts');
+          fs.mkdirSync(groupScriptsDir, { recursive: true });
+          for (const scriptFile of fs.readdirSync(skillScriptsDir)) {
+            fs.cpSync(
+              path.join(skillScriptsDir, scriptFile),
+              path.join(groupScriptsDir, scriptFile),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // Write aggregated RULES.md
+  if (rulesContent.length > 0) {
+    fs.mkdirSync(dstTessl, { recursive: true });
+    fs.writeFileSync(
+      path.join(dstTessl, 'RULES.md'),
+      rulesContent.join('\n\n---\n\n'),
+    );
+  }
+
+  // Built-in container skills (agent-browser, status, etc.)
+  const builtinSkillsDir = path.join(process.cwd(), 'container', 'skills');
+  if (fs.existsSync(builtinSkillsDir)) {
+    for (const skillDir of fs.readdirSync(builtinSkillsDir)) {
+      const srcDir = path.join(builtinSkillsDir, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      fs.cpSync(srcDir, path.join(skillsDst, skillDir), { recursive: true });
+    }
+  }
+
+  // Agent-created skills (staging) — override tile skills if names collide
+  const groupSkillsDir = path.join(groupDir, 'skills');
+  if (fs.existsSync(groupSkillsDir)) {
+    for (const skillDir of fs.readdirSync(groupSkillsDir)) {
+      const srcDir = path.join(groupSkillsDir, skillDir);
+      if (!fs.statSync(srcDir).isDirectory()) continue;
+      fs.cpSync(srcDir, path.join(skillsDst, skillDir), { recursive: true });
     }
   }
   mounts.push({
-    hostPath: groupSessionsDir,
+    hostPath: toHostPath(groupSessionsDir),
     containerPath: '/home/node/.claude',
     readonly: false,
   });
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
+  // Per-group IPC namespace
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // Chown IPC dirs so container user can read/write/unlink files
+  const ipcUid = HOST_UID ?? 1000;
+  const ipcGid = HOST_GID ?? 1000;
+  if (ipcUid !== 0) {
+    try {
+      for (const sub of ['', 'messages', 'tasks', 'input']) {
+        fs.chownSync(path.join(groupIpcDir, sub), ipcUid, ipcGid);
+      }
+    } catch (err) {
+      logger.warn({ folder: group.folder, err }, 'Failed to chown IPC dirs');
+    }
+  }
   mounts.push({
-    hostPath: groupIpcDir,
+    hostPath: toHostPath(groupIpcDir),
     containerPath: '/workspace/ipc',
     readonly: false,
   });
 
-  // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
-  if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
-    const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
-    if (needsCopy) {
-      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
-    }
-  }
-  mounts.push({
-    hostPath: groupAgentRunnerDir,
-    containerPath: '/app/src',
-    readonly: false,
-  });
-
-  // Additional mounts validated against external allowlist (tamper-proof from containers)
+  // Additional mounts validated against external allowlist
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
       group.containerConfig.additionalMounts,
@@ -223,41 +313,86 @@ function buildVolumeMounts(
   return mounts;
 }
 
-async function buildContainerArgs(
+function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-  agentIdentifier?: string,
-): Promise<string[]> {
+  group: RegisteredGroup,
+  isMain: boolean,
+  replyToMessageId?: string,
+): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Resource limits for untrusted containers
+  if (!isMain && !group.containerConfig?.trusted) {
+    args.push(
+      '--memory',
+      '512m', // 512MB RAM hard limit
+      '--memory-swap',
+      '512m', // no swap
+      '--cpus',
+      '1', // 1 CPU core
+      '--pids-limit',
+      '256', // prevent fork bombs
+    );
+    // Group folder is read-only for untrusted (set above).
+    // Agent can read CLAUDE.md/skills but can't write 7GB of numbers.
+  }
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
-  if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
+  // Credential tiers:
+  //   Main/Trusted: Composio only (handles Gmail, Calendar, Tasks, GitHub via OAuth)
+  //   Other:        nothing (Anthropic via proxy only)
+  //
+  // All other credentials (GITHUB_TOKEN, GOOGLE_*, RECLAIM_*, TRIPIT_*, OPENAI_*)
+  // stay on the host. Scripts that need them run host-side via IPC.
+  const isTrusted = group.containerConfig?.trusted === true;
+
+  const CONTAINER_VARS = ['COMPOSIO_API_KEY'];
+
+  const varsToForward = isMain || isTrusted ? CONTAINER_VARS : [];
+
+  const envFromFile = readEnvFile(CONTAINER_VARS);
+  for (const varName of varsToForward) {
+    const value = process.env[varName] || envFromFile[varName];
+    if (value) {
+      args.push('-e', `${varName}=${value}`);
+    }
+  }
+
+  // Pass reply-to message ID so the first IPC send_message appears as a Telegram reply
+  if (replyToMessageId) {
+    args.push('-e', `NANOCLAW_REPLY_TO_MESSAGE_ID=${replyToMessageId}`);
+  }
+
+  // Route API traffic through the credential proxy (containers never see real secrets)
+  args.push(
+    '-e',
+    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+  );
+
+  // Mirror the host's auth method with a placeholder value.
+  // API key mode: SDK sends x-api-key, proxy replaces with real key.
+  // OAuth mode:   SDK exchanges placeholder token for temp API key,
+  //               proxy injects real OAuth token on that exchange request.
+  const authMode = detectAuthMode();
+  if (authMode === 'api-key') {
+    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
-    logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
-    );
+    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
   // Run as host user so bind-mounted files are accessible.
-  // Skip when running as root (uid 0), as the container's node user (uid 1000),
-  // or when getuid is unavailable (native Windows without WSL).
-  const hostUid = process.getuid?.();
-  const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
+  // In DooD, process.getuid() returns the orchestrator container's uid (1000),
+  // not the actual host user. HOST_UID/HOST_GID override this.
+  const effectiveUid = HOST_UID ?? process.getuid?.();
+  const effectiveGid = HOST_GID ?? process.getgid?.();
+  if (effectiveUid != null && effectiveUid !== 0 && effectiveUid !== 1000) {
+    args.push('--user', `${effectiveUid}:${effectiveGid}`);
     args.push('-e', 'HOME=/home/node');
   }
 
@@ -285,17 +420,29 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
+  // Clean up stale _reply_to file from previous container runs.
+  // Scheduled tasks have no replyToMessageId — a leftover file would
+  // cause the MCP server to quote a random old message.
+  const replyToFile = path.join(
+    resolveGroupIpcPath(group.folder),
+    'input',
+    '_reply_to',
+  );
+  try {
+    fs.unlinkSync(replyToFile);
+  } catch {
+    /* file doesn't exist — fine */
+  }
+
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  // Main group uses the default OneCLI agent; others use their own agent.
-  const agentIdentifier = input.isMain
-    ? undefined
-    : group.folder.toLowerCase().replace(/_/g, '-');
-  const containerArgs = await buildContainerArgs(
+  const containerArgs = buildContainerArgs(
     mounts,
     containerName,
-    agentIdentifier,
+    group,
+    input.isMain,
+    input.replyToMessageId,
   );
 
   logger.debug(
@@ -420,7 +567,13 @@ export async function runContainerAgent(
 
     let timedOut = false;
     let hadStreamingOutput = false;
-    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    // Untrusted containers get shorter timeout (5 min vs 30 min default)
+    const UNTRUSTED_TIMEOUT = 300_000;
+    const defaultTimeout =
+      input.isMain || group.containerConfig?.trusted
+        ? CONTAINER_TIMEOUT
+        : UNTRUSTED_TIMEOUT;
+    const configTimeout = group.containerConfig?.timeout || defaultTimeout;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
     const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
@@ -702,6 +855,8 @@ export interface AvailableGroup {
   name: string;
   lastActivity: string;
   isRegistered: boolean;
+  containerConfig?: import('./types.js').RegisteredGroup['containerConfig'];
+  requiresTrigger?: boolean;
 }
 
 /**
@@ -722,10 +877,22 @@ export function writeGroupsSnapshot(
   const visibleGroups = isMain ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
+
+  // Preserve JID-keyed entries that agents may have written
+  let existing: Record<string, unknown> = {};
+  if (fs.existsSync(groupsFile)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(groupsFile, 'utf-8'));
+    } catch {
+      existing = {};
+    }
+  }
+
   fs.writeFileSync(
     groupsFile,
     JSON.stringify(
       {
+        ...existing,
         groups: visibleGroups,
         lastSync: new Date().toISOString(),
       },

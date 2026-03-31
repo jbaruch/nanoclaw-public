@@ -2,13 +2,43 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
+
+/** Hostname containers use to reach the host machine. */
+export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+
+/**
+ * Address the credential proxy binds to.
+ * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
+ * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
+ *   falling back to 0.0.0.0 if the interface isn't found.
+ */
+export const PROXY_BIND_HOST =
+  process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
+
+function detectProxyBindHost(): string {
+  if (os.platform() === 'darwin') return '127.0.0.1';
+
+  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
+  // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
+  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
+
+  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
+  const ifaces = os.networkInterfaces();
+  const docker0 = ifaces['docker0'];
+  if (docker0) {
+    const ipv4 = docker0.find((a) => a.family === 'IPv4');
+    if (ipv4) return ipv4.address;
+  }
+  return '0.0.0.0';
+}
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
@@ -27,12 +57,14 @@ export function readonlyMountArgs(
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/** Stop a container by name. Uses execFileSync to avoid shell injection. */
+/** Stop a container by name. Uses spawnSync with args array to avoid shell injection. */
 export function stopContainer(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
-  execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
+  spawnSync(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', name], {
+    stdio: 'pipe',
+  });
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
@@ -78,10 +110,12 @@ export function ensureContainerRuntimeRunning(): void {
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
+    const result = spawnSync(
+      CONTAINER_RUNTIME_BIN,
+      ['ps', '--filter', 'name=nanoclaw-', '--format', '{{.Names}}'],
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
+    const output = result.stdout;
     const orphans = output.trim().split('\n').filter(Boolean);
     for (const name of orphans) {
       try {

@@ -1,0 +1,31 @@
+{
+  "name": "nanoclaw/nanoclaw-admin",
+  "version": "0.1.0",
+  "summary": "Admin rules and skills for the NanoClaw main channel. Group management, agent teams, task scheduling, and system health. Only loaded for the main (elevated) channel. Add your own skills here.",
+  "private": true,
+  "rules": {
+    "admin-context": {
+      "rules": "rules/admin-context.md"
+    },
+    "skill-tile-placement": {
+      "rules": "rules/skill-tile-placement.md"
+    }
+  },
+  "skills": {
+    "manage-groups": {
+      "path": "skills/manage-groups/SKILL.md"
+    },
+    "create-agent-team": {
+      "path": "skills/create-agent-team/SKILL.md"
+    },
+    "schedule-task": {
+      "path": "skills/schedule-task/SKILL.md"
+    },
+    "check-system-health": {
+      "path": "skills/check-system-health/SKILL.md"
+    },
+    "verify-tiles": {
+      "path": "skills/verify-tiles/SKILL.md"
+    }
+  }
+}
