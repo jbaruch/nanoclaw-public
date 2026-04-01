@@ -4,3 +4,4 @@ groups/global/SOUL.md merge=ours
 groups/global/CLAUDE.md merge=ours
 groups/main/CLAUDE.md merge=ours
 tiles/nanoclaw-admin/** merge=ours
+Dockerfile.orchestrator merge=ours
