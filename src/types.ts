@@ -103,6 +103,13 @@ export interface Channel {
   reactToLatestMessage?(jid: string, emoji: string): Promise<void>;
   // Optional: pin a message in the chat.
   pinMessage?(jid: string, messageId: string): Promise<void>;
+  // Optional: send a file to the chat.
+  sendFile?(
+    jid: string,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: string,
+  ): Promise<void>;
   // Optional: create a draft stream for progressive message display.
   createDraftStream?(
     jid: string,

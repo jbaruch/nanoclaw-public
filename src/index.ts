@@ -816,6 +816,11 @@ async function main(): Promise<void> {
       if (!channel) return;
       await channel.pinMessage?.(jid, messageId);
     },
+    sendFile: async (jid, filePath, caption, replyToMessageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) return;
+      await channel.sendFile?.(jid, filePath, caption, replyToMessageId);
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {
