@@ -7,6 +7,7 @@ import { CronExpressionParser } from 'cron-parser';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  GROUPS_DIR,
   IPC_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
@@ -35,6 +36,12 @@ export interface IpcDeps {
     replyToMessageId?: string,
   ) => Promise<string | void>;
   pinMessage?: (jid: string, messageId: string) => Promise<void>;
+  sendFile?: (
+    jid: string,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -141,6 +148,59 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC reaction attempt blocked',
                   );
+                }
+              } else if (
+                data.type === 'send_file' &&
+                data.chatJid &&
+                data.filePath &&
+                deps.sendFile
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  // Translate container path to host path
+                  const containerPath: string = data.filePath;
+                  let hostPath: string;
+                  if (containerPath.startsWith('/workspace/group/')) {
+                    hostPath = path.join(
+                      GROUPS_DIR,
+                      sourceGroup,
+                      containerPath.replace('/workspace/group/', ''),
+                    );
+                  } else if (containerPath.startsWith('/workspace/trusted/')) {
+                    hostPath = path.join(
+                      process.cwd(),
+                      'trusted',
+                      containerPath.replace('/workspace/trusted/', ''),
+                    );
+                  } else {
+                    logger.warn(
+                      { containerPath, sourceGroup },
+                      'send_file: path outside allowed mounts',
+                    );
+                    fs.unlinkSync(filePath);
+                    continue;
+                  }
+
+                  if (fs.existsSync(hostPath)) {
+                    await deps.sendFile(
+                      data.chatJid,
+                      hostPath,
+                      data.caption,
+                      data.replyToMessageId,
+                    );
+                    logger.info(
+                      { chatJid: data.chatJid, hostPath, sourceGroup },
+                      'IPC file sent',
+                    );
+                  } else {
+                    logger.warn(
+                      { hostPath, containerPath, sourceGroup },
+                      'send_file: file not found on host',
+                    );
+                  }
                 }
               } else if (data.type === 'message' && data.chatJid && data.text) {
                 // Strip <internal> tags — if nothing remains, skip silently
@@ -296,11 +356,12 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
-    // For run_host_script / github_backup / promote_staging
+    // For run_host_script / github_backup / promote_staging / 
     requestId?: string;
     message?: string;
     tileName?: string;
     skillName?: string;
+    slug?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -860,6 +921,84 @@ export async function processTaskIpc(
             }
           },
         );
+      }
+      break;
+
+    case '':
+      if (data.requestId && data.slug) {
+        const  = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'input',
+          `_script_result_${data.requestId}.json`,
+        );
+
+        const { readEnvFile: read } = await import('./env.js');
+        const  = read(['']);
+        const apiKey = .;
+
+        if (!apiKey) {
+          fs.writeFileSync(
+            ,
+            JSON.stringify({ error: ' not set in .env' }),
+          );
+          break;
+        }
+
+        logger.info(
+          { slug: data.slug, sourceGroup },
+          'Fetching  event',
+        );
+
+        try {
+          const url = `https://.com/api/universal/event?slug=${encodeURIComponent(data.slug)}`;
+          const resp = await fetch(url, {
+            headers: { 'X-API-KEY': apiKey },
+            signal: AbortSignal.timeout(15_000),
+          });
+
+          if (!resp.ok) {
+            fs.writeFileSync(
+              ,
+              JSON.stringify({
+                error: ` API returned ${resp.status}: ${resp.statusText}`,
+              }),
+            );
+            break;
+          }
+
+          const event = (await resp.json()) as Record<string, unknown>;
+          const cfp = (event.cfp ?? {}) as Record<string, unknown>;
+          const normalized = {
+            name: event.name,
+            cfp_open: cfp.isOpen,
+            cfp_start: cfp.startDate,
+            cfp_end: cfp.endDate,
+            conf_start: event.startDate,
+            conf_end: event.endDate,
+            city: event.city,
+            country: event.country,
+            website: event.website,
+            cfp_url: `https://.com/${data.slug}/`,
+          };
+
+          fs.writeFileSync(
+            ,
+            JSON.stringify({ data: normalized }),
+          );
+          logger.info({ slug: data.slug }, ' event fetched');
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          logger.error(
+            { slug: data.slug, error: errMsg },
+            ' fetch failed',
+          );
+          fs.writeFileSync(
+            ,
+            JSON.stringify({ error: errMsg }),
+          );
+        }
       }
       break;
 
