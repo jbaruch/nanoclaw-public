@@ -1,6 +1,6 @@
 ---
 name: promote
-description: Promote the agent-created skills and rules from NAS staging to tessl tiles. Runs the full pipeline — pull, optimize, lint, commit, push, deploy, publish, install. Use when the owner says there are new items on staging, or after check-staging shows pending items.
+description: Promote the agent-created skills and rules from NAS staging to tessl tiles. Runs the full pipeline — pull, optimize, lint, commit, push, deploy, publish, install. Use when the user says there are new items on staging, or after check-staging shows pending items.
 ---
 
 # Promote from Staging

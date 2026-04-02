@@ -1,6 +1,6 @@
 ---
 name: verify-tiles
-description: Verifies tile installation after promotion — compares installed tiles against staging, removes stale staging copies if content matches, reports mismatches. Runs in a fresh container after promote-tiles nukes the old one. Use after promotion or when skill versions seem wrong.
+description: Verifies tile installation after promotion — compares installed tiles against staging, removes stale staging copies if content matches, reports mismatches. Runs in a fresh container after the previous container was replaced by promote-tiles. Use after promoting tiles, when skill versions seem outdated or incorrect, when installed skills don't reflect recent changes, or to confirm a promotion completed successfully.
 ---
 
 # Verify Tile Installation
@@ -16,7 +16,14 @@ ls /workspace/group/skills/ 2>/dev/null
 For each `tessl__<name>` directory found:
 1. Read staging: `/workspace/group/skills/tessl__<name>/SKILL.md`
 2. Read installed tile: `/home/node/.claude/.tessl/tiles/${TILE_OWNER}/nanoclaw-admin/skills/<name>/SKILL.md` (or `nanoclaw-core/...`)
-3. Compare — small wording differences are OK; missing steps, removed rules, or logic changes = **MISMATCH**
+3. Compare using `diff` to surface concrete differences:
+   ```bash
+   diff /workspace/group/skills/tessl__<name>/SKILL.md \
+        "/home/node/.claude/.tessl/tiles/${TILE_OWNER}/nanoclaw-admin/skills/<name>/SKILL.md"
+   ```
+   - **Small wording differences** (whitespace, punctuation, minor rephrasing with same meaning) → treat as **MATCH**
+   - **Structural or logic differences** (missing steps, removed rules, changed conditions, added/removed bash commands) → treat as **MISMATCH**
+   - If the diff is empty → **MATCH**
 
 ## Step 2: Act on comparison result
 

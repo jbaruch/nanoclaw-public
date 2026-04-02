@@ -21,11 +21,11 @@
     "schedule-task": {
       "path": "skills/schedule-task/SKILL.md"
     },
-    "check-system-health": {
-      "path": "skills/check-system-health/SKILL.md"
-    },
     "verify-tiles": {
       "path": "skills/verify-tiles/SKILL.md"
+    },
+    "promote-tiles": {
+      "path": "skills/promote-tiles/SKILL.md"
     }
   }
 }

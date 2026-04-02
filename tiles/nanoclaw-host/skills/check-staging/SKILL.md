@@ -1,6 +1,6 @@
 ---
 name: check-staging
-description: List pending skills and rules on the NAS staging area. Shows what the agent has created or updated that hasn't been promoted to tiles yet. Use before running promote, or when the owner asks what's on staging.
+description: List pending skills and rules on the NAS staging area. Shows what the agent has created or updated that hasn't been promoted to tiles yet. Use before running promote, or when the user asks what's on staging.
 ---
 
 # Check Staging
