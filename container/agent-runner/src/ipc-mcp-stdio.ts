@@ -74,6 +74,38 @@ server.tool(
 );
 
 server.tool(
+  'send_file',
+  'Send a file from the workspace to the user via Telegram. The file must exist on the container filesystem. Use for generated reports, exports, or any file the user asked you to create. Trusted containers only.',
+  {
+    filePath: z.string().describe('Absolute path to the file in the container (e.g., /workspace/group/report.csv)'),
+    caption: z.string().optional().describe('Optional caption to send with the file'),
+    reply_to: z.string().optional().describe('Message ID to reply to'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.filePath)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.filePath}` }],
+        isError: true,
+      };
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'send_file',
+      chatJid,
+      filePath: args.filePath,
+      caption: args.caption,
+      replyToMessageId: args.reply_to,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `File queued for sending: ${path.basename(args.filePath)}` }] };
+  },
+);
+
+server.tool(
   'react_to_message',
   'React to a message with an emoji. Use to acknowledge, approve, or express sentiment without sending a full text reply. Invalid emoji falls back to 👍.',
   {
@@ -495,6 +527,53 @@ server.tool(
 
     return {
       content: [{ type: 'text' as const, text: 'Backup timed out after 60s' }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
+  'sessionize_get_event',
+  'Fetch CFP and conference details from Sessionize by event slug. Returns normalized event data including CFP dates, conference dates, location, and website. Host handles the API key.',
+  {
+    slug: z.string().describe('Sessionize event slug (e.g., "devoxx-be-2026") or full URL (the slug is extracted automatically)'),
+  },
+  async (args) => {
+    const slug = args.slug.replace(/^https?:\/\/sessionize\.com\//, '').replace(/\/$/, '');
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const data = {
+      type: 'sessionize_get_event',
+      slug,
+      requestId,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+    const timeoutMs = 30_000;
+    const pollMs = 500;
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      if (fs.existsSync(resultPath)) {
+        const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+        fs.unlinkSync(resultPath);
+        if (result.error) {
+          return {
+            content: [{ type: 'text' as const, text: `Sessionize error: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(result.data, null, 2) }],
+        };
+      }
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Sessionize request timed out after 30s' }],
       isError: true,
     };
   },

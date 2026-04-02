@@ -1,7 +1,7 @@
 import fs from 'fs';
 import https from 'https';
 import path from 'path';
-import { Api, Bot } from 'grammy';
+import { Api, Bot, InputFile } from 'grammy';
 import OpenAI from 'openai';
 
 import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
@@ -869,6 +869,36 @@ export class TelegramChannel implements Channel {
       return lastMsgId?.toString();
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
+    }
+  }
+
+  async sendFile(
+    jid: string,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: string,
+  ): Promise<void> {
+    if (!this.bot) return;
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const options: {
+        caption?: string;
+        reply_parameters?: { message_id: number };
+      } = {};
+      if (caption) options.caption = caption;
+      if (replyToMessageId) {
+        options.reply_parameters = {
+          message_id: parseInt(replyToMessageId, 10),
+        };
+      }
+      await this.bot.api.sendDocument(
+        numericId,
+        new InputFile(filePath),
+        options,
+      );
+      logger.info({ jid, filePath, caption }, 'Telegram file sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
     }
   }
 
