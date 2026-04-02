@@ -1,6 +1,6 @@
 ---
 name: manage-groups
-description: Add, remove, list, or configure NanoClaw groups and channels. Use when the user asks to register a new WhatsApp/Telegram/Slack group, remove a group, list registered groups, configure sender allowlists, or add directory mounts to a group container.
+description: Add, remove, list, or configure NanoClaw groups and channels. Use when the user asks to register a new Telegram/WhatsApp/Discord group, remove a group, list registered groups, configure sender allowlists, or add directory mounts to a group container.
 ---
 
 # Manage Groups
@@ -54,8 +54,8 @@ Registered groups are stored in `/workspace/ipc/available_groups.json` as a JID-
 ```
 
 Non-obvious fields:
-- **requiresTrigger**: Whether `@trigger` prefix is needed (default: `true`). Set to `false` for solo/personal chats where all messages should be processed
-- **isMain**: Whether this is the main control group (elevated privileges, no trigger required)
+- **requiresTrigger**: `false` for solo/personal chats where all messages are processed (default: `true`)
+- **isMain**: Marks the main control group (elevated privileges, no trigger required)
 
 ## Adding a Group
 
@@ -67,8 +67,8 @@ Non-obvious fields:
      name="Family Chat",
      folder="whatsapp_family-chat",
      trigger="@Andy",
-     requiresTrigger=false,       # omit if trigger is needed
-     containerConfig={"trusted": true}  # pass for trusted groups
+     requiresTrigger=false,
+     containerConfig={"trusted": true}
    )
    ```
    **Trust level** via `containerConfig`:
@@ -84,10 +84,7 @@ Non-obvious fields:
 > ⚠️ **Known bug**: `register_group` only writes to the SQLite DB; the spawn system reads trust level from `available_groups.json`. These are out of sync.
 > **Workaround**: After calling `register_group`, manually add the JID-keyed entry to `/workspace/ipc/available_groups.json` with the appropriate `"containerConfig"` (e.g. `{"trusted": true}`). This file is the authoritative source for the spawner.
 
-Folder naming convention — channel prefix + underscore + lowercase hyphenated name:
-- WhatsApp "Family Chat" → `whatsapp_family-chat`
-- Telegram "Dev Team" → `telegram_dev-team`
-- Slack "Engineering" → `slack_engineering`
+Folder naming convention — channel prefix + underscore + lowercase hyphenated name (e.g. `telegram_dev-team`, `whatsapp_family-chat`, `discord_general`).
 
 ## Removing a Group
 

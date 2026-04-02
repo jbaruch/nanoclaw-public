@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw/nanoclaw-host",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "summary": "Skills and rules for the NanoClaw host agent (Claude Code on Mac). Tile promotion, container management, staging checks, and reconciliation.",
   "private": false,
   "rules": {

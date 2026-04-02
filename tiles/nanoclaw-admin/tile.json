@@ -1,7 +1,7 @@
 {
   "name": "nanoclaw/nanoclaw-admin",
-  "version": "0.1.0",
-  "summary": "Admin rules and skills for the NanoClaw main channel. Group management, agent teams, task scheduling, and system health. Only loaded for the main (elevated) channel. Add your own skills here.",
+  "version": "0.1.43",
+  "summary": "Admin rules and skills for the NanoClaw main channel. Group management, agent teams, authentication, and container configuration. Only loaded for the main (elevated) channel.",
   "private": true,
   "rules": {
     "admin-context": {
@@ -9,6 +9,12 @@
     },
     "skill-tile-placement": {
       "rules": "rules/skill-tile-placement.md"
+    },
+    "composio-preamble": {
+      "rules": "rules/composio-preamble.md"
+    },
+    "event-filter-rules": {
+      "rules": "rules/event-filter-rules.md"
     }
   },
   "skills": {
@@ -18,14 +24,62 @@
     "create-agent-team": {
       "path": "skills/create-agent-team/SKILL.md"
     },
+    "heartbeat": {
+      "path": "skills/heartbeat/SKILL.md"
+    },
+    "morning-brief": {
+      "path": "skills/morning-brief/SKILL.md"
+    },
+    "nightly-housekeeping": {
+      "path": "skills/nightly-housekeeping/SKILL.md"
+    },
+    "check-calendar": {
+      "path": "skills/check-calendar/SKILL.md"
+    },
+    "check-email": {
+      "path": "skills/check-email/SKILL.md"
+    },
+    "check-travel-bookings": {
+      "path": "skills/check-travel-bookings/SKILL.md"
+    },
     "schedule-task": {
       "path": "skills/schedule-task/SKILL.md"
+    },
+    "brief-cleanup": {
+      "path": "skills/brief-cleanup/SKILL.md"
+    },
+    "check-cfps": {
+      "path": "skills/check-cfps/SKILL.md"
+    },
+    "trakt-watch-history": {
+      "path": "skills/trakt-watch-history/SKILL.md"
+    },
+    "check-orders": {
+      "path": "skills/check-orders/SKILL.md"
+    },
+    "check-watchlist": {
+      "path": "skills/check-watchlist/SKILL.md"
+    },
+    "recommend-books": {
+      "path": "skills/recommend-books/SKILL.md"
+    },
+    "recommend-shows": {
+      "path": "skills/recommend-shows/SKILL.md"
+    },
+    "task-tz-sync": {
+      "path": "skills/task-tz-sync/SKILL.md"
+    },
+    "soul-searching": {
+      "path": "skills/soul-searching/SKILL.md"
+    },
+    "promote-tiles": {
+      "path": "skills/promote-tiles/SKILL.md"
     },
     "verify-tiles": {
       "path": "skills/verify-tiles/SKILL.md"
     },
-    "promote-tiles": {
-      "path": "skills/promote-tiles/SKILL.md"
+    "scheduler-timezone": {
+      "path": "skills/scheduler-timezone/SKILL.md"
     }
   }
 }
