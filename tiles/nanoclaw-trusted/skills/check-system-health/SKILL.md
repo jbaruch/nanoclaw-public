@@ -5,6 +5,8 @@ description: Check NanoClaw system health — stuck tasks, DB size, task run fai
 
 # Check System Health
 
+**Invoked from:** heartbeat (Step 5). Also available standalone.
+
 DB is at `/workspace/store/messages.db`. Run each check below.
 
 ## 1. Stuck scheduled tasks

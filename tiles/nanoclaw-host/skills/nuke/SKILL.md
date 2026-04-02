@@ -28,7 +28,7 @@ If no container is running, the script exits cleanly.
 
 ## Finding the JID
 
-If the owner provides a group name instead of a JID, look it up:
+If the user provides a group name instead of a JID, look it up:
 
 ```bash
 ssh -n "$NAS_HOST" "sqlite3 $NAS_PROJECT_DIR/store/messages.db \"SELECT jid, name FROM registered_groups;\""
