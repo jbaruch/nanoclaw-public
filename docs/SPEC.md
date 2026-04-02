@@ -399,6 +399,29 @@ ANTHROPIC_API_KEY=sk-ant-api03-...
 
 Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
 
+
+### Claude Code Model Settings
+
+The orchestrator writes model configuration to `/home/node/.claude/settings.json` inside the container at spawn time — these are **not** baked into the Docker image. They go in the `"env"` block of the settings file:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_MODEL": "claude-opus-4-6",
+    "CLAUDE_CODE_MAX_CONTEXT_WINDOW": 1000000,
+    "CLAUDE_CODE_EFFORT_LEVEL": "max"
+  }
+}
+```
+
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `CLAUDE_CODE_MODEL` | Sets the Claude model used for agent execution | `"claude-opus-4-6"` |
+| `CLAUDE_CODE_MAX_CONTEXT_WINDOW` | Sets the maximum context window size in tokens | `1000000` |
+| `CLAUDE_CODE_EFFORT_LEVEL` | Sets reasoning depth (use `"max"` for extended thinking with Opus 4.6) | `"max"` |
+
+These are written by the orchestrator's container runner at spawn time. To change the model or context window, update the values in `src/container-runner.ts` where `settings.json` is generated.
+
 ### Changing the Assistant Name
 
 Set the `ASSISTANT_NAME` environment variable:
