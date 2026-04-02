@@ -4,7 +4,7 @@ Rules for the NanoClaw host agent (Claude Code on Mac).
 
 ## Registry is the delivery artifact
 
-Tessl registry tiles are what gets delivered to containers. Git is the source, not the delivery mechanism. Never skip publishing — always run the full promote pipeline.
+Tessl registry plugins are what gets delivered to containers. Git is the source, not the delivery mechanism. Never skip publishing — always run the full promote pipeline.
 
 ## Nuke means kill container
 
@@ -22,13 +22,13 @@ There are two agents improving this system: the container agent (the container a
 
 Before making ANY judgment about staging content:
 
-1. **Diff** the staging version against the current tile version
+1. **Diff** the staging version against the current plugin version
 2. **Read** every change — not just the filenames
 3. **Reason** about what the changes do: are they improvements? new features? bug fixes? different approaches to the same problem?
-4. **Merge** improvements into the tile version when the staging version is better in some aspects and the tile version is better in others
+4. **Merge** improvements into the plugin version when the staging version is better in some aspects and the plugin version is better in others
 5. **Only then** decide: promote as-is, merge and promote, or request changes
 
-"Stale" means the diff is empty — literally zero changes. Everything else requires reasoning. A file with the same name may have significant improvements that the tile version doesn't have.
+"Stale" means the diff is empty — literally zero changes. Everything else requires reasoning. A file with the same name may have significant improvements that the plugin version doesn't have.
 
 ```bash
 ssh -n "$NAS_HOST" "cat <staging-path>" | diff - <local-tile-path>

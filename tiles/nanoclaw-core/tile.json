@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw/nanoclaw-core",
-  "version": "0.1.33",
+  "version": "0.1.38",
   "summary": "Core behavioral rules and skills for NanoClaw personal assistant agents. Always-on rules for communication, async tasks, memory, and formatting. On-demand skills for message formatting, task scheduling, heartbeat orchestration, and checks (unanswered messages, calendar, email, CFPs).",
   "private": false,
   "rules": {
@@ -15,6 +15,12 @@
     },
     "default-silence": {
       "rules": "rules/default-silence.md"
+    },
+    "temporal-awareness": {
+      "rules": "rules/temporal-awareness.md"
+    },
+    "ground-truth": {
+      "rules": "rules/ground-truth.md"
     }
   },
   "skills": {

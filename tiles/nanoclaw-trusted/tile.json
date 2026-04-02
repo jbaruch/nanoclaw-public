@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw/nanoclaw-trusted",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "summary": "Rules for trusted NanoClaw groups. Shared memory, session bootstrap, cross-group memory updates. Loaded for trusted and main containers only.",
   "private": false,
   "rules": {
@@ -12,9 +12,6 @@
     },
     "skill-dependencies": {
       "rules": "rules/skill-dependencies.md"
-    },
-    "temporal-awareness": {
-      "rules": "rules/temporal-awareness.md"
     }
   },
   "skills": {
@@ -23,6 +20,9 @@
     },
     "trusted-memory": {
       "path": "skills/trusted-memory/SKILL.md"
+    },
+    "check-unanswered": {
+      "path": "skills/check-unanswered/SKILL.md"
     }
   }
 }

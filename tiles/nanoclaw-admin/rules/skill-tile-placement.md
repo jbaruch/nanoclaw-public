@@ -1,6 +1,6 @@
-# Skill Tile Placement Rule
+# Skill Plugin Placement Rule
 
-When promoting a skill or rule, always choose the correct tile:
+When promoting a skill or rule, always choose the correct plugin:
 
 ## Decision checklist — run through in order
 
@@ -14,9 +14,9 @@ When promoting a skill or rule, always choose the correct tile:
 
 If in doubt: **admin**. Putting something in core that belongs in admin breaks the security model.
 
-## Tile summary
+## Plugin summary
 
-| Tile | Who gets it | What goes here |
+| Plugin | Who gets it | What goes here |
 |------|------------|----------------|
 | **nanoclaw-core** | All containers | Basic behavior, formatting, language, silence, staging process |
 | **nanoclaw-trusted** | Trusted + main | Shared memory, operational discipline, system health, skill dependencies |
@@ -30,5 +30,5 @@ If in doubt: **admin**. Putting something in core that belongs in admin breaks t
 - Pure logic, no credentials, all containers need it → **core**
 - Security restriction for public groups → **untrusted**
 
-**Always check before calling promote_staging — wrong tile = security model broken.**
+**Always check before calling promote_staging — wrong plugin = security model broken.**
 
