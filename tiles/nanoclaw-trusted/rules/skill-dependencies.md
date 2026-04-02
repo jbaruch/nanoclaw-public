@@ -5,8 +5,8 @@ Skills that invoke or depend on other skills. Read this to understand execution 
 ## Heartbeat (runs every 15 min)
 1. Calls `task-tz-sync` (Step 0.5) — detects timezone changes
 2. Checks `task-tz-state.json` for missed tasks (Step 0.6) — may invoke `morning-brief` or `nightly-housekeeping`
-3. Calls `check-unanswered` (Step 4) — scans for unreplied messages
-4. Calls `check-system-health` (Step 5) — DB health, stuck tasks
+3. Calls `check-unanswered` (Step 0.7) — scans for unreplied messages
+4. Runs `heartbeat-checks.py` script (Step 1) — system health checks directly via script
 
 ## Morning Brief (runs daily, 8am local)
 1. Reads Google Calendar via Composio (Step 1)

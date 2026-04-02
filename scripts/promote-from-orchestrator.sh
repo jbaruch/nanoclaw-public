@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Promote staging skills/rules to tiles — runs INSIDE the orchestrator container.
+# Promote staging skills/rules to plugins — runs INSIDE the orchestrator container.
 # Called by the promote_staging MCP tool via IPC.
 #
 # Args: $1 = group folder (e.g. "telegram_swarm")
@@ -101,7 +101,7 @@ fi
 
 # --- Lint ---
 echo "Linting..."
-tessl tile lint "$TILE_DIR" || { echo "ERROR: lint failed"; exit 1; }
+tessl plugin lint "$TILE_DIR" || { echo "ERROR: lint failed"; exit 1; }
 
 # --- Git commit + push ---
 cd "$REPO_DIR"
@@ -126,18 +126,22 @@ fi
 
 # --- Publish ---
 echo "Publishing..."
-tessl tile publish --bump patch "$TILE_DIR" || echo "WARN: publish failed (tiles deployed via git)"
+tessl plugin publish --bump patch "$TILE_DIR" || echo "WARN: publish failed (tiles deployed via git)"
 
 # --- Rebuild orchestrator ---
 # Can't rebuild self from inside, but the git push triggers the change.
 # Next docker compose up --build will pick it up.
 
-# --- Install tiles ---
-echo "Installing tiles from registry..."
+# --- Install plugins ---
+echo "Installing plugins from registry..."
 cd /app/tessl-workspace
 # Build tile list from tiles/ directory
 TILE_LIST=$(ls /app/repo/tiles/ 2>/dev/null | while read t; do echo "$TILE_OWNER/$t"; done | tr '\n' ' ')
-tessl install $TILE_LIST \
-  --yes --dangerously-ignore-security --agent claude-code 2>&1 || echo "WARN: tile install had issues"
+tessl update \
+  --yes --dangerously-ignore-security --agent claude-code 2>&1 || echo "WARN: tile update had issues"
+
+# Kill all running agent containers so they respawn with new plugins
+echo "Killing stale agent containers..."
+docker ps --format '{{.ID}} {{.Names}}' | grep nanoclaw-telegram | awk '{print $1}' | xargs -r docker kill 2>/dev/null || true
 
 echo "Done! $PROMOTED item(s) promoted."

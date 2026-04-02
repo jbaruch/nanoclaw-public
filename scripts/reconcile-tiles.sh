@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reconcile tiles: compare git source vs registry-installed vs orchestrator.
+# Reconcile plugins: compare git source vs registry-installed vs orchestrator.
 # Reports drift, missing items, and stale files.
 #
 # Usage:
@@ -68,7 +68,7 @@ if [ -n "$RESULT" ]; then
   echo "$RESULT"
   ISSUES=$(echo "$RESULT" | wc -l | tr -d ' ')
 else
-  echo "All tiles in sync."
+  echo "All plugins in sync."
 fi
 
 echo ""
