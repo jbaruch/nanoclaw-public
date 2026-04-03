@@ -276,14 +276,16 @@ function shouldClose(): boolean {
 /**
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
+ * Tracks consumed files in memory so read-only mounts don't cause infinite loops.
  */
 const REPLY_TO_FILE = path.join(IPC_INPUT_DIR, '_reply_to');
+const consumedInputFiles = new Set<string>();
 
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json') && !f.startsWith('_script_result_'))
+      .filter(f => f.endsWith('.json') && !f.startsWith('_script_result_') && !consumedInputFiles.has(f))
       .sort();
 
     const messages: string[] = [];
@@ -292,7 +294,8 @@ function drainIpcInput(): string[] {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
+        consumedInputFiles.add(file);
+        try { fs.unlinkSync(filePath); } catch { /* read-only mount — tracked in memory */ }
         if (data.type === 'message' && data.text) {
           messages.push(data.text);
           if (data.replyToMessageId) {

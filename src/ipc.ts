@@ -51,6 +51,7 @@ export interface IpcDeps {
     isMain: boolean,
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
+    isTrusted?: boolean,
   ) => void;
   onTasksChanged: () => void;
   nukeSession: (groupFolder: string) => void;

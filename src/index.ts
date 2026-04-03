@@ -147,13 +147,18 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   // Copy CLAUDE.md template into the new group folder so agents have
   // identity and instructions from the first run.  (Fixes #1391)
+  // Main: full admin template. Trusted: global template. Untrusted: dedicated template.
   const groupMdFile = path.join(groupDir, 'CLAUDE.md');
   if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
+    const isUntrusted = !group.isMain && !group.containerConfig?.trusted;
+    let templateFile: string;
+    if (group.isMain) {
+      templateFile = path.join(GROUPS_DIR, 'main', 'CLAUDE.md');
+    } else if (isUntrusted) {
+      templateFile = path.join(GROUPS_DIR, 'global', 'CLAUDE-untrusted.md');
+    } else {
+      templateFile = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+    }
     if (fs.existsSync(templateFile)) {
       let content = fs.readFileSync(templateFile, 'utf-8');
       if (ASSISTANT_NAME !== 'Andy') {
@@ -394,6 +399,7 @@ async function runAgent(
   replyToMessageId?: string,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
+  const isTrusted = !!group.containerConfig?.trusted;
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
@@ -411,6 +417,7 @@ async function runAgent(
       status: t.status,
       next_run: t.next_run,
     })),
+    isTrusted,
   );
 
   // Update available groups snapshot (main group only can see all groups)
@@ -420,6 +427,7 @@ async function runAgent(
     isMain,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
+    isTrusted,
   );
 
   // Wrap onOutput to track session ID from streamed results

@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw/nanoclaw-untrusted",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "summary": "Security rules for untrusted NanoClaw groups. Credential protection, internal file protection, social engineering defenses.",
   "private": false,
   "rules": {

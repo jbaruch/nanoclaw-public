@@ -1,11 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Limit git memory usage to prevent SIGBUS under container memory pressure
-git config --global pack.threads 1
-git config --global pack.deltaCacheSize 1m
-git config --global pack.windowMemory 100m
-
+# Git memory limits are baked into the image (Dockerfile).
 # Agent-runner is pre-compiled at image build time (/app/dist/).
 
 # Wire tessl rules chain into workspace (first-time setup for new groups).

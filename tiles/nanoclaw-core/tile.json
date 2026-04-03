@@ -21,6 +21,9 @@
     },
     "ground-truth": {
       "rules": "rules/ground-truth.md"
+    },
+    "context-recovery": {
+      "rules": "rules/context-recovery.md"
     }
   },
   "skills": {
