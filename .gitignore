@@ -17,6 +17,8 @@ groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
+!groups/global/CLAUDE-untrusted.md
+!groups/global/SOUL-untrusted.md
 
 # Secrets
 *.keys.json

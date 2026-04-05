@@ -3,6 +3,7 @@
  * Spawns agent execution in containers and handles IPC
  */
 import { ChildProcess, spawn } from 'child_process';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
@@ -17,6 +18,7 @@ import {
   HOST_PROJECT_ROOT,
   HOST_UID,
   IDLE_TIMEOUT,
+  STORE_DIR,
   TILE_OWNER,
   TIMEZONE,
 } from './config.js';
@@ -38,12 +40,66 @@ import { readEnvFile } from './env.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+/**
+ * Create a filtered copy of messages.db containing only one group's messages.
+ * Returns the path to the filtered DB, or null if the source DB doesn't exist.
+ */
+function createFilteredDb(chatJid: string, groupFolder: string): string | null {
+  const srcDb = path.join(STORE_DIR, 'messages.db');
+  if (!fs.existsSync(srcDb)) return null;
+
+  const filteredDir = path.join(DATA_DIR, 'filtered-db', groupFolder);
+  fs.mkdirSync(filteredDir, { recursive: true });
+  const filteredPath = path.join(filteredDir, 'messages.db');
+
+  // Remove stale copy from previous run
+  if (fs.existsSync(filteredPath)) {
+    fs.unlinkSync(filteredPath);
+  }
+
+  // Use ATTACH to copy schema-agnostically — picks up new columns automatically
+  const dst = new Database(filteredPath);
+  try {
+    dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
+    dst.exec(
+      `CREATE TABLE chats AS SELECT * FROM src.chats WHERE jid = '${chatJid.replace(/'/g, "''")}'`,
+    );
+    dst.exec(
+      `CREATE TABLE messages AS SELECT * FROM src.messages WHERE chat_jid = '${chatJid.replace(/'/g, "''")}'`,
+    );
+    dst.exec('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)');
+    dst.exec('DETACH src');
+  } finally {
+    dst.close();
+  }
+
+  // Chown so container user can read
+  const uid = HOST_UID ?? 1000;
+  const gid = HOST_GID ?? 1000;
+  if (uid !== 0) {
+    try {
+      fs.chownSync(filteredDir, uid, gid);
+      fs.chownSync(filteredPath, uid, gid);
+    } catch (err: unknown) {
+      logger.warn({ err, filteredPath }, 'Failed to chown filtered DB');
+    }
+  }
+
+  logger.debug(
+    { chatJid, groupFolder, path: filteredPath },
+    'Created filtered DB for untrusted container',
+  );
+
+  return filteredPath;
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
+  isTrusted?: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
@@ -80,9 +136,29 @@ function toHostPath(localPath: string): string {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  chatJid: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const groupDir = resolveGroupFolderPath(group.folder);
+
+  // Ensure AGENTS.md exists (chains .tessl/RULES.md into Claude Code context).
+  // Must be created BEFORE the mount goes read-only for untrusted groups.
+  const agentsMdPath = path.join(groupDir, 'AGENTS.md');
+  if (!fs.existsSync(agentsMdPath)) {
+    fs.writeFileSync(
+      agentsMdPath,
+      '\n\n# Agent Rules <!-- managed by orchestrator -->\n\n@.tessl/RULES.md follow the [instructions](.tessl/RULES.md)\n',
+    );
+  }
+
+  if (isMain) {
+    // Main gets the project root read-only.
+    mounts.push({
+      hostPath: toHostPath(process.cwd()),
+      containerPath: '/workspace/project',
+      readonly: true,
+    });
+  }
 
   // Group folder mount. Untrusted groups get read-only (disk exhaustion protection).
   mounts.push({
@@ -92,38 +168,71 @@ function buildVolumeMounts(
   });
 
   // Global memory directory (SOUL.md, shared CLAUDE.md).
-  // All groups get this — main used to get it via /workspace/project, but that mount
-  // was removed for NAS. Now mounted explicitly for everyone.
+  // Trusted + main get the full directory. Untrusted get only SOUL-untrusted.md
+  // mounted as SOUL.md so core-behavior's "read SOUL.md" still works.
   const globalDir = path.join(GROUPS_DIR, 'global');
-  if (fs.existsSync(globalDir)) {
-    mounts.push({
-      hostPath: toHostPath(globalDir),
-      containerPath: '/workspace/global',
-      readonly: !isMain, // main can update global memory, others read-only
-    });
+  if (isMain || group.containerConfig?.trusted) {
+    if (fs.existsSync(globalDir)) {
+      mounts.push({
+        hostPath: toHostPath(globalDir),
+        containerPath: '/workspace/global',
+        readonly: !isMain,
+      });
+    }
+  } else {
+    // Untrusted: mount only the sanitized SOUL as a single file
+    const untrustedSoul = path.join(globalDir, 'SOUL-untrusted.md');
+    if (fs.existsSync(untrustedSoul)) {
+      mounts.push({
+        hostPath: toHostPath(untrustedSoul),
+        containerPath: '/workspace/global/SOUL.md',
+        readonly: true,
+      });
+    }
   }
 
   // Shared trusted directory — writable space for trusted containers.
   if (isMain || group.containerConfig?.trusted) {
     const trustedDir = path.join(process.cwd(), 'trusted');
-    if (fs.existsSync(trustedDir)) {
-      mounts.push({
-        hostPath: toHostPath(trustedDir),
-        containerPath: '/workspace/trusted',
-        readonly: false,
-      });
+    fs.mkdirSync(trustedDir, { recursive: true });
+    // Chown so container user can write memory files
+    const trustedUid = HOST_UID ?? 1000;
+    const trustedGid = HOST_GID ?? 1000;
+    if (trustedUid !== 0) {
+      try {
+        fs.chownSync(trustedDir, trustedUid, trustedGid);
+      } catch (err: unknown) {
+        logger.warn({ err, trustedDir }, 'Failed to chown trusted dir');
+      }
     }
+    mounts.push({
+      hostPath: toHostPath(trustedDir),
+      containerPath: '/workspace/trusted',
+      readonly: false,
+    });
   }
 
-  // Store directory (messages.db) — read-only access for all groups.
-  // Needed for heartbeat checks (unanswered messages, stuck tasks, DB size).
-  const storeDir = path.join(process.cwd(), 'store');
-  if (fs.existsSync(storeDir)) {
-    mounts.push({
-      hostPath: toHostPath(storeDir),
-      containerPath: '/workspace/store',
-      readonly: true,
-    });
+  // Store directory (messages.db).
+  // Trusted/main: full DB (all groups). Untrusted: filtered copy (own chat only).
+  if (isMain || group.containerConfig?.trusted) {
+    const storeDir = path.join(process.cwd(), 'store');
+    if (fs.existsSync(storeDir)) {
+      mounts.push({
+        hostPath: toHostPath(storeDir),
+        containerPath: '/workspace/store',
+        readonly: true,
+      });
+    }
+  } else {
+    // Untrusted: create filtered DB with only this group's messages
+    const filteredDb = createFilteredDb(chatJid, group.folder);
+    if (filteredDb) {
+      mounts.push({
+        hostPath: toHostPath(path.dirname(filteredDb)),
+        containerPath: '/workspace/store',
+        readonly: true,
+      });
+    }
   }
 
   // Per-group Claude sessions directory (isolated from other groups)
@@ -146,6 +255,7 @@ function buildVolumeMounts(
             CLAUDE_CODE_MAX_CONTEXT_WINDOW: '1000000',
             CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
             CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+            CLAUDE_CODE_EFFORT_LEVEL: 'max',
             // Disable auto-memory for untrusted groups to prevent persistent injection
             CLAUDE_CODE_DISABLE_AUTO_MEMORY:
               isMain || group.containerConfig?.trusted ? '0' : '1',
@@ -172,12 +282,8 @@ function buildVolumeMounts(
   }
 
   // Tiles come from the tessl registry (installed by orchestrator).
-  // Main/trusted: all tiles. Others: nanoclaw-core only.
-  const trustedTiles = [
-    'nanoclaw-core',
-    'nanoclaw-admin',
-    // reclaim-tripit-sync removed — sync runs host-side via run_host_script
-  ];
+  // Main/trusted: all tiles. Admin loads last so it can override trusted skills.
+  const trustedTiles = ['nanoclaw-core', 'nanoclaw-trusted', 'nanoclaw-admin'];
   const untrustedTiles = ['nanoclaw-core', 'nanoclaw-untrusted'];
   const tilesToInstall =
     isMain || group.containerConfig?.trusted ? trustedTiles : untrustedTiles;
@@ -252,6 +358,25 @@ function buildVolumeMounts(
     );
   }
 
+  // Copy .tessl/ to group folder so AGENTS.md → .tessl/RULES.md resolves.
+  // Host-side copy is required because untrusted groups mount /workspace/group
+  // read-only — the container cannot write .tessl/ there itself.
+  // Skip if RULES.md content is unchanged (avoids unnecessary I/O on every spawn).
+  const groupTesslDir = path.join(groupDir, '.tessl');
+  if (fs.existsSync(dstTessl)) {
+    const srcRules = path.join(dstTessl, 'RULES.md');
+    const dstRules = path.join(groupTesslDir, 'RULES.md');
+    const needsCopy = fs.existsSync(srcRules) &&
+      (!fs.existsSync(dstRules) ||
+        fs.readFileSync(srcRules, 'utf-8') !== fs.readFileSync(dstRules, 'utf-8'));
+    if (needsCopy) {
+      if (fs.existsSync(groupTesslDir)) {
+        fs.rmSync(groupTesslDir, { recursive: true, force: true });
+      }
+      fs.cpSync(dstTessl, groupTesslDir, { recursive: true });
+    }
+  }
+
   // Built-in container skills (agent-browser, status, etc.)
   const builtinSkillsDir = path.join(process.cwd(), 'container', 'skills');
   if (fs.existsSync(builtinSkillsDir)) {
@@ -265,10 +390,24 @@ function buildVolumeMounts(
   // Agent-created skills (staging) — override tile skills if names collide
   const groupSkillsDir = path.join(groupDir, 'skills');
   if (fs.existsSync(groupSkillsDir)) {
-    for (const skillDir of fs.readdirSync(groupSkillsDir)) {
-      const srcDir = path.join(groupSkillsDir, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      fs.cpSync(srcDir, path.join(skillsDst, skillDir), { recursive: true });
+    const stagingSkills = fs
+      .readdirSync(groupSkillsDir)
+      .filter((d) => {
+        const p = path.join(groupSkillsDir, d);
+        return fs.statSync(p).isDirectory();
+      });
+    if (stagingSkills.length > 0) {
+      logger.warn(
+        { folder: group.folder, skills: stagingSkills },
+        'Staging skills override tile skills — run verify-tiles to clear',
+      );
+      for (const skillDir of stagingSkills) {
+        fs.cpSync(
+          path.join(groupSkillsDir, skillDir),
+          path.join(skillsDst, skillDir),
+          { recursive: true },
+        );
+      }
     }
   }
   mounts.push({
@@ -277,28 +416,78 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Claude Code config file — lives at /home/node/.claude.json (outside .claude/).
+  // Read-only rootfs can't create it, so we bind-mount it from the sessions dir.
+  const claudeJsonPath = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    '.claude.json',
+  );
+  if (!fs.existsSync(claudeJsonPath)) {
+    fs.writeFileSync(claudeJsonPath, '{}');
+  }
+  // Chown so container user can write (Claude Code updates this file at runtime)
+  const jsonUid = HOST_UID ?? 1000;
+  const jsonGid = HOST_GID ?? 1000;
+  if (jsonUid !== 0) {
+    try {
+      fs.chownSync(claudeJsonPath, jsonUid, jsonGid);
+    } catch (err: unknown) {
+      logger.warn({ err, claudeJsonPath }, 'Failed to chown .claude.json');
+    }
+  }
+  mounts.push({
+    hostPath: toHostPath(claudeJsonPath),
+    containerPath: '/home/node/.claude.json',
+    readonly: false,
+  });
+
   // Per-group IPC namespace
   const groupIpcDir = resolveGroupIpcPath(group.folder);
+  const isTrustedIpc = isMain || !!group.containerConfig?.trusted;
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  if (isTrustedIpc) {
+    fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  }
   // Chown IPC dirs so container user can read/write/unlink files
   const ipcUid = HOST_UID ?? 1000;
   const ipcGid = HOST_GID ?? 1000;
   if (ipcUid !== 0) {
     try {
-      for (const sub of ['', 'messages', 'tasks', 'input']) {
+      const subsToChown = isTrustedIpc
+        ? ['', 'messages', 'tasks', 'input']
+        : ['messages', 'input'];
+      for (const sub of subsToChown) {
         fs.chownSync(path.join(groupIpcDir, sub), ipcUid, ipcGid);
       }
     } catch (err) {
       logger.warn({ folder: group.folder, err }, 'Failed to chown IPC dirs');
     }
   }
-  mounts.push({
-    hostPath: toHostPath(groupIpcDir),
-    containerPath: '/workspace/ipc',
-    readonly: false,
-  });
+
+  if (isTrustedIpc) {
+    // Trusted/main: single mount for entire IPC directory
+    mounts.push({
+      hostPath: toHostPath(groupIpcDir),
+      containerPath: '/workspace/ipc',
+      readonly: false,
+    });
+  } else {
+    // Untrusted: split mounts — messages/ writable, input/ read-only, no tasks/
+    // No root IPC files (available_groups.json, current_tasks.json)
+    mounts.push({
+      hostPath: toHostPath(path.join(groupIpcDir, 'messages')),
+      containerPath: '/workspace/ipc/messages',
+      readonly: false,
+    });
+    mounts.push({
+      hostPath: toHostPath(path.join(groupIpcDir, 'input')),
+      containerPath: '/workspace/ipc/input',
+      readonly: true,
+    });
+  }
 
   // Additional mounts validated against external allowlist
   if (group.containerConfig?.additionalMounts) {
@@ -322,7 +511,7 @@ function buildContainerArgs(
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Resource limits for untrusted containers
+  // Resource limits and filesystem restrictions for untrusted containers
   if (!isMain && !group.containerConfig?.trusted) {
     args.push(
       '--memory',
@@ -333,6 +522,9 @@ function buildContainerArgs(
       '1', // 1 CPU core
       '--pids-limit',
       '256', // prevent fork bombs
+      '--read-only', // immutable root filesystem
+      '--tmpfs',
+      '/tmp:size=64m', // writable /tmp via tmpfs (needed for input.json)
     );
     // Group folder is read-only for untrusted (set above).
     // Agent can read CLAUDE.md/skills but can't write 7GB of numbers.
@@ -434,7 +626,7 @@ export async function runContainerAgent(
     /* file doesn't exist — fine */
   }
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, input.chatJid);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(
@@ -836,7 +1028,11 @@ export function writeTasksSnapshot(
     status: string;
     next_run: string | null;
   }>,
+  isTrusted?: boolean,
 ): void {
+  // Untrusted containers don't get IPC root files — tasks/ not mounted
+  if (!isMain && !isTrusted) return;
+
   // Write filtered tasks to the group's IPC directory
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
@@ -869,7 +1065,11 @@ export function writeGroupsSnapshot(
   isMain: boolean,
   groups: AvailableGroup[],
   _registeredJids: Set<string>,
+  isTrusted?: boolean,
 ): void {
+  // Untrusted containers don't get IPC root files — available_groups not mounted
+  if (!isMain && !isTrusted) return;
+
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 

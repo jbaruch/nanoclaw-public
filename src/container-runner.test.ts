@@ -14,12 +14,18 @@ vi.mock('./config.js', () => ({
   CREDENTIAL_PROXY_PORT: 3001,
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
+  STORE_DIR: '/tmp/nanoclaw-test-store',
   HOST_PROJECT_ROOT: process.cwd(),
   HOST_UID: undefined,
   HOST_GID: undefined,
   IDLE_TIMEOUT: 1800000, // 30min
   TILE_OWNER: 'test',
   TIMEZONE: 'America/Los_Angeles',
+}));
+
+// Mock better-sqlite3 (used by createFilteredDb)
+vi.mock('better-sqlite3', () => ({
+  default: vi.fn(),
 }));
 
 // Mock logger
