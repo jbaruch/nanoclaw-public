@@ -43,11 +43,10 @@ describe('readonlyMountArgs', () => {
 });
 
 describe('stopContainer', () => {
-  it('calls docker stop via spawnSync for valid container names', () => {
+  it('calls docker stop via execSync for valid container names', () => {
     stopContainer('nanoclaw-test-123');
-    expect(mockSpawnSync).toHaveBeenCalledWith(
-      CONTAINER_RUNTIME_BIN,
-      ['stop', '-t', '1', 'nanoclaw-test-123'],
+    expect(mockExecSync).toHaveBeenCalledWith(
+      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-test-123`,
       { stdio: 'pipe' },
     );
   });
@@ -60,7 +59,7 @@ describe('stopContainer', () => {
       'Invalid container name',
     );
     expect(() => stopContainer('foo`id`')).toThrow('Invalid container name');
-    expect(mockSpawnSync).not.toHaveBeenCalled();
+    expect(mockExecSync).not.toHaveBeenCalled();
   });
 });
 
@@ -104,23 +103,20 @@ describe('cleanupOrphans', () => {
       stderr: '',
       status: 0,
     });
-    // stop calls succeed
-    mockSpawnSync.mockReturnValue({ stdout: '', stderr: '', status: 0 });
 
     cleanupOrphans();
 
-    // ps + 2 stop calls
-    expect(mockSpawnSync).toHaveBeenCalledTimes(3);
-    expect(mockSpawnSync).toHaveBeenNthCalledWith(
-      2,
-      CONTAINER_RUNTIME_BIN,
-      ['stop', '-t', '1', 'nanoclaw-group1-111'],
+    // ps via spawnSync, 2 stop calls via execSync
+    expect(mockSpawnSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
+    expect(mockExecSync).toHaveBeenNthCalledWith(
+      1,
+      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group1-111`,
       { stdio: 'pipe' },
     );
-    expect(mockSpawnSync).toHaveBeenNthCalledWith(
-      3,
-      CONTAINER_RUNTIME_BIN,
-      ['stop', '-t', '1', 'nanoclaw-group2-222'],
+    expect(mockExecSync).toHaveBeenNthCalledWith(
+      2,
+      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group2-222`,
       { stdio: 'pipe' },
     );
     expect(logger.info).toHaveBeenCalledWith(
@@ -162,15 +158,16 @@ describe('cleanupOrphans', () => {
       status: 0,
     });
     // First stop fails
-    mockSpawnSync.mockImplementationOnce(() => {
+    mockExecSync.mockImplementationOnce(() => {
       throw new Error('already stopped');
     });
     // Second stop succeeds
-    mockSpawnSync.mockReturnValueOnce({ stdout: '', stderr: '', status: 0 });
+    mockExecSync.mockReturnValueOnce('');
 
     cleanupOrphans(); // should not throw
 
-    expect(mockSpawnSync).toHaveBeenCalledTimes(3);
+    expect(mockSpawnSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
     expect(logger.info).toHaveBeenCalledWith(
       { count: 2, names: ['nanoclaw-a-1', 'nanoclaw-b-2'] },
       'Stopped orphaned containers',
