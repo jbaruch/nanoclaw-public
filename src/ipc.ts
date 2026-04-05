@@ -51,6 +51,7 @@ export interface IpcDeps {
     isMain: boolean,
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
+    isTrusted?: boolean,
   ) => void;
   onTasksChanged: () => void;
   nukeSession: (groupFolder: string) => void;
@@ -250,6 +251,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     timestamp: new Date().toISOString(),
                     is_from_me: true,
                     is_bot_message: true,
+                    reply_to_message_id: data.replyToMessageId,
                   });
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
@@ -362,6 +364,7 @@ export async function processTaskIpc(
     tileName?: string;
     skillName?: string;
     slug?: string;
+    filter?: Record<string, boolean>;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -935,13 +938,15 @@ export async function processTaskIpc(
         );
 
         const { readEnvFile: readSessionizeEnv } = await import('./env.js');
-        const sessionizeVars = readSessionizeEnv(['SESSIONIZE_API_KEY']);
-        const apiKey = sessionizeVars.SESSIONIZE_API_KEY;
+        const sessionizeVars = readSessionizeEnv(['SESSIONIZE_EVENT_API_KEY']);
+        const apiKey = sessionizeVars.SESSIONIZE_EVENT_API_KEY;
 
         if (!apiKey) {
           fs.writeFileSync(
             sessionizeResultPath,
-            JSON.stringify({ error: 'SESSIONIZE_API_KEY not set in .env' }),
+            JSON.stringify({
+              error: 'SESSIONIZE_EVENT_API_KEY not set in .env',
+            }),
           );
           break;
         }
@@ -969,18 +974,37 @@ export async function processTaskIpc(
           }
 
           const event = (await resp.json()) as Record<string, unknown>;
-          const cfp = (event.cfp ?? {}) as Record<string, unknown>;
+          const cfpDates = (event.cfpDates ?? {}) as Record<string, unknown>;
+          const eventDates = (event.eventDates ?? {}) as Record<
+            string,
+            unknown
+          >;
+          const location = (event.location ?? {}) as Record<string, unknown>;
+          const timezone = (event.timezone ?? {}) as Record<string, unknown>;
+          const expenses = (event.expensesCovered ?? {}) as Record<
+            string,
+            unknown
+          >;
           const normalized = {
             name: event.name,
-            cfp_open: cfp.isOpen,
-            cfp_start: cfp.startDate,
-            cfp_end: cfp.endDate,
-            conf_start: event.startDate,
-            conf_end: event.endDate,
-            city: event.city,
-            country: event.country,
+            cfp_open:
+              !!cfpDates.endUtc &&
+              new Date(cfpDates.endUtc as string) > new Date(),
+            cfp_start: cfpDates.startUtc,
+            cfp_end: cfpDates.endUtc,
+            cfp_start_local: cfpDates.start,
+            cfp_end_local: cfpDates.end,
+            conf_start: eventDates.start,
+            conf_end: eventDates.end,
+            location: location.full,
+            city: location.city,
+            country: location.country,
+            timezone: timezone.iana,
+            is_online: event.isOnline,
             website: event.website,
-            cfp_url: `https://sessionize.com/${data.slug}/`,
+            cfp_url: event.cfpLink || `https://sessionize.com/${data.slug}/`,
+            expenses_covered: expenses,
+            organizer: event.organizer,
           };
 
           fs.writeFileSync(
@@ -998,6 +1022,70 @@ export async function processTaskIpc(
             sessionizeResultPath,
             JSON.stringify({ error: errMsg }),
           );
+        }
+      }
+      break;
+
+    case 'sessionize_open_cfps':
+      if (data.requestId) {
+        const cfpsResultPath = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'input',
+          `_script_result_${data.requestId}.json`,
+        );
+
+        const { readEnvFile: readCfpsEnv } = await import('./env.js');
+        const cfpsVars = readCfpsEnv(['SESSIONIZE_SPEAKER_KEY']);
+        const speakerKey = cfpsVars.SESSIONIZE_SPEAKER_KEY;
+
+        if (!speakerKey) {
+          fs.writeFileSync(
+            cfpsResultPath,
+            JSON.stringify({ error: 'SESSIONIZE_SPEAKER_KEY not set in .env' }),
+          );
+          break;
+        }
+
+        logger.info({ sourceGroup }, 'Fetching Sessionize open CFPs');
+
+        try {
+          const resp = await fetch(
+            'https://sessionize.com/api/universal/open-cfps',
+            {
+              headers: { 'X-API-KEY': speakerKey },
+              signal: AbortSignal.timeout(15_000),
+            },
+          );
+
+          if (!resp.ok) {
+            fs.writeFileSync(
+              cfpsResultPath,
+              JSON.stringify({
+                error: `Sessionize API returned ${resp.status}: ${resp.statusText}`,
+              }),
+            );
+            break;
+          }
+
+          let events = (await resp.json()) as Array<Record<string, unknown>>;
+          const filter = (data.filter ?? {}) as Record<string, boolean>;
+
+          // Apply filters — default: exclude online and user groups
+          if (!filter.isOnline) {
+            events = events.filter((e) => !e.isOnline);
+          }
+          if (!filter.isUserGroup) {
+            events = events.filter((e) => !e.isUserGroup);
+          }
+
+          fs.writeFileSync(cfpsResultPath, JSON.stringify({ data: events }));
+          logger.info({ count: events.length }, 'Sessionize open CFPs fetched');
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          logger.error({ error: errMsg }, 'Sessionize open CFPs fetch failed');
+          fs.writeFileSync(cfpsResultPath, JSON.stringify({ error: errMsg }));
         }
       }
       break;
@@ -1058,10 +1146,21 @@ export async function processTaskIpc(
                 }),
               );
             } else {
-              logger.info({ sourceGroup }, 'promote_staging completed');
+              // Clear ALL sessions so every group picks up new tiles on next spawn
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const { deleteAllSessions } =
+                require('./db.js') as typeof import('./db.js');
+              const cleared = deleteAllSessions();
+              logger.info(
+                { sourceGroup, sessionsCleared: cleared },
+                'promote_staging completed — all sessions invalidated',
+              );
               fs.writeFileSync(
                 promoteResultPath,
-                JSON.stringify({ stdout: stdout.trim() }),
+                JSON.stringify({
+                  stdout: stdout.trim(),
+                  sessionsCleared: cleared,
+                }),
               );
             }
           },
