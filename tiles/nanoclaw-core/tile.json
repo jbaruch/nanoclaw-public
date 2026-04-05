@@ -27,6 +27,15 @@
     },
     "context-recovery": {
       "rules": "rules/context-recovery.md"
+    },
+    "post-compaction-trust": {
+      "rules": "rules/post-compaction-trust.md"
+    },
+    "tone-matching": {
+      "rules": "rules/tone-matching.md"
+    },
+    "query-size-limits": {
+      "rules": "rules/query-size-limits.md"
     }
   },
   "skills": {

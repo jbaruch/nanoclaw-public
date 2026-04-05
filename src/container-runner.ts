@@ -369,9 +369,11 @@ function buildVolumeMounts(
   if (fs.existsSync(dstTessl)) {
     const srcRules = path.join(dstTessl, 'RULES.md');
     const dstRules = path.join(groupTesslDir, 'RULES.md');
-    const needsCopy = fs.existsSync(srcRules) &&
+    const needsCopy =
+      fs.existsSync(srcRules) &&
       (!fs.existsSync(dstRules) ||
-        fs.readFileSync(srcRules, 'utf-8') !== fs.readFileSync(dstRules, 'utf-8'));
+        fs.readFileSync(srcRules, 'utf-8') !==
+          fs.readFileSync(dstRules, 'utf-8'));
     if (needsCopy) {
       if (fs.existsSync(groupTesslDir)) {
         fs.rmSync(groupTesslDir, { recursive: true, force: true });
@@ -393,12 +395,10 @@ function buildVolumeMounts(
   // Agent-created skills (staging) — override tile skills if names collide
   const groupSkillsDir = path.join(groupDir, 'skills');
   if (fs.existsSync(groupSkillsDir)) {
-    const stagingSkills = fs
-      .readdirSync(groupSkillsDir)
-      .filter((d) => {
-        const p = path.join(groupSkillsDir, d);
-        return fs.statSync(p).isDirectory();
-      });
+    const stagingSkills = fs.readdirSync(groupSkillsDir).filter((d) => {
+      const p = path.join(groupSkillsDir, d);
+      return fs.statSync(p).isDirectory();
+    });
     if (stagingSkills.length > 0) {
       logger.warn(
         { folder: group.folder, skills: stagingSkills },
