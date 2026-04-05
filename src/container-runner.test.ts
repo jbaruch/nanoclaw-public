@@ -110,7 +110,11 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  runContainerAgent,
+  ContainerOutput,
+  selectTiles,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -230,5 +234,49 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+// --- Tile selection (security-critical) ---
+
+describe('selectTiles', () => {
+  it('main group gets core + trusted + admin', () => {
+    expect(selectTiles(true, false)).toEqual([
+      'nanoclaw-core',
+      'nanoclaw-trusted',
+      'nanoclaw-admin',
+    ]);
+  });
+
+  it('main group gets admin even if also marked trusted', () => {
+    expect(selectTiles(true, true)).toEqual([
+      'nanoclaw-core',
+      'nanoclaw-trusted',
+      'nanoclaw-admin',
+    ]);
+  });
+
+  it('trusted group gets core + trusted, NOT admin', () => {
+    const tiles = selectTiles(false, true);
+    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-trusted']);
+    expect(tiles).not.toContain('nanoclaw-admin');
+  });
+
+  it('untrusted group gets core + untrusted, NOT trusted or admin', () => {
+    const tiles = selectTiles(false, false);
+    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-untrusted']);
+    expect(tiles).not.toContain('nanoclaw-trusted');
+    expect(tiles).not.toContain('nanoclaw-admin');
+  });
+
+  it('all tiers include nanoclaw-core', () => {
+    expect(selectTiles(true, false)[0]).toBe('nanoclaw-core');
+    expect(selectTiles(false, true)[0]).toBe('nanoclaw-core');
+    expect(selectTiles(false, false)[0]).toBe('nanoclaw-core');
+  });
+
+  it('admin tile is NEVER in trusted or untrusted selections', () => {
+    expect(selectTiles(false, true)).not.toContain('nanoclaw-admin');
+    expect(selectTiles(false, false)).not.toContain('nanoclaw-admin');
   });
 });

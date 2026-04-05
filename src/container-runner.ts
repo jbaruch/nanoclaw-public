@@ -36,6 +36,17 @@ import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 import { readEnvFile } from './env.js';
 
+/**
+ * Select which tiles to install based on group trust tier.
+ * Main: core + trusted + admin. Trusted: core + trusted. Untrusted: core + untrusted.
+ * Admin loads last so it can override trusted skills.
+ */
+export function selectTiles(isMain: boolean, isTrusted: boolean): string[] {
+  if (isMain) return ['nanoclaw-core', 'nanoclaw-trusted', 'nanoclaw-admin'];
+  if (isTrusted) return ['nanoclaw-core', 'nanoclaw-trusted'];
+  return ['nanoclaw-core', 'nanoclaw-untrusted'];
+}
+
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
@@ -284,12 +295,7 @@ function buildVolumeMounts(
     fs.rmSync(dstTessl, { recursive: true, force: true });
   }
 
-  // Tiles come from the tessl registry (installed by orchestrator).
-  // Main/trusted: all tiles. Admin loads last so it can override trusted skills.
-  const trustedTiles = ['nanoclaw-core', 'nanoclaw-trusted', 'nanoclaw-admin'];
-  const untrustedTiles = ['nanoclaw-core', 'nanoclaw-untrusted'];
-  const tilesToInstall =
-    isMain || group.containerConfig?.trusted ? trustedTiles : untrustedTiles;
+  const tilesToInstall = selectTiles(isMain, !!group.containerConfig?.trusted);
 
   const registryTiles = path.join(
     process.cwd(),
