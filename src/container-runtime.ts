@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync, spawnSync } from 'child_process';
+import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 
@@ -27,7 +27,6 @@ function detectProxyBindHost(): string {
   if (os.platform() === 'darwin') return '127.0.0.1';
 
   // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
-  // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
   if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
 
   // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
@@ -57,7 +56,7 @@ export function readonlyMountArgs(
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/** Stop a container by name. */
+/** Stop a container by name. Validates name to prevent shell injection. */
 export function stopContainer(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
@@ -65,7 +64,7 @@ export function stopContainer(name: string): void {
   execSync(`${CONTAINER_RUNTIME_BIN} stop ${name}`, { stdio: 'pipe' });
 }
 
-/** Ensure the container runtime is running, starting it if needed. */
+/** Ensure the container runtime (Docker) is running. */
 export function ensureContainerRuntimeRunning(): void {
   try {
     execSync(`${CONTAINER_RUNTIME_BIN} info`, {
@@ -73,48 +72,44 @@ export function ensureContainerRuntimeRunning(): void {
       timeout: 10000,
     });
     logger.debug('Container runtime already running');
-  } catch (err) {
-    logger.error({ err }, 'Failed to reach container runtime');
+  } catch {
+    logger.error('Docker is not running or not installed');
     console.error(
       '\n╔════════════════════════════════════════════════════════════════╗',
     );
     console.error(
-      '║  FATAL: Container runtime failed to start                      ║',
+      '║  FATAL: Docker is not running                                  ║',
     );
     console.error(
       '║                                                                ║',
     );
     console.error(
-      '║  Agents cannot run without a container runtime. To fix:        ║',
+      '║  Agents cannot run without Docker. To fix:                     ║',
     );
     console.error(
-      '║  1. Ensure Docker is installed and running                     ║',
+      '║  1. Start Docker Desktop (macOS) or dockerd (Linux)            ║',
     );
     console.error(
-      '║  2. Run: docker info                                           ║',
-    );
-    console.error(
-      '║  3. Restart NanoClaw                                           ║',
+      '║  2. Restart NanoClaw                                           ║',
     );
     console.error(
       '╚════════════════════════════════════════════════════════════════╝\n',
     );
-    throw new Error('Container runtime is required but failed to start', {
-      cause: err,
-    });
+    throw new Error('Container runtime is required but failed to start');
   }
 }
 
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const result = spawnSync(
-      CONTAINER_RUNTIME_BIN,
-      ['ps', '--filter', 'name=nanoclaw-', '--format', '{{.Names}}'],
+    const output = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --format "{{.Names}}"`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
-    const output = result.stdout;
-    const orphans = output.trim().split('\n').filter(Boolean);
+    const orphans = output
+      .split('\n')
+      .map((n) => n.trim())
+      .filter((n) => n.startsWith('nanoclaw-'));
     for (const name of orphans) {
       try {
         stopContainer(name);
