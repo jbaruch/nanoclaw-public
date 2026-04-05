@@ -67,6 +67,11 @@ RUN chown -R node:node /workspace && \
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node
 
+# Limit git memory usage (baked in so read-only rootfs containers don't fail)
+RUN git config --global pack.threads 1 && \
+    git config --global pack.deltaCacheSize 1m && \
+    git config --global pack.windowMemory 100m
+
 # Set working directory to group workspace
 WORKDIR /workspace/group
 

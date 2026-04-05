@@ -5,6 +5,6 @@ When you learn something new and operationally important — a workflow, where s
 ## YYYY-MM-DD HH:MM UTC
 **What:** [one-line description of what you learned]
 **Context:** [how you found out / what prompted this]
-**Promote to:** [RUNBOOK.md / MEMORY.md / unsure]
+**Promote to:** [RUNBOOK.md / typed memory file + MEMORY.md index / unsure]
 
 Do this immediately when learned, not at end of session. This ensures the knowledge survives context compaction.
