@@ -268,7 +268,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Cooldown expired — reset and let the group try again
     delete circuitBreakerUntil[group.folder];
     consecutiveFailures[group.folder] = 0;
-    logger.info({ group: group.name }, 'Circuit breaker cooldown expired — resuming');
+    logger.info(
+      { group: group.name },
+      'Circuit breaker cooldown expired — resuming',
+    );
   }
 
   const missedMessages = getMessagesSince(
