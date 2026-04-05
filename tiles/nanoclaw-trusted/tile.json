@@ -21,6 +21,9 @@
     },
     "session-bootstrap": {
       "rules": "rules/session-bootstrap.md"
+    },
+    "verification-protocol": {
+      "rules": "rules/verification-protocol.md"
     }
   },
   "skills": {
