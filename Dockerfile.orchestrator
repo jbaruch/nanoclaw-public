@@ -45,6 +45,8 @@ RUN mkdir -p /app/tessl-workspace && \
 # Copy group templates (used by registerGroup to create CLAUDE.md for new groups)
 COPY groups/main/CLAUDE.md ./groups/main/CLAUDE.md
 COPY groups/global/CLAUDE.md ./groups/global/CLAUDE.md
+COPY groups/global/CLAUDE-untrusted.md ./groups/global/CLAUDE-untrusted.md
+# SOUL-untrusted.md is personal — create your own or it will be skipped at mount time
 
 # Remove devDependencies after build
 RUN npm prune --omit=dev

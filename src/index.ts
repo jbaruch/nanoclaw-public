@@ -147,13 +147,18 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   // Copy CLAUDE.md template into the new group folder so agents have
   // identity and instructions from the first run.  (Fixes #1391)
+  // Main: full admin template. Trusted: global template. Untrusted: dedicated template.
   const groupMdFile = path.join(groupDir, 'CLAUDE.md');
   if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
+    const isUntrusted = !group.isMain && !group.containerConfig?.trusted;
+    let templateFile: string;
+    if (group.isMain) {
+      templateFile = path.join(GROUPS_DIR, 'main', 'CLAUDE.md');
+    } else if (isUntrusted) {
+      templateFile = path.join(GROUPS_DIR, 'global', 'CLAUDE-untrusted.md');
+    } else {
+      templateFile = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+    }
     if (fs.existsSync(templateFile)) {
       let content = fs.readFileSync(templateFile, 'utf-8');
       if (ASSISTANT_NAME !== 'Andy') {
@@ -339,6 +344,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             timestamp: new Date().toISOString(),
             is_from_me: true,
             is_bot_message: true,
+            reply_to_message_id: replyId,
           });
           // Consume after first reply — prevents replying to the wrong message
           // when user sends follow-ups while background agent is working.
@@ -397,6 +403,7 @@ async function runAgent(
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
+  const isTrusted = !!group.containerConfig?.trusted;
   const tasks = getAllTasks();
   writeTasksSnapshot(
     group.folder,
@@ -411,6 +418,7 @@ async function runAgent(
       status: t.status,
       next_run: t.next_run,
     })),
+    isTrusted,
   );
 
   // Update available groups snapshot (main group only can see all groups)
@@ -420,6 +428,7 @@ async function runAgent(
     isMain,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
+    isTrusted,
   );
 
   // Wrap onOutput to track session ID from streamed results
@@ -858,7 +867,12 @@ async function main(): Promise<void> {
         next_run: t.next_run,
       }));
       for (const group of Object.values(registeredGroups)) {
-        writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
+        writeTasksSnapshot(
+          group.folder,
+          group.isMain === true,
+          taskRows,
+          !!group.containerConfig?.trusted,
+        );
       }
     },
   });
