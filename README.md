@@ -64,7 +64,7 @@ Skills and rules delivered via [tessl](https://tessl.io) tiles with trust-based 
 |------|-----------|---------|
 | `nanoclaw-core` | All containers | Silence rules, context recovery, ground truth |
 | `nanoclaw-trusted` | Trusted + main | Memory bootstrap, system health, trusted behavior |
-| `nanoclaw-admin` | Main only | Email, calendar, CFPs, heartbeat, group management |
+| `nanoclaw-admin` | Main only | Email, calendar, heartbeat, group management |
 | `nanoclaw-untrusted` | Untrusted only | Security rules, bad actor disengage |
 
 ### Unanswered Message Detection
