@@ -754,7 +754,7 @@ async function main(): Promise<void> {
       } catch (resumeErr) {
         const msg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
         if (sessionId && /session|conversation not found|resume/i.test(msg)) {
-          log(`Session resume failed (\${msg}), retrying with fresh session`);
+          log(`Session resume failed (${msg}), retrying with fresh session`);
           sessionId = undefined;
           resumeAt = undefined;
           queryResult = await runQuery(prompt, undefined, mcpServerPath, containerInput, sdkEnv, undefined);
