@@ -30,6 +30,7 @@ interface ContainerInput {
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
+  isTrusted?: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
@@ -433,12 +434,23 @@ async function runQuery(
   let lastStreamEmit = 0;
   const STREAM_THROTTLE_MS = 300;
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
+  // Load SOUL.md and global CLAUDE.md into systemPrompt.append so they survive
+  // compaction. The SDK re-injects system prompt content every turn — behavioral
+  // instructions placed here won't drift after long conversations or compaction.
+  // NOTE: /workspace/global/SOUL.md resolves to the correct file per trust tier —
+  // trusted containers mount the full SOUL.md, untrusted mount SOUL-untrusted.md
+  // at the same path. No trust check needed here; the mount layer handles it.
+  const soulMdPath = '/workspace/global/SOUL.md';
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+  const appendParts: string[] = [];
+  if (fs.existsSync(soulMdPath)) {
+    appendParts.push(fs.readFileSync(soulMdPath, 'utf-8'));
   }
+  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+    appendParts.push(fs.readFileSync(globalClaudeMdPath, 'utf-8'));
+  }
+  const systemPromptAppend =
+    appendParts.length > 0 ? appendParts.join('\n\n---\n\n') : undefined;
 
   // Rules are loaded by the SDK via the tessl chain: CLAUDE.md → AGENTS.md → .tessl/RULES.md
   // For untrusted groups, the orchestrator copies .tessl from a main group's session.
@@ -466,11 +478,11 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
+      systemPrompt: systemPromptAppend
         ? {
             type: 'preset' as const,
             preset: 'claude_code' as const,
-            append: globalClaudeMd,
+            append: systemPromptAppend,
           }
         : undefined,
       allowedTools: [
@@ -731,6 +743,13 @@ async function main(): Promise<void> {
     // Script says wake agent — enrich prompt with script data
     log(`Script wakeAgent=true, enriching prompt with data`);
     prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
+  }
+
+  // Tag untrusted group prompts with origin markers so the model (and compaction)
+  // can distinguish user instructions from untrusted input. Trusted and main group
+  // prompts are left untagged — they carry the same authority as system instructions.
+  if (!containerInput.isMain && !containerInput.isTrusted) {
+    prompt = `<untrusted-input source="${containerInput.groupFolder}">\n${prompt}\n</untrusted-input>`;
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat

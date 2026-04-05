@@ -84,6 +84,12 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
+// Circuit breaker: pause groups that fail repeatedly to avoid burning credits.
+const MAX_CONSECUTIVE_FAILURES = 5;
+const CIRCUIT_BREAKER_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const consecutiveFailures: Record<string, number> = {};
+const circuitBreakerUntil: Record<string, number> = {};
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -245,6 +251,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
+  // Circuit breaker: skip groups that have failed too many times in a row
+  const breakerExpiry = circuitBreakerUntil[group.folder];
+  if (breakerExpiry) {
+    if (Date.now() < breakerExpiry) {
+      logger.warn({ group: group.name }, 'Circuit breaker active — skipping');
+      return true;
+    }
+    // Cooldown expired — reset and let the group try again
+    delete circuitBreakerUntil[group.folder];
+    consecutiveFailures[group.folder] = 0;
+    logger.info({ group: group.name }, 'Circuit breaker cooldown expired — resuming');
+  }
+
   const missedMessages = getMessagesSince(
     chatJid,
     getOrRecoverCursor(chatJid),
@@ -370,6 +389,31 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
+    // Track consecutive failures for circuit breaker
+    consecutiveFailures[group.folder] =
+      (consecutiveFailures[group.folder] || 0) + 1;
+    if (consecutiveFailures[group.folder] >= MAX_CONSECUTIVE_FAILURES) {
+      circuitBreakerUntil[group.folder] =
+        Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+      logger.error(
+        { group: group.name, failures: consecutiveFailures[group.folder] },
+        `Circuit breaker tripped — pausing group for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60_000} minutes`,
+      );
+      // Notify via main group if this isn't the main group
+      if (!isMainGroup) {
+        const mainJid = Object.keys(registeredGroups).find(
+          (jid) => registeredGroups[jid].isMain,
+        );
+        if (mainJid) {
+          const mainChannel = findChannel(channels, mainJid);
+          mainChannel?.sendMessage(
+            mainJid,
+            `Circuit breaker tripped for "${group.name}" — ${consecutiveFailures[group.folder]} consecutive failures. Paused for 30 minutes. Check logs.`,
+          );
+        }
+      }
+    }
+
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
@@ -389,6 +433,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  // Reset failure counter on success
+  consecutiveFailures[group.folder] = 0;
   return true;
 }
 
@@ -451,6 +497,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        isTrusted: !!group.containerConfig?.trusted,
         assistantName: ASSISTANT_NAME,
         replyToMessageId,
       },

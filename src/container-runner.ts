@@ -243,28 +243,31 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  // Write settings.json only if content has changed — unnecessary rewrites
+  // invalidate the SDK's prompt cache (file mtime changes trigger cache misses).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  // Always write — settings may have changed (model, memory, teams)
-  {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            CLAUDE_CODE_MODEL: 'claude-opus-4-6',
-            CLAUDE_CODE_MAX_CONTEXT_WINDOW: '1000000',
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            CLAUDE_CODE_EFFORT_LEVEL: 'max',
-            // Disable auto-memory for untrusted groups to prevent persistent injection
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY:
-              isMain || group.containerConfig?.trusted ? '0' : '1',
-          },
+  const newSettings =
+    JSON.stringify(
+      {
+        env: {
+          CLAUDE_CODE_MODEL: 'claude-opus-4-6',
+          CLAUDE_CODE_MAX_CONTEXT_WINDOW: '1000000',
+          CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+          CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+          CLAUDE_CODE_EFFORT_LEVEL: 'max',
+          // Disable auto-memory for untrusted groups to prevent persistent injection
+          CLAUDE_CODE_DISABLE_AUTO_MEMORY:
+            isMain || group.containerConfig?.trusted ? '0' : '1',
         },
-        null,
-        2,
-      ) + '\n',
-    );
+      },
+      null,
+      2,
+    ) + '\n';
+  if (
+    !fs.existsSync(settingsFile) ||
+    fs.readFileSync(settingsFile, 'utf-8') !== newSettings
+  ) {
+    fs.writeFileSync(settingsFile, newSettings);
   }
 
   // Tile delivery — all host-side, no tessl CLI in containers.
