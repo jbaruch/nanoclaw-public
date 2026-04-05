@@ -17,7 +17,11 @@
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query,
+  HookCallback,
+  PreCompactHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
 interface ContainerInput {
@@ -92,7 +96,9 @@ class MessageStream {
         yield this.queue.shift()!;
       }
       if (this.done) return;
-      await new Promise<void>(r => { this.waiting = r; });
+      await new Promise<void>((r) => {
+        this.waiting = r;
+      });
       this.waiting = null;
     }
   }
@@ -102,7 +108,9 @@ async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = '';
     process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('data', (chunk) => {
+      data += chunk;
+    });
     process.stdin.on('end', () => resolve(data));
     process.stdin.on('error', reject);
   });
@@ -121,7 +129,10 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
+function getSessionSummary(
+  sessionId: string,
+  transcriptPath: string,
+): string | null {
   const projectDir = path.dirname(transcriptPath);
   const indexPath = path.join(projectDir, 'sessions-index.json');
 
@@ -131,13 +142,17 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
   }
 
   try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
+    const index: SessionsIndex = JSON.parse(
+      fs.readFileSync(indexPath, 'utf-8'),
+    );
+    const entry = index.entries.find((e) => e.sessionId === sessionId);
     if (entry?.summary) {
       return entry.summary;
     }
   } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+    log(
+      `Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   return null;
@@ -176,12 +191,18 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       const filename = `${date}-${name}.md`;
       const filePath = path.join(conversationsDir, filename);
 
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
+      const markdown = formatTranscriptMarkdown(
+        messages,
+        summary,
+        assistantName,
+      );
       fs.writeFileSync(filePath, markdown);
 
       log(`Archived conversation to ${filePath}`);
     } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+      log(
+        `Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     return {};
@@ -214,9 +235,12 @@ function parseTranscript(content: string): ParsedMessage[] {
     try {
       const entry = JSON.parse(line);
       if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
+        const text =
+          typeof entry.message.content === 'string'
+            ? entry.message.content
+            : entry.message.content
+                .map((c: { text?: string }) => c.text || '')
+                .join('');
         if (text) messages.push({ role: 'user', content: text });
       } else if (entry.type === 'assistant' && entry.message?.content) {
         const textParts = entry.message.content
@@ -225,22 +249,26 @@ function parseTranscript(content: string): ParsedMessage[] {
         const text = textParts.join('');
         if (text) messages.push({ role: 'assistant', content: text });
       }
-    } catch {
-    }
+    } catch {}
   }
 
   return messages;
 }
 
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null, assistantName?: string): string {
+function formatTranscriptMarkdown(
+  messages: ParsedMessage[],
+  title?: string | null,
+  assistantName?: string,
+): string {
   const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
+  const formatDateTime = (d: Date) =>
+    d.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
 
   const lines: string[] = [];
   lines.push(`# ${title || 'Conversation'}`);
@@ -251,10 +279,11 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   lines.push('');
 
   for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : (assistantName || 'Assistant');
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
+    const sender = msg.role === 'user' ? 'User' : assistantName || 'Assistant';
+    const content =
+      msg.content.length > 2000
+        ? msg.content.slice(0, 2000) + '...'
+        : msg.content;
     lines.push(`**${sender}**: ${content}`);
     lines.push('');
   }
@@ -267,7 +296,11 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  */
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+    } catch {
+      /* ignore */
+    }
     return true;
   }
   return false;
@@ -276,14 +309,17 @@ function shouldClose(): boolean {
 /**
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
+ * Tracks consumed files in memory so read-only mounts don't cause infinite loops.
  */
 const REPLY_TO_FILE = path.join(IPC_INPUT_DIR, '_reply_to');
+const consumedInputFiles = new Set<string>();
 
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json') && !f.startsWith('_script_result_'))
+    const files = fs
+      .readdirSync(IPC_INPUT_DIR)
+      .filter((f) => f.endsWith('.json') && !f.startsWith('_script_result_') && !consumedInputFiles.has(f))
       .sort();
 
     const messages: string[] = [];
@@ -292,7 +328,10 @@ function drainIpcInput(): string[] {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
+        consumedInputFiles.add(file);
+        try { fs.unlinkSync(filePath); } catch (e: any) {
+          if (e.code !== 'EROFS' && e.code !== 'EACCES') throw e;
+        }
         if (data.type === 'message' && data.text) {
           messages.push(data.text);
           if (data.replyToMessageId) {
@@ -300,8 +339,13 @@ function drainIpcInput(): string[] {
           }
         }
       } catch (err) {
-        log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+        log(
+          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        consumedInputFiles.add(file);
+        try { fs.unlinkSync(filePath); } catch (e: any) {
+          if (e.code !== 'EROFS' && e.code !== 'EACCES' && e.code !== 'ENOENT') throw e;
+        }
       }
     }
     // Write the latest replyToMessageId so the MCP server can pick it up
@@ -350,7 +394,11 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+): Promise<{
+  newSessionId?: string;
+  lastAssistantUuid?: string;
+  closedDuringQuery: boolean;
+}> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -419,17 +467,32 @@ async function runQuery(
       resume: sessionId,
       resumeSessionAt: resumeAt,
       systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+        ? {
+            type: 'preset' as const,
+            preset: 'claude_code' as const,
+            append: globalClaudeMd,
+          }
         : undefined,
       allowedTools: [
         'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
+        'Read',
+        'Write',
+        'Edit',
+        'Glob',
+        'Grep',
+        'WebSearch',
+        'WebFetch',
+        'Task',
+        'TaskOutput',
+        'TaskStop',
+        'TeamCreate',
+        'TeamDelete',
+        'SendMessage',
+        'TodoWrite',
+        'ToolSearch',
+        'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -469,12 +532,17 @@ async function runQuery(
           : {}),
       },
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+        PreCompact: [
+          { hooks: [createPreCompactHook(containerInput.assistantName)] },
+        ],
       },
-    }
+    },
   })) {
     messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
+    const msgType =
+      message.type === 'system'
+        ? `system/${(message as { subtype?: string }).subtype}`
+        : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
     if (message.type === 'assistant' && 'uuid' in message) {
@@ -502,25 +570,39 @@ async function runQuery(
       log(`Session initialized: ${newSessionId}`);
     }
 
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+    if (
+      message.type === 'system' &&
+      (message as { subtype?: string }).subtype === 'task_notification'
+    ) {
+      const tn = message as {
+        task_id: string;
+        status: string;
+        summary: string;
+      };
+      log(
+        `Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`,
+      );
     }
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const textResult =
+        'result' in message ? (message as { result?: string }).result : null;
+      log(
+        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
+      );
       writeOutput({
         status: 'success',
         result: textResult || null,
-        newSessionId
+        newSessionId,
       });
     }
   }
 
   ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
+  log(
+    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
+  );
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
@@ -536,40 +618,47 @@ async function runScript(script: string): Promise<ScriptResult | null> {
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 
   return new Promise((resolve) => {
-    execFile('bash', [scriptPath], {
-      timeout: SCRIPT_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
-      env: process.env,
-    }, (error, stdout, stderr) => {
-      if (stderr) {
-        log(`Script stderr: ${stderr.slice(0, 500)}`);
-      }
+    execFile(
+      'bash',
+      [scriptPath],
+      {
+        timeout: SCRIPT_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+        env: process.env,
+      },
+      (error, stdout, stderr) => {
+        if (stderr) {
+          log(`Script stderr: ${stderr.slice(0, 500)}`);
+        }
 
-      if (error) {
-        log(`Script error: ${error.message}`);
-        return resolve(null);
-      }
-
-      // Parse last non-empty line of stdout as JSON
-      const lines = stdout.trim().split('\n');
-      const lastLine = lines[lines.length - 1];
-      if (!lastLine) {
-        log('Script produced no output');
-        return resolve(null);
-      }
-
-      try {
-        const result = JSON.parse(lastLine);
-        if (typeof result.wakeAgent !== 'boolean') {
-          log(`Script output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`);
+        if (error) {
+          log(`Script error: ${error.message}`);
           return resolve(null);
         }
-        resolve(result as ScriptResult);
-      } catch {
-        log(`Script output is not valid JSON: ${lastLine.slice(0, 200)}`);
-        resolve(null);
-      }
-    });
+
+        // Parse last non-empty line of stdout as JSON
+        const lines = stdout.trim().split('\n');
+        const lastLine = lines[lines.length - 1];
+        if (!lastLine) {
+          log('Script produced no output');
+          return resolve(null);
+        }
+
+        try {
+          const result = JSON.parse(lastLine);
+          if (typeof result.wakeAgent !== 'boolean') {
+            log(
+              `Script output missing wakeAgent boolean: ${lastLine.slice(0, 200)}`,
+            );
+            return resolve(null);
+          }
+          resolve(result as ScriptResult);
+        } catch {
+          log(`Script output is not valid JSON: ${lastLine.slice(0, 200)}`);
+          resolve(null);
+        }
+      },
+    );
   });
 }
 
@@ -579,13 +668,17 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
+    try {
+      fs.unlinkSync('/tmp/input.json');
+    } catch {
+      /* may not exist */
+    }
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
       status: 'error',
       result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
   }
@@ -601,7 +694,11 @@ async function main(): Promise<void> {
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale _close sentinel from previous container runs
-  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try {
+    fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+  } catch {
+    /* ignore */
+  }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -620,7 +717,9 @@ async function main(): Promise<void> {
     const scriptResult = await runScript(containerInput.script);
 
     if (!scriptResult || !scriptResult.wakeAgent) {
-      const reason = scriptResult ? 'wakeAgent=false' : 'script error/no output';
+      const reason = scriptResult
+        ? 'wakeAgent=false'
+        : 'script error/no output';
       log(`Script decided not to wake agent: ${reason}`);
       writeOutput({
         status: 'success',
@@ -638,11 +737,20 @@ async function main(): Promise<void> {
   let resumeAt: string | undefined;
   try {
     while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+      log(
+        `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
+      );
 
       let queryResult;
       try {
-        queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+        queryResult = await runQuery(
+          prompt,
+          sessionId,
+          mcpServerPath,
+          containerInput,
+          sdkEnv,
+          resumeAt,
+        );
       } catch (resumeErr) {
         const msg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
         if (sessionId && /session|conversation not found|resume/i.test(msg)) {
@@ -691,7 +799,7 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       newSessionId: sessionId,
-      error: errorMessage
+      error: errorMessage,
     });
     process.exit(1);
   }
