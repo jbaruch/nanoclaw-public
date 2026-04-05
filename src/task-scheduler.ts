@@ -145,6 +145,7 @@ async function runTask(
       status: t.status,
       next_run: t.next_run,
     })),
+    !!group.containerConfig?.trusted,
   );
 
   let result: string | null = null;
