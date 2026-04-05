@@ -51,9 +51,6 @@
     "check-cfps": {
       "path": "skills/check-cfps/SKILL.md"
     },
-    "trakt-watch-history": {
-      "path": "skills/trakt-watch-history/SKILL.md"
-    },
     "check-orders": {
       "path": "skills/check-orders/SKILL.md"
     },

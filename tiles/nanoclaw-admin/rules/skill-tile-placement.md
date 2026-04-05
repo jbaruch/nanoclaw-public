@@ -5,7 +5,7 @@ When promoting a skill or rule, always choose the correct plugin:
 ## Decision checklist — run through in order
 
 1. **Does it require Composio, Google APIs, or any external credentials?** → **nanoclaw-admin**
-2. **Does it call `run_host_script`, `promote_staging`, or manage NanoClaw infrastructure?** → **nanoclaw-admin**
+2. **Does it call named host operations, `promote_staging`, or manage NanoClaw infrastructure?** → **nanoclaw-admin**
 3. **Is it only meaningful in the main channel?** → **nanoclaw-admin**
 4. **Does it read/write `/workspace/trusted/` or manage shared memory?** → **nanoclaw-trusted**
 5. **Is it operational behavior for trusted containers (verification, system health)?** → **nanoclaw-trusted**

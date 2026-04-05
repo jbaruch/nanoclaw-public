@@ -342,7 +342,7 @@ function buildVolumeMounts(
         fs.cpSync(skillSrcDir, path.join(skillsDst, `tessl__${skillDir}`), {
           recursive: true,
         });
-        // Copy bundled scripts to group's scripts/ dir (used by run_host_script)
+        // Copy bundled scripts to group's scripts/ dir (used by named host operations)
         const skillScriptsDir = path.join(skillSrcDir, 'scripts');
         if (fs.existsSync(skillScriptsDir)) {
           const groupScriptsDir = path.join(groupDir, 'scripts');
@@ -546,8 +546,8 @@ function buildContainerArgs(
   //   Main/Trusted: Composio only (handles Gmail, Calendar, Tasks, GitHub via OAuth)
   //   Other:        nothing (Anthropic via proxy only)
   //
-  // All other credentials (GITHUB_TOKEN, GOOGLE_*, RECLAIM_*, TRIPIT_*, OPENAI_*)
-  // stay on the host. Scripts that need them run host-side via IPC.
+  // All other credentials stay on the host. Scripts that need them run
+  // host-side via named IPC operations with locked-down env vars.
   const isTrusted = group.containerConfig?.trusted === true;
 
   const CONTAINER_VARS = ['COMPOSIO_API_KEY'];
