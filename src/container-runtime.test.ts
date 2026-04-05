@@ -10,12 +10,10 @@ vi.mock('./logger.js', () => ({
   },
 }));
 
-// Mock child_process — store the mock fns so tests can configure them
+// Mock child_process — store the mock fn so tests can configure it
 const mockExecSync = vi.fn();
-const mockSpawnSync = vi.fn();
 vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
-  spawnSync: (...args: unknown[]) => mockSpawnSync(...args),
 }));
 
 import {
@@ -29,8 +27,6 @@ import { logger } from './logger.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // Default spawnSync to return empty stdout
-  mockSpawnSync.mockReturnValue({ stdout: '', stderr: '', status: 0 });
 });
 
 // --- Pure functions ---
@@ -43,7 +39,7 @@ describe('readonlyMountArgs', () => {
 });
 
 describe('stopContainer', () => {
-  it('calls docker stop via execSync for valid container names', () => {
+  it('calls stop via execSync for valid container names', () => {
     stopContainer('nanoclaw-test-123');
     expect(mockExecSync).toHaveBeenCalledWith(
       `${CONTAINER_RUNTIME_BIN} stop nanoclaw-test-123`,
@@ -82,8 +78,8 @@ describe('ensureContainerRuntimeRunning', () => {
   });
 
   it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('Cannot connect to the Docker daemon');
+    mockExecSync.mockImplementation(() => {
+      throw new Error('not running');
     });
 
     expect(() => ensureContainerRuntimeRunning()).toThrow(
@@ -97,25 +93,22 @@ describe('ensureContainerRuntimeRunning', () => {
 
 describe('cleanupOrphans', () => {
   it('stops orphaned nanoclaw containers', () => {
-    // spawnSync for ps returns container names
-    mockSpawnSync.mockReturnValueOnce({
-      stdout: 'nanoclaw-group1-111\nnanoclaw-group2-222\n',
-      stderr: '',
-      status: 0,
-    });
+    mockExecSync.mockReturnValueOnce(
+      'nanoclaw-group1-111\nnanoclaw-group2-222\nother-container\n',
+    );
+    mockExecSync.mockReturnValue('');
 
     cleanupOrphans();
 
-    // ps via spawnSync, 2 stop calls via execSync
-    expect(mockSpawnSync).toHaveBeenCalledTimes(1);
-    expect(mockExecSync).toHaveBeenCalledTimes(2);
+    // ps + 2 stop calls (only nanoclaw- containers)
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
     expect(mockExecSync).toHaveBeenNthCalledWith(
-      1,
+      2,
       `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group1-111`,
       { stdio: 'pipe' },
     );
     expect(mockExecSync).toHaveBeenNthCalledWith(
-      2,
+      3,
       `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group2-222`,
       { stdio: 'pipe' },
     );
@@ -126,20 +119,16 @@ describe('cleanupOrphans', () => {
   });
 
   it('does nothing when no orphans exist', () => {
-    mockSpawnSync.mockReturnValueOnce({
-      stdout: '',
-      stderr: '',
-      status: 0,
-    });
+    mockExecSync.mockReturnValueOnce('\n');
 
     cleanupOrphans();
 
-    expect(mockSpawnSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(1);
     expect(logger.info).not.toHaveBeenCalled();
   });
 
   it('warns and continues when ps fails', () => {
-    mockSpawnSync.mockImplementationOnce(() => {
+    mockExecSync.mockImplementationOnce(() => {
       throw new Error('docker not available');
     });
 
@@ -152,11 +141,7 @@ describe('cleanupOrphans', () => {
   });
 
   it('continues stopping remaining containers when one stop fails', () => {
-    mockSpawnSync.mockReturnValueOnce({
-      stdout: 'nanoclaw-a-1\nnanoclaw-b-2\n',
-      stderr: '',
-      status: 0,
-    });
+    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n');
     // First stop fails
     mockExecSync.mockImplementationOnce(() => {
       throw new Error('already stopped');
@@ -166,8 +151,7 @@ describe('cleanupOrphans', () => {
 
     cleanupOrphans(); // should not throw
 
-    expect(mockSpawnSync).toHaveBeenCalledTimes(1);
-    expect(mockExecSync).toHaveBeenCalledTimes(2);
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
     expect(logger.info).toHaveBeenCalledWith(
       { count: 2, names: ['nanoclaw-a-1', 'nanoclaw-b-2'] },
       'Stopped orphaned containers',
