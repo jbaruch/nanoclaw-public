@@ -74,7 +74,6 @@ Bot replies are tracked via `reply_to_message_id`. A deterministic script detect
 ### Other Improvements
 
 - **Reply context** — quoted messages passed to agent for conversation threading
-- **Sessionize MCP tools** — fetch CFP data and open CFPs from speaker account
 - **Default silence** — comprehensive forbidden phrase list from real leaked patterns
 - **Bad actor disengage** — total silence after detecting adversarial behavior
 - **Staging override warnings** — logs when stale development copies shadow tile updates

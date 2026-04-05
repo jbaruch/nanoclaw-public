@@ -358,13 +358,11 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
-    // For run_host_script / github_backup / promote_staging / sessionize
+    // For run_host_script / github_backup / promote_staging
     requestId?: string;
     message?: string;
     tileName?: string;
     skillName?: string;
-    slug?: string;
-    filter?: Record<string, boolean>;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -924,169 +922,6 @@ export async function processTaskIpc(
             }
           },
         );
-      }
-      break;
-
-    case 'sessionize_get_event':
-      if (data.requestId && data.slug) {
-        const sessionizeResultPath = path.join(
-          DATA_DIR,
-          'ipc',
-          sourceGroup,
-          'input',
-          `_script_result_${data.requestId}.json`,
-        );
-
-        const { readEnvFile: readSessionizeEnv } = await import('./env.js');
-        const sessionizeVars = readSessionizeEnv(['SESSIONIZE_EVENT_API_KEY']);
-        const apiKey = sessionizeVars.SESSIONIZE_EVENT_API_KEY;
-
-        if (!apiKey) {
-          fs.writeFileSync(
-            sessionizeResultPath,
-            JSON.stringify({
-              error: 'SESSIONIZE_EVENT_API_KEY not set in .env',
-            }),
-          );
-          break;
-        }
-
-        logger.info(
-          { slug: data.slug, sourceGroup },
-          'Fetching Sessionize event',
-        );
-
-        try {
-          const url = `https://sessionize.com/api/universal/event?slug=${encodeURIComponent(data.slug)}`;
-          const resp = await fetch(url, {
-            headers: { 'X-API-KEY': apiKey },
-            signal: AbortSignal.timeout(15_000),
-          });
-
-          if (!resp.ok) {
-            fs.writeFileSync(
-              sessionizeResultPath,
-              JSON.stringify({
-                error: `Sessionize API returned ${resp.status}: ${resp.statusText}`,
-              }),
-            );
-            break;
-          }
-
-          const event = (await resp.json()) as Record<string, unknown>;
-          const cfpDates = (event.cfpDates ?? {}) as Record<string, unknown>;
-          const eventDates = (event.eventDates ?? {}) as Record<
-            string,
-            unknown
-          >;
-          const location = (event.location ?? {}) as Record<string, unknown>;
-          const timezone = (event.timezone ?? {}) as Record<string, unknown>;
-          const expenses = (event.expensesCovered ?? {}) as Record<
-            string,
-            unknown
-          >;
-          const normalized = {
-            name: event.name,
-            cfp_open:
-              !!cfpDates.endUtc &&
-              new Date(cfpDates.endUtc as string) > new Date(),
-            cfp_start: cfpDates.startUtc,
-            cfp_end: cfpDates.endUtc,
-            cfp_start_local: cfpDates.start,
-            cfp_end_local: cfpDates.end,
-            conf_start: eventDates.start,
-            conf_end: eventDates.end,
-            location: location.full,
-            city: location.city,
-            country: location.country,
-            timezone: timezone.iana,
-            is_online: event.isOnline,
-            website: event.website,
-            cfp_url: event.cfpLink || `https://sessionize.com/${data.slug}/`,
-            expenses_covered: expenses,
-            organizer: event.organizer,
-          };
-
-          fs.writeFileSync(
-            sessionizeResultPath,
-            JSON.stringify({ data: normalized }),
-          );
-          logger.info({ slug: data.slug }, 'Sessionize event fetched');
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          logger.error(
-            { slug: data.slug, error: errMsg },
-            'Sessionize fetch failed',
-          );
-          fs.writeFileSync(
-            sessionizeResultPath,
-            JSON.stringify({ error: errMsg }),
-          );
-        }
-      }
-      break;
-
-    case 'sessionize_open_cfps':
-      if (data.requestId) {
-        const cfpsResultPath = path.join(
-          DATA_DIR,
-          'ipc',
-          sourceGroup,
-          'input',
-          `_script_result_${data.requestId}.json`,
-        );
-
-        const { readEnvFile: readCfpsEnv } = await import('./env.js');
-        const cfpsVars = readCfpsEnv(['SESSIONIZE_SPEAKER_KEY']);
-        const speakerKey = cfpsVars.SESSIONIZE_SPEAKER_KEY;
-
-        if (!speakerKey) {
-          fs.writeFileSync(
-            cfpsResultPath,
-            JSON.stringify({ error: 'SESSIONIZE_SPEAKER_KEY not set in .env' }),
-          );
-          break;
-        }
-
-        logger.info({ sourceGroup }, 'Fetching Sessionize open CFPs');
-
-        try {
-          const resp = await fetch(
-            'https://sessionize.com/api/universal/open-cfps',
-            {
-              headers: { 'X-API-KEY': speakerKey },
-              signal: AbortSignal.timeout(15_000),
-            },
-          );
-
-          if (!resp.ok) {
-            fs.writeFileSync(
-              cfpsResultPath,
-              JSON.stringify({
-                error: `Sessionize API returned ${resp.status}: ${resp.statusText}`,
-              }),
-            );
-            break;
-          }
-
-          let events = (await resp.json()) as Array<Record<string, unknown>>;
-          const filter = (data.filter ?? {}) as Record<string, boolean>;
-
-          // Apply filters — default: exclude online and user groups
-          if (!filter.isOnline) {
-            events = events.filter((e) => !e.isOnline);
-          }
-          if (!filter.isUserGroup) {
-            events = events.filter((e) => !e.isUserGroup);
-          }
-
-          fs.writeFileSync(cfpsResultPath, JSON.stringify({ data: events }));
-          logger.info({ count: events.length }, 'Sessionize open CFPs fetched');
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          logger.error({ error: errMsg }, 'Sessionize open CFPs fetch failed');
-          fs.writeFileSync(cfpsResultPath, JSON.stringify({ error: errMsg }));
-        }
       }
       break;
 
