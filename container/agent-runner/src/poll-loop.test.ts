@@ -1,0 +1,210 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+
+import { initTestSessionDb, closeSessionDb, getSessionDb } from './db/connection.js';
+import { getPendingMessages, markCompleted } from './db/messages-in.js';
+import { getUndeliveredMessages } from './db/messages-out.js';
+import { formatMessages, extractRouting } from './formatter.js';
+import { MockProvider } from './providers/mock.js';
+
+beforeEach(() => {
+  initTestSessionDb();
+});
+
+afterEach(() => {
+  closeSessionDb();
+});
+
+function insertMessage(id: string, kind: string, content: object, opts?: { processAfter?: string }) {
+  getSessionDb()
+    .prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, content)
+     VALUES (?, ?, datetime('now'), 'pending', ?, ?)`,
+    )
+    .run(id, kind, opts?.processAfter ?? null, JSON.stringify(content));
+}
+
+describe('formatter', () => {
+  it('should format a single chat message', () => {
+    insertMessage('m1', 'chat', { sender: 'John', text: 'Hello world' });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('sender="John"');
+    expect(prompt).toContain('Hello world');
+  });
+
+  it('should format multiple chat messages as XML block', () => {
+    insertMessage('m1', 'chat', { sender: 'John', text: 'Hello' });
+    insertMessage('m2', 'chat', { sender: 'Jane', text: 'Hi there' });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('<messages>');
+    expect(prompt).toContain('</messages>');
+    expect(prompt).toContain('sender="John"');
+    expect(prompt).toContain('sender="Jane"');
+  });
+
+  it('should format task messages', () => {
+    insertMessage('m1', 'task', { prompt: 'Review open PRs' });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('[SCHEDULED TASK]');
+    expect(prompt).toContain('Review open PRs');
+  });
+
+  it('should format webhook messages', () => {
+    insertMessage('m1', 'webhook', { source: 'github', event: 'push', payload: { ref: 'main' } });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('[WEBHOOK: github/push]');
+  });
+
+  it('should format system messages', () => {
+    insertMessage('m1', 'system', { action: 'register_group', status: 'success', result: { id: 'ag-1' } });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('[SYSTEM RESPONSE]');
+    expect(prompt).toContain('register_group');
+  });
+
+  it('should handle mixed kinds', () => {
+    insertMessage('m1', 'chat', { sender: 'John', text: 'Hello' });
+    insertMessage('m2', 'system', { action: 'test', status: 'ok', result: null });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('sender="John"');
+    expect(prompt).toContain('[SYSTEM RESPONSE]');
+  });
+
+  it('should escape XML in content', () => {
+    insertMessage('m1', 'chat', { sender: 'A<B', text: 'x > y && z' });
+    const messages = getPendingMessages();
+    const prompt = formatMessages(messages);
+    expect(prompt).toContain('A&lt;B');
+    expect(prompt).toContain('x &gt; y &amp;&amp; z');
+  });
+});
+
+describe('routing', () => {
+  it('should extract routing from messages', () => {
+    getSessionDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('m1', 'chat', datetime('now'), 'pending', 'chan-123', 'discord', 'thread-456', '{"text":"hi"}')`,
+      )
+      .run();
+
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(routing.platformId).toBe('chan-123');
+    expect(routing.channelType).toBe('discord');
+    expect(routing.threadId).toBe('thread-456');
+    expect(routing.inReplyTo).toBe('m1');
+  });
+});
+
+describe('mock provider', () => {
+  it('should produce init + result events', async () => {
+    const provider = new MockProvider((prompt) => `Echo: ${prompt}`);
+    const query = provider.query({
+      prompt: 'Hello',
+      cwd: '/tmp',
+      mcpServers: {},
+      env: {},
+    });
+
+    const events: Array<{ type: string }> = [];
+    // End the stream after initial response
+    setTimeout(() => query.end(), 50);
+
+    for await (const event of query.events) {
+      events.push(event);
+    }
+
+    expect(events.length).toBeGreaterThanOrEqual(2);
+    expect(events[0].type).toBe('init');
+    expect(events[1].type).toBe('result');
+    expect((events[1] as { text: string }).text).toBe('Echo: Hello');
+  });
+
+  it('should handle push() during active query', async () => {
+    const provider = new MockProvider((prompt) => `Re: ${prompt}`);
+    const query = provider.query({
+      prompt: 'First',
+      cwd: '/tmp',
+      mcpServers: {},
+      env: {},
+    });
+
+    const events: Array<{ type: string; text?: string }> = [];
+
+    // Push a follow-up after a short delay, then end
+    setTimeout(() => query.push('Second'), 30);
+    setTimeout(() => query.end(), 60);
+
+    for await (const event of query.events) {
+      events.push(event);
+    }
+
+    const results = events.filter((e) => e.type === 'result');
+    expect(results).toHaveLength(2);
+    expect(results[0].text).toBe('Re: First');
+    expect(results[1].text).toBe('Re: Second');
+  });
+});
+
+describe('end-to-end with mock provider', () => {
+  it('should read messages_in, process with mock provider, write messages_out', async () => {
+    // Insert a chat message
+    insertMessage('m1', 'chat', { sender: 'User', text: 'What is 2+2?' });
+
+    // Read and process
+    const messages = getPendingMessages();
+    expect(messages).toHaveLength(1);
+
+    const routing = extractRouting(messages);
+    const prompt = formatMessages(messages);
+
+    // Create mock provider and run query
+    const provider = new MockProvider(() => 'The answer is 4');
+    const query = provider.query({
+      prompt,
+      cwd: '/tmp',
+      mcpServers: {},
+      env: {},
+    });
+
+    // Process events — simulate what poll-loop does
+    const { markProcessing } = await import('./db/messages-in.js');
+    const { writeMessageOut } = await import('./db/messages-out.js');
+
+    markProcessing(['m1']);
+
+    setTimeout(() => query.end(), 50);
+
+    for await (const event of query.events) {
+      if (event.type === 'result' && event.text) {
+        writeMessageOut({
+          id: `out-${Date.now()}`,
+          in_reply_to: routing.inReplyTo,
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: event.text }),
+        });
+      }
+    }
+
+    markCompleted(['m1']);
+
+    // Verify: message was processed
+    const processed = getPendingMessages();
+    expect(processed).toHaveLength(0);
+
+    // Verify: response was written
+    const outMessages = getUndeliveredMessages();
+    expect(outMessages).toHaveLength(1);
+    expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
+    expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
