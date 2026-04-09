@@ -7,8 +7,9 @@ Status: [x] done, [~] partial, [ ] not started
 ## Core Architecture
 
 - [x] Session DB replaces IPC (messages_in / messages_out as sole IO)
+- [x] Two-DB split: inbound.db (host-owned) + outbound.db (container-owned) — zero cross-process write contention
 - [x] Central DB (agent groups, messaging groups, sessions, routing)
-- [x] Host sweep (stale detection, retry with backoff, recurrence scheduling)
+- [x] Host sweep (stale detection via heartbeat file, retry with backoff, recurrence scheduling)
 - [x] Active delivery polling (1s for running sessions)
 - [x] Sweep delivery polling (60s across all sessions)
 - [x] Container runner with session DB mounting
@@ -53,7 +54,8 @@ Status: [x] done, [~] partial, [ ] not started
 - [~] Webex via Chat SDK (adapter + skill written, not tested)
 - [~] iMessage via Chat SDK (adapter + skill written, not tested)
 - [x] Backward compatibility with native channels (old adapters still work)
-- [ ] Setup flow wired to v2 channels
+- [x] Channel barrel wired (src/index.ts imports barrel, skills uncomment)
+- [~] Setup flow wired to v2 channels (register.ts + verify.ts updated, but channel skills don't call register yet — see docs/v2-setup-wiring.md)
 - [ ] Setup communicates each group is a different agent, distinct names
 - [ ] Setup vs production channel separation
 - [ ] Generate visual diagram of customized instance at end of setup
