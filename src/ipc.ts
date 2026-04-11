@@ -1,17 +1,48 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  DATA_DIR,
+  GROUPS_DIR,
+  IPC_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
+import { sendPoolMessage } from './channels/telegram.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteAllSessions,
+  deleteTask,
+  getTaskById,
+  storeMessage,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  sendReaction?: (
+    jid: string,
+    messageId: string | undefined,
+    emoji: string,
+  ) => Promise<void>;
+  sendMessage: (
+    jid: string,
+    text: string,
+    replyToMessageId?: string,
+  ) => Promise<string | void>;
+  pinMessage?: (jid: string, messageId: string) => Promise<void>;
+  sendFile?: (
+    jid: string,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -21,8 +52,10 @@ export interface IpcDeps {
     isMain: boolean,
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
+    isTrusted?: boolean,
   ) => void;
   onTasksChanged: () => void;
+  nukeSession: (groupFolder: string) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -73,15 +106,154 @@ export function startIpcWatcher(deps: IpcDeps): void {
           for (const file of messageFiles) {
             const filePath = path.join(messagesDir, file);
             try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > 1_048_576) {
+                logger.warn(
+                  { file, sourceGroup, size: stat.size },
+                  'IPC file exceeds 1MB limit, moving to errors',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+                continue;
+              }
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if (
+                data.type === 'react_to_message' &&
+                data.chatJid &&
+                data.emoji &&
+                deps.sendReaction
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  await deps.sendReaction(
+                    data.chatJid,
+                    data.messageId || undefined,
+                    data.emoji,
+                  );
+                  logger.info(
+                    {
+                      chatJid: data.chatJid,
+                      emoji: data.emoji,
+                      sourceGroup,
+                    },
+                    'IPC reaction sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC reaction attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'send_file' &&
+                data.chatJid &&
+                data.filePath &&
+                deps.sendFile
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  // Translate container path to host path
+                  const containerPath: string = data.filePath;
+                  let hostPath: string;
+                  if (containerPath.startsWith('/workspace/group/')) {
+                    hostPath = path.join(
+                      GROUPS_DIR,
+                      sourceGroup,
+                      containerPath.replace('/workspace/group/', ''),
+                    );
+                  } else if (containerPath.startsWith('/workspace/trusted/')) {
+                    hostPath = path.join(
+                      process.cwd(),
+                      'trusted',
+                      containerPath.replace('/workspace/trusted/', ''),
+                    );
+                  } else {
+                    logger.warn(
+                      { containerPath, sourceGroup },
+                      'send_file: path outside allowed mounts',
+                    );
+                    fs.unlinkSync(filePath);
+                    continue;
+                  }
+
+                  if (fs.existsSync(hostPath)) {
+                    await deps.sendFile(
+                      data.chatJid,
+                      hostPath,
+                      data.caption,
+                      data.replyToMessageId,
+                    );
+                    logger.info(
+                      { chatJid: data.chatJid, hostPath, sourceGroup },
+                      'IPC file sent',
+                    );
+                  } else {
+                    logger.warn(
+                      { hostPath, containerPath, sourceGroup },
+                      'send_file: file not found on host',
+                    );
+                  }
+                }
+              } else if (data.type === 'message' && data.chatJid && data.text) {
+                // Strip <internal> tags — if nothing remains, skip silently
+                const cleanText = data.text
+                  .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+                  .trim();
+                if (!cleanText) {
+                  logger.debug(
+                    { sourceGroup },
+                    'IPC message suppressed (all internal)',
+                  );
+                  fs.unlinkSync(filePath);
+                  continue;
+                }
+
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.sender && data.chatJid.startsWith('tg:')) {
+                    await sendPoolMessage(
+                      data.chatJid,
+                      cleanText,
+                      data.sender,
+                      sourceGroup,
+                    );
+                  } else {
+                    const sentMsgId = await deps.sendMessage(
+                      data.chatJid,
+                      cleanText,
+                      data.replyToMessageId,
+                    );
+                    // Pin the message if requested
+                    if (data.pin && sentMsgId && deps.pinMessage) {
+                      await deps.pinMessage(data.chatJid, sentMsgId);
+                    }
+                  }
+                  // Store bot response so heartbeat can track answered messages
+                  storeMessage({
+                    id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                    chat_jid: data.chatJid,
+                    sender: data.sender || ASSISTANT_NAME,
+                    sender_name: data.sender || ASSISTANT_NAME,
+                    content: cleanText,
+                    timestamp: new Date().toISOString(),
+                    is_from_me: true,
+                    is_bot_message: true,
+                    reply_to_message_id: data.replyToMessageId,
+                  });
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -124,6 +296,20 @@ export function startIpcWatcher(deps: IpcDeps): void {
           for (const file of taskFiles) {
             const filePath = path.join(tasksDir, file);
             try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > 1_048_576) {
+                logger.warn(
+                  { file, sourceGroup, size: stat.size },
+                  'IPC task file exceeds 1MB limit, moving to errors',
+                );
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+                continue;
+              }
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain, deps);
@@ -173,6 +359,14 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For host operations / github_backup / promote_staging
+    requestId?: string;
+    message?: string;
+    tileName?: string;
+    skillName?: string;
+    slug?: string;
+    filter?: Record<string, boolean>;
+    dryRun?: boolean;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -228,11 +422,12 @@ export async function processTaskIpc(
             break;
           }
         } else if (scheduleType === 'interval') {
+          const MIN_INTERVAL_MS = 60_000;
           const ms = parseInt(data.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
+          if (isNaN(ms) || ms < MIN_INTERVAL_MS) {
             logger.warn(
-              { scheduleValue: data.schedule_value },
-              'Invalid interval',
+              { scheduleValue: data.schedule_value, minMs: MIN_INTERVAL_MS },
+              'Invalid interval: must be at least 60s',
             );
             break;
           }
@@ -384,9 +579,20 @@ export async function processTaskIpc(
               break;
             }
           } else if (updatedTask.schedule_type === 'interval') {
+            const MIN_INTERVAL_MS = 60_000;
             const ms = parseInt(updatedTask.schedule_value, 10);
-            if (!isNaN(ms) && ms > 0) {
+            if (!isNaN(ms) && ms >= MIN_INTERVAL_MS) {
               updates.next_run = new Date(Date.now() + ms).toISOString();
+            } else if (!isNaN(ms)) {
+              logger.warn(
+                {
+                  taskId: data.taskId,
+                  value: updatedTask.schedule_value,
+                  minMs: MIN_INTERVAL_MS,
+                },
+                'Invalid interval in task update: must be at least 60s',
+              );
+              break;
             }
           }
         }
@@ -454,10 +660,254 @@ export async function processTaskIpc(
           requiresTrigger: data.requiresTrigger,
           isMain: existingGroup?.isMain,
         });
+        // Refresh snapshot so available_groups.json reflects new trust config immediately
+        const availableGroups = deps.getAvailableGroups();
+        deps.writeGroupsSnapshot(
+          sourceGroup,
+          true,
+          availableGroups,
+          new Set(Object.keys(registeredGroups)),
+        );
       } else {
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'nuke_session':
+      if (data.groupFolder) {
+        logger.info(
+          { groupFolder: data.groupFolder, sourceGroup },
+          'Session nuke requested via IPC',
+        );
+        deps.nukeSession(sourceGroup);
+      }
+      break;
+
+    // --- Named host operations ---
+
+    case 'github_backup':
+      if (data.requestId) {
+        const backupDir = path.join(
+          process.cwd(),
+          'groups',
+          sourceGroup,
+          'backup-repo',
+        );
+        const resultPath = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'input',
+          `_script_result_${data.requestId}.json`,
+        );
+
+        if (!fs.existsSync(backupDir)) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({ error: `backup-repo not found at ${backupDir}` }),
+          );
+          break;
+        }
+
+        const commitMsg =
+          data.message || `backup: ${new Date().toISOString().split('T')[0]}`;
+        logger.info(
+          { sourceGroup, backupDir, commitMsg },
+          'Running github_backup',
+        );
+
+        // Read GitHub token for push auth
+        const { readEnvFile: readBackupEnv } = await import('./env.js');
+        const backupEnvVars = readBackupEnv(['GITHUB_TOKEN']);
+        const ghToken = backupEnvVars.GITHUB_TOKEN;
+
+        execFile(
+          'bash',
+          [
+            '-c',
+            `cd "${backupDir}" && git add -A && git diff --cached --quiet && echo '{"stdout":"Nothing to commit."}' || (git commit -m "${commitMsg.replace(/"/g, '\\"')}" && git push && echo '{"stdout":"Committed and pushed."}')`,
+          ],
+          {
+            timeout: 60_000,
+            maxBuffer: 1024 * 1024,
+            env: {
+              ...process.env,
+              ...(ghToken
+                ? {
+                    GIT_ASKPASS: 'echo',
+                    GIT_TERMINAL_PROMPT: '0',
+                    GITHUB_TOKEN: ghToken,
+                    GIT_CONFIG_COUNT: '1',
+                    GIT_CONFIG_KEY_0:
+                      'url.https://x-access-token:' +
+                      ghToken +
+                      '@github.com/.insteadOf',
+                    GIT_CONFIG_VALUE_0: 'https://github.com/',
+                  }
+                : {}),
+            },
+          },
+          (error, stdout, stderr) => {
+            if (error) {
+              logger.error(
+                { sourceGroup, error: error.message, stderr },
+                'github_backup failed',
+              );
+              fs.writeFileSync(
+                resultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                }),
+              );
+            } else {
+              // stdout is the JSON echo from the bash script
+              try {
+                const parsed = JSON.parse(stdout.trim().split('\n').pop()!);
+                fs.writeFileSync(resultPath, JSON.stringify(parsed));
+              } catch {
+                fs.writeFileSync(
+                  resultPath,
+                  JSON.stringify({ stdout: stdout.trim() }),
+                );
+              }
+              logger.info({ sourceGroup }, 'github_backup completed');
+            }
+          },
+        );
+      }
+      break;
+
+    case 'promote_staging':
+      if (data.requestId && data.tileName && data.skillName) {
+        if (!isMain) {
+          logger.warn({ sourceGroup }, 'Unauthorized promote_staging attempt');
+          break;
+        }
+
+        const promoteResultPath = path.join(
+          DATA_DIR,
+          'ipc',
+          sourceGroup,
+          'input',
+          `_script_result_${data.requestId}.json`,
+        );
+
+        const promoteScript = path.join(
+          process.cwd(),
+          'scripts',
+          'promote-to-tile-repo.sh',
+        );
+
+        if (!fs.existsSync(promoteScript)) {
+          fs.writeFileSync(
+            promoteResultPath,
+            JSON.stringify({
+              error: 'promote-to-tile-repo.sh not found',
+            }),
+          );
+          break;
+        }
+
+        const stagingDir = path.join(
+          GROUPS_DIR,
+          sourceGroup,
+          'staging',
+          data.tileName,
+        );
+
+        // Read credentials from .env for tile repo push
+        const envPath = path.join(process.cwd(), '.env');
+        const envContent = fs.existsSync(envPath)
+          ? fs.readFileSync(envPath, 'utf-8')
+          : '';
+        const getEnv = (key: string) =>
+          envContent
+            .split('\n')
+            .find((l) => l.startsWith(`${key}=`))
+            ?.split('=')
+            .slice(1)
+            .join('=') || '';
+
+        logger.info(
+          { sourceGroup, tileName: data.tileName, skillName: data.skillName },
+          'Running promote_staging',
+        );
+
+        execFile(
+          'bash',
+          [promoteScript, stagingDir, data.tileName, data.skillName],
+          {
+            timeout: 300_000,
+            maxBuffer: 5 * 1024 * 1024,
+            env: {
+              ...process.env,
+              GITHUB_TOKEN: getEnv('GITHUB_TOKEN'),
+              TILE_OWNER: getEnv('TILE_OWNER') || 'jbaruch',
+              ASSISTANT_NAME: getEnv('ASSISTANT_NAME') || 'AyeAye',
+            },
+          },
+          (error, stdout, stderr) => {
+            if (error) {
+              logger.error(
+                {
+                  sourceGroup,
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                },
+                'promote_staging failed',
+              );
+              fs.writeFileSync(
+                promoteResultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                }),
+              );
+            } else {
+              logger.info(
+                { sourceGroup },
+                'promote_staging pushed to tile repo',
+              );
+              fs.writeFileSync(
+                promoteResultPath,
+                JSON.stringify({ stdout: stdout.trim() }),
+              );
+
+              // Schedule tessl update + session clear after GHA completes (~5 min)
+              setTimeout(() => {
+                logger.info('Running post-promote tessl update');
+                execFile(
+                  'bash',
+                  [
+                    '-c',
+                    'cd /app/tessl-workspace && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1',
+                  ],
+                  { timeout: 120_000 },
+                  (updateErr, updateStdout) => {
+                    if (updateErr) {
+                      logger.error(
+                        { error: updateErr.message },
+                        'Post-promote tessl update failed',
+                      );
+                    } else {
+                      const cleared = deleteAllSessions();
+                      logger.info(
+                        {
+                          sessionsCleared: cleared,
+                          output: updateStdout.trim().slice(-200),
+                        },
+                        'Post-promote tessl update completed — sessions cleared',
+                      );
+                    }
+                  },
+                );
+              }, 300_000); // 5 minutes
+            }
+          },
         );
       }
       break;

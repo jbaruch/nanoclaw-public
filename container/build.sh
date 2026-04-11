@@ -13,6 +13,8 @@ CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 
+# Tessl tiles are installed at runtime (entrypoint), not build time.
+# The image only ships built-in skills and the tessl binary.
 ${CONTAINER_RUNTIME} build -t "${IMAGE_NAME}:${TAG}" .
 
 echo ""

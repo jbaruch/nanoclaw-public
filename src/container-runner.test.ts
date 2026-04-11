@@ -11,11 +11,21 @@ vi.mock('./config.js', () => ({
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
   CONTAINER_TIMEOUT: 1800000, // 30min
+  CREDENTIAL_PROXY_PORT: 3001,
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
+  STORE_DIR: '/tmp/nanoclaw-test-store',
+  HOST_PROJECT_ROOT: process.cwd(),
+  HOST_UID: undefined,
+  HOST_GID: undefined,
   IDLE_TIMEOUT: 1800000, // 30min
-  ONECLI_URL: 'http://localhost:10254',
+  TILE_OWNER: 'test',
   TIMEZONE: 'America/Los_Angeles',
+}));
+
+// Mock better-sqlite3 (used by createFilteredDb)
+vi.mock('better-sqlite3', () => ({
+  default: vi.fn(),
 }));
 
 // Mock logger
@@ -54,20 +64,15 @@ vi.mock('./mount-security.js', () => ({
 // Mock container-runtime
 vi.mock('./container-runtime.js', () => ({
   CONTAINER_RUNTIME_BIN: 'docker',
+  CONTAINER_HOST_GATEWAY: 'host.docker.internal',
   hostGatewayArgs: () => [],
   readonlyMountArgs: (h: string, c: string) => ['-v', `${h}:${c}:ro`],
   stopContainer: vi.fn(),
 }));
 
-// Mock OneCLI SDK
-vi.mock('@onecli-sh/sdk', () => ({
-  OneCLI: class {
-    applyContainerConfig = vi.fn().mockResolvedValue(true);
-    createAgent = vi.fn().mockResolvedValue({ id: 'test' });
-    ensureAgent = vi
-      .fn()
-      .mockResolvedValue({ name: 'test', identifier: 'test', created: true });
-  },
+// Mock credential-proxy
+vi.mock('./credential-proxy.js', () => ({
+  detectAuthMode: vi.fn(() => 'api-key'),
 }));
 
 // Create a controllable fake ChildProcess
@@ -105,7 +110,11 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  runContainerAgent,
+  ContainerOutput,
+  selectTiles,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -225,5 +234,49 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+// --- Tile selection (security-critical) ---
+
+describe('selectTiles', () => {
+  it('main group gets core + trusted + admin', () => {
+    expect(selectTiles(true, false)).toEqual([
+      'nanoclaw-core',
+      'nanoclaw-trusted',
+      'nanoclaw-admin',
+    ]);
+  });
+
+  it('main group gets admin even if also marked trusted', () => {
+    expect(selectTiles(true, true)).toEqual([
+      'nanoclaw-core',
+      'nanoclaw-trusted',
+      'nanoclaw-admin',
+    ]);
+  });
+
+  it('trusted group gets core + trusted, NOT admin', () => {
+    const tiles = selectTiles(false, true);
+    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-trusted']);
+    expect(tiles).not.toContain('nanoclaw-admin');
+  });
+
+  it('untrusted group gets core + untrusted, NOT trusted or admin', () => {
+    const tiles = selectTiles(false, false);
+    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-untrusted']);
+    expect(tiles).not.toContain('nanoclaw-trusted');
+    expect(tiles).not.toContain('nanoclaw-admin');
+  });
+
+  it('all tiers include nanoclaw-core', () => {
+    expect(selectTiles(true, false)[0]).toBe('nanoclaw-core');
+    expect(selectTiles(false, true)[0]).toBe('nanoclaw-core');
+    expect(selectTiles(false, false)[0]).toBe('nanoclaw-core');
+  });
+
+  it('admin tile is NEVER in trusted or untrusted selections', () => {
+    expect(selectTiles(false, true)).not.toContain('nanoclaw-admin');
+    expect(selectTiles(false, false)).not.toContain('nanoclaw-admin');
   });
 });

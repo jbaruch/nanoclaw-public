@@ -1,19 +1,21 @@
 import fs from 'fs';
 import path from 'path';
 
-import { OneCLI } from '@onecli-sh/sdk';
-
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
+  HOST_GID,
+  HOST_UID,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
-  ONECLI_URL,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TIMEZONE,
 } from './config.js';
+import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -28,20 +30,22 @@ import {
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
+  PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
-  createTask,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
+  deleteAllSessions,
   deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
   getMessageById,
   getMessagesSince,
+  getTaskById,
+  createTask,
   getNewMessages,
   getRouterState,
-  getTaskById,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
@@ -51,8 +55,10 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { initBotPool } from './channels/telegram.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { ChannelType } from './text-styles.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -65,6 +71,11 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSessionCleanup } from './session-cleanup.js';
+import {
+  extractSessionCommand,
+  handleSessionCommand,
+  isSessionCommandAllowed,
+} from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -74,7 +85,9 @@ export { escapeXml, formatMessages } from './router.js';
 
 /** Check if a message is a reply to or quote of a bot message. */
 function isReplyToBot(msg: NewMessage): boolean {
+  // Check content prefix — resolveReply adds [Replying to SenderName: "..."]
   if (msg.content.startsWith(`[Replying to ${ASSISTANT_NAME}:`)) return true;
+  // Check reply_to_message_id in DB — covers cases where prefix format differs
   if (msg.reply_to_message_id) {
     const original = getMessageById(msg.reply_to_message_id, msg.chat_jid);
     if (original?.is_from_me) return true;
@@ -86,31 +99,19 @@ let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+// Per-chat reply-to tracking: updated when follow-up messages are piped,
+// consumed by the output callback to quote-reply the latest message.
+const pendingReplyTo: Record<string, string | undefined> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
-const onecli = new OneCLI({ url: ONECLI_URL });
-
-function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
-  if (group.isMain) return;
-  const identifier = group.folder.toLowerCase().replace(/_/g, '-');
-  onecli.ensureAgent({ name: group.name, identifier }).then(
-    (res) => {
-      logger.info(
-        { jid, identifier, created: res.created },
-        'OneCLI agent ensured',
-      );
-    },
-    (err) => {
-      logger.debug(
-        { jid, identifier, err: String(err) },
-        'OneCLI agent ensure skipped',
-      );
-    },
-  );
-}
+// Circuit breaker: pause groups that fail repeatedly to avoid burning credits.
+const MAX_CONSECUTIVE_FAILURES = 5;
+const CIRCUIT_BREAKER_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const consecutiveFailures: Record<string, number> = {};
+const circuitBreakerUntil: Record<string, number> = {};
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -175,13 +176,18 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   // Copy CLAUDE.md template into the new group folder so agents have
   // identity and instructions from the first run.  (Fixes #1391)
+  // Main: full admin template. Trusted: global template. Untrusted: dedicated template.
   const groupMdFile = path.join(groupDir, 'CLAUDE.md');
   if (!fs.existsSync(groupMdFile)) {
-    const templateFile = path.join(
-      GROUPS_DIR,
-      group.isMain ? 'main' : 'global',
-      'CLAUDE.md',
-    );
+    const isUntrusted = !group.isMain && !group.containerConfig?.trusted;
+    let templateFile: string;
+    if (group.isMain) {
+      templateFile = path.join(GROUPS_DIR, 'main', 'CLAUDE.md');
+    } else if (isUntrusted) {
+      templateFile = path.join(GROUPS_DIR, 'global', 'CLAUDE-untrusted.md');
+    } else {
+      templateFile = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+    }
     if (fs.existsSync(templateFile)) {
       let content = fs.readFileSync(templateFile, 'utf-8');
       if (ASSISTANT_NAME !== 'Andy') {
@@ -193,14 +199,24 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     }
   }
 
-  // Ensure a corresponding OneCLI agent exists (best-effort, non-blocking)
-  ensureOneCLIAgent(jid, group);
+  // Chown group folder to the container user so the agent can write to it.
+  // In DooD the orchestrator runs as root — files it creates are root-owned.
+  const effectiveUid = HOST_UID ?? process.getuid?.();
+  const effectiveGid = HOST_GID ?? process.getgid?.();
+  if (effectiveUid != null && effectiveUid !== 0) {
+    try {
+      chownRecursive(groupDir, effectiveUid, effectiveGid ?? effectiveUid);
+    } catch (err) {
+      logger.warn(
+        { folder: group.folder, err },
+        'Failed to chown group folder',
+      );
+    }
+  }
 
-  logger.info(
-    { jid, name: group.name, folder: group.folder },
-    'Group registered',
-  );
-
+  // Auto-create a lightweight heartbeat for trigger-required groups.
+  // These groups have their own container and can only send to their own chat,
+  // preventing cross-group message routing bugs from the main heartbeat.
   if (group.requiresTrigger !== false && !group.isMain) {
     const heartbeatId = `heartbeat-${group.folder}`;
     if (!getTaskById(heartbeatId)) {
@@ -208,7 +224,8 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
         id: heartbeatId,
         group_folder: group.folder,
         chat_jid: jid,
-        prompt: 'Run the check-unanswered script only: python3 /home/node/.claude/skills/tessl__check-unanswered/scripts/check-unanswered.py — then react and reply to each unanswered message. Do NOT query the database directly. Do NOT check email, calendar, or system health.',
+        prompt:
+          'Run the check-unanswered script only: python3 /home/node/.claude/skills/tessl__check-unanswered/scripts/check-unanswered.py — then react and reply to each unanswered message. Do NOT query the database directly. Do NOT check email, calendar, or system health.',
         schedule_type: 'cron',
         schedule_value: '*/15 * * * *',
         context_mode: 'group',
@@ -216,7 +233,26 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
         status: 'active',
         created_at: new Date().toISOString(),
       });
-      logger.info({ jid, folder: group.folder }, 'Auto-created heartbeat for trigger-required group');
+      logger.info(
+        { jid, folder: group.folder },
+        'Auto-created heartbeat for trigger-required group',
+      );
+    }
+  }
+
+  logger.info(
+    { jid, name: group.name, folder: group.folder },
+    'Group registered',
+  );
+}
+
+function chownRecursive(dir: string, uid: number, gid: number): void {
+  fs.chownSync(dir, uid, gid);
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    fs.chownSync(fullPath, uid, gid);
+    if (entry.isDirectory()) {
+      chownRecursive(fullPath, uid, gid);
     }
   }
 }
@@ -236,6 +272,8 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
       name: c.name,
       lastActivity: c.last_message_time,
       isRegistered: registeredJids.has(c.jid),
+      containerConfig: registeredGroups[c.jid]?.containerConfig,
+      requiresTrigger: registeredGroups[c.jid]?.requiresTrigger,
     }));
 }
 
@@ -251,7 +289,7 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
+  let group = registeredGroups[chatJid];
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
@@ -262,6 +300,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
+  // Circuit breaker: skip groups that have failed too many times in a row
+  const breakerExpiry = circuitBreakerUntil[group.folder];
+  if (breakerExpiry) {
+    if (Date.now() < breakerExpiry) {
+      logger.warn({ group: group.name }, 'Circuit breaker active — skipping');
+      return true;
+    }
+    // Cooldown expired — reset and let the group try again
+    delete circuitBreakerUntil[group.folder];
+    consecutiveFailures[group.folder] = 0;
+    logger.info(
+      { group: group.name },
+      'Circuit breaker cooldown expired — resuming',
+    );
+  }
+
   const missedMessages = getMessagesSince(
     chatJid,
     getOrRecoverCursor(chatJid),
@@ -270,6 +324,45 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
 
   if (missedMessages.length === 0) return true;
+
+  // --- Session command interception (before trigger check) ---
+  const cmdResult = await handleSessionCommand({
+    missedMessages,
+    isMainGroup,
+    groupName: group.name,
+    triggerPattern: getTriggerPattern(group.trigger),
+    timezone: TIMEZONE,
+    deps: {
+      sendMessage: async (text) => {
+        await channel.sendMessage(chatJid, text);
+      },
+      setTyping: (typing) =>
+        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      runAgent: (prompt, onOutput) =>
+        runAgent(group, prompt, chatJid, onOutput),
+      closeStdin: () => queue.closeStdin(chatJid),
+      advanceCursor: (ts) => {
+        lastAgentTimestamp[chatJid] = ts;
+        saveState();
+      },
+      formatMessages,
+      canSenderInteract: (msg) => {
+        const hasTrigger = getTriggerPattern(group.trigger).test(
+          msg.content.trim(),
+        );
+        const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
+        return (
+          isMainGroup ||
+          !reqTrigger ||
+          (hasTrigger &&
+            (msg.is_from_me ||
+              isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+        );
+      },
+    },
+  });
+  if (cmdResult.handled) return cmdResult.success;
+  // --- End session command interception ---
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -280,7 +373,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         (triggerPattern.test(m.content.trim()) || isReplyToBot(m)) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
-    if (!hasTrigger) return true;
+    if (!hasTrigger) {
+      return true;
+    }
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
@@ -302,50 +397,116 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug(
-        { group: group.name },
-        'Idle timeout, closing container stdin',
-      );
-      queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
+    idleTimer = setTimeout(
+      () => {
+        logger.debug(
+          { group: group.name },
+          'Idle timeout, closing container stdin',
+        );
+        queue.closeStdin(chatJid);
+      },
+      group.isMain || group.containerConfig?.trusted ? IDLE_TIMEOUT : 300_000,
+    );
   };
 
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  // Progressive streaming disabled — causes message override bugs when
+  // multiple messages are piped to the same container.
+
+  // Track which message triggered the response — first reply quotes it.
+  // Uses shared pendingReplyTo map so follow-up messages piped via
+  // queue.sendMessage() can update the reply target for the output callback.
+  pendingReplyTo[chatJid] = missedMessages[missedMessages.length - 1]?.id;
+  logger.info(
+    {
+      replyToMessageId: pendingReplyTo[chatJid],
+      messageIds: missedMessages.map((m) => m.id),
+      group: group.name,
+    },
+    'Reply-to tracking',
+  );
+
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          const replyId = pendingReplyTo[chatJid];
+          await channel.sendMessage(chatJid, text, replyId);
+          // Store bot response in DB so heartbeat can track answered messages
+          storeMessage({
+            id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            chat_jid: chatJid,
+            sender: ASSISTANT_NAME,
+            sender_name: ASSISTANT_NAME,
+            content: text,
+            timestamp: new Date().toISOString(),
+            is_from_me: true,
+            is_bot_message: true,
+            reply_to_message_id: replyId,
+          });
+          // Consume after first reply — prevents replying to the wrong message
+          // when user sends follow-ups while background agent is working.
+          pendingReplyTo[chatJid] = undefined;
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    pendingReplyTo[chatJid],
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
+    // Track consecutive failures for circuit breaker
+    consecutiveFailures[group.folder] =
+      (consecutiveFailures[group.folder] || 0) + 1;
+    if (consecutiveFailures[group.folder] >= MAX_CONSECUTIVE_FAILURES) {
+      circuitBreakerUntil[group.folder] =
+        Date.now() + CIRCUIT_BREAKER_COOLDOWN_MS;
+      logger.error(
+        { group: group.name, failures: consecutiveFailures[group.folder] },
+        `Circuit breaker tripped — pausing group for ${CIRCUIT_BREAKER_COOLDOWN_MS / 60_000} minutes`,
+      );
+      // Notify via main group if this isn't the main group
+      if (!isMainGroup) {
+        const mainJid = Object.keys(registeredGroups).find(
+          (jid) => registeredGroups[jid].isMain,
+        );
+        if (mainJid) {
+          const mainChannel = findChannel(channels, mainJid);
+          mainChannel?.sendMessage(
+            mainJid,
+            `Circuit breaker tripped for "${group.name}" — ${consecutiveFailures[group.folder]} consecutive failures. Paused for 30 minutes. Check logs.`,
+          );
+        }
+      }
+    }
+
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
@@ -365,6 +526,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  // Reset failure counter on success
+  consecutiveFailures[group.folder] = 0;
   return true;
 }
 
@@ -373,11 +536,13 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  replyToMessageId?: string,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
+  const isTrusted = !!group.containerConfig?.trusted;
   const tasks = getAllTasks();
   writeTasksSnapshot(
     group.folder,
@@ -392,6 +557,7 @@ async function runAgent(
       status: t.status,
       next_run: t.next_run,
     })),
+    isTrusted,
   );
 
   // Update available groups snapshot (main group only can see all groups)
@@ -401,6 +567,7 @@ async function runAgent(
     isMain,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
+    isTrusted,
   );
 
   // Wrap onOutput to track session ID from streamed results
@@ -423,7 +590,9 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        isTrusted: !!group.containerConfig?.trusted,
         assistantName: ASSISTANT_NAME,
+        replyToMessageId,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -460,6 +629,18 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
+      // Detect stale session — clear so next invocation starts fresh
+      if (
+        output.error &&
+        /session|conversation not found|resume/i.test(output.error)
+      ) {
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+        logger.info(
+          { group: group.name },
+          'Cleared stale session after resume error',
+        );
+      }
       return 'error';
     }
 
@@ -517,6 +698,37 @@ async function startMessageLoop(): Promise<void> {
           }
 
           const isMainGroup = group.isMain === true;
+
+          // --- Session command interception (message loop) ---
+          // Scan ALL messages in the batch for a session command.
+          const loopCmdMsg = groupMessages.find(
+            (m) =>
+              extractSessionCommand(
+                m.content,
+                getTriggerPattern(group.trigger),
+              ) !== null,
+          );
+
+          if (loopCmdMsg) {
+            // Only close active container if the sender is authorized — otherwise an
+            // untrusted user could kill in-flight work by sending /compact (DoS).
+            // closeStdin no-ops internally when no container is active.
+            if (
+              isSessionCommandAllowed(
+                isMainGroup,
+                loopCmdMsg.is_from_me === true,
+              )
+            ) {
+              queue.closeStdin(chatJid);
+            }
+            // Enqueue so processGroupMessages handles auth + cursor advancement.
+            // Don't pipe via IPC — slash commands need a fresh container with
+            // string prompt (not MessageStream) for SDK recognition.
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
+          // --- End session command interception ---
+
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
 
           // For non-main groups, only act on trigger messages.
@@ -546,9 +758,16 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          const lastMsgId = messagesToSend[messagesToSend.length - 1]?.id;
+          if (queue.sendMessage(chatJid, formatted, lastMsgId)) {
+            // Update shared reply-to so the output callback quotes this message
+            pendingReplyTo[chatJid] = lastMsgId;
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              {
+                chatJid,
+                count: messagesToSend.length,
+                replyToMessageId: lastMsgId,
+              },
               'Piped messages to active container',
             );
             lastAgentTimestamp[chatJid] =
@@ -605,18 +824,18 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
-
-  // Ensure OneCLI agents exist for all registered groups.
-  // Recovers from missed creates (e.g. OneCLI was down at registration time).
-  for (const [jid, group] of Object.entries(registeredGroups)) {
-    ensureOneCLIAgent(jid, group);
-  }
-
   restoreRemoteControl();
+
+  // Start credential proxy (containers route API calls through this)
+  const proxyServer = await startCredentialProxy(
+    CREDENTIAL_PROXY_PORT,
+    PROXY_BIND_HOST,
+  );
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -635,6 +854,14 @@ async function main(): Promise<void> {
       logger.warn(
         { chatJid, sender: msg.sender },
         'Remote control rejected: not main group',
+      );
+      return;
+    }
+
+    if (!msg.is_from_me) {
+      logger.warn(
+        { chatJid, sender: msg.sender },
+        'Remote control rejected: sender is not the account owner',
       );
       return;
     }
@@ -727,6 +954,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Initialize Telegram bot pool for agent teams (swarm)
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -740,15 +972,36 @@ async function main(): Promise<void> {
         logger.warn({ jid }, 'No channel owns JID, cannot send message');
         return;
       }
-      const text = formatOutbound(rawText);
+      const text = formatOutbound(rawText, channel.name as ChannelType);
       if (text) await channel.sendMessage(jid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: (jid, rawText, replyToMessageId) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      const text = formatOutbound(rawText, channel.name as ChannelType);
+      if (!text) return Promise.resolve();
+      return channel.sendMessage(jid, text, replyToMessageId);
+    },
+    sendReaction: async (jid, messageId, emoji) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) return;
+      if (messageId) {
+        await channel.sendReaction?.(jid, messageId, emoji);
+      } else {
+        await channel.reactToLatestMessage?.(jid, emoji);
+      }
+    },
+    pinMessage: async (jid, messageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) return;
+      await channel.pinMessage?.(jid, messageId);
+    },
+    sendFile: async (jid, filePath, caption, replyToMessageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) return;
+      await channel.sendFile?.(jid, filePath, caption, replyToMessageId);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
@@ -762,6 +1015,18 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    nukeSession: (groupFolder: string) => {
+      // Kill the running container
+      queue.closeStdin(
+        Object.entries(registeredGroups).find(
+          ([, g]) => g.folder === groupFolder,
+        )?.[0] || '',
+      );
+      // Clear session so next spawn starts fresh
+      delete sessions[groupFolder];
+      setSession(groupFolder, '');
+      logger.info({ groupFolder }, 'Session nuked via IPC');
+    },
     onTasksChanged: () => {
       const tasks = getAllTasks();
       const taskRows = tasks.map((t) => ({
@@ -775,13 +1040,45 @@ async function main(): Promise<void> {
         next_run: t.next_run,
       }));
       for (const group of Object.values(registeredGroups)) {
-        writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
+        writeTasksSnapshot(
+          group.folder,
+          group.isMain === true,
+          taskRows,
+          !!group.containerConfig?.trusted,
+        );
       }
     },
   });
   startSessionCleanup();
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Periodic tile update from registry (every 15 min)
+  // Heartbeat runs in the container and can't call tessl update.
+  // This catches publishes that the post-promote timer missed.
+  const { execFile: execTesslUpdate } = await import('child_process');
+  setInterval(() => {
+    execTesslUpdate(
+      'bash',
+      [
+        '-c',
+        'cd /app/tessl-workspace && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1',
+      ],
+      { timeout: 120_000 },
+      (err, stdout) => {
+        if (err) {
+          logger.warn({ error: err.message }, 'Periodic tessl update failed');
+        } else if (stdout.includes('Updated')) {
+          const cleared = deleteAllSessions();
+          logger.info(
+            { sessionsCleared: cleared, output: stdout.trim().slice(-200) },
+            'Periodic tessl update found new tiles — sessions cleared',
+          );
+        }
+      },
+    );
+  }, 900_000);
+
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);

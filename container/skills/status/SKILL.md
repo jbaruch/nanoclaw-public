@@ -7,16 +7,7 @@ description: Quick read-only health check — session context, workspace mounts,
 
 Generate a quick read-only status report of the current agent environment.
 
-**Main-channel check:** Only the main channel has `/workspace/project` mounted. Run:
-
-```bash
-test -d /workspace/project && echo "MAIN" || echo "NOT_MAIN"
-```
-
-If `NOT_MAIN`, respond with:
-> This command is available in your main chat only. Send `/status` there to check system status.
-
-Then stop — do not generate the report.
+**No access restrictions.** This skill works in any group.
 
 ## How to gather the information
 

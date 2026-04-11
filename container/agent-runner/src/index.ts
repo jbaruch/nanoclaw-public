@@ -30,9 +30,11 @@ interface ContainerInput {
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
+  isTrusted?: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
+  replyToMessageId?: string;
 }
 
 interface ContainerOutput {
@@ -40,6 +42,7 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  streamText?: string;
 }
 
 interface SessionEntry {
@@ -307,34 +310,48 @@ function shouldClose(): boolean {
 /**
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
+ * Tracks consumed files in memory so read-only mounts don't cause infinite loops.
  */
+const REPLY_TO_FILE = path.join(IPC_INPUT_DIR, '_reply_to');
+const consumedInputFiles = new Set<string>();
+
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs
       .readdirSync(IPC_INPUT_DIR)
-      .filter((f) => f.endsWith('.json'))
+      .filter((f) => f.endsWith('.json') && !f.startsWith('_script_result_') && !consumedInputFiles.has(f))
       .sort();
 
     const messages: string[] = [];
+    let latestReplyTo: string | undefined;
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
+        consumedInputFiles.add(file);
+        try { fs.unlinkSync(filePath); } catch (e: any) {
+          if (e.code !== 'EROFS' && e.code !== 'EACCES') throw e;
+        }
         if (data.type === 'message' && data.text) {
           messages.push(data.text);
+          if (data.replyToMessageId) {
+            latestReplyTo = data.replyToMessageId;
+          }
         }
       } catch (err) {
         log(
           `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
         );
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
+        consumedInputFiles.add(file);
+        try { fs.unlinkSync(filePath); } catch (e: any) {
+          if (e.code !== 'EROFS' && e.code !== 'EACCES' && e.code !== 'ENOENT') throw e;
         }
       }
+    }
+    // Write the latest replyToMessageId so the MCP server can pick it up
+    if (latestReplyTo) {
+      try { fs.writeFileSync(REPLY_TO_FILE, latestReplyTo); } catch { /* ignore */ }
     }
     return messages;
   } catch (err) {
@@ -412,12 +429,31 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
+  // Streaming preview: accumulate assistant text and emit throttled
+  let streamingTextAccum = '';
+  let lastStreamEmit = 0;
+  const STREAM_THROTTLE_MS = 300;
+
+  // Load SOUL.md and global CLAUDE.md into systemPrompt.append so they survive
+  // compaction. The SDK re-injects system prompt content every turn — behavioral
+  // instructions placed here won't drift after long conversations or compaction.
+  // NOTE: /workspace/global/SOUL.md resolves to the correct file per trust tier —
+  // trusted containers mount the full SOUL.md, untrusted mount SOUL-untrusted.md
+  // at the same path. No trust check needed here; the mount layer handles it.
+  const soulMdPath = '/workspace/global/SOUL.md';
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+  const appendParts: string[] = [];
+  if (fs.existsSync(soulMdPath)) {
+    appendParts.push(fs.readFileSync(soulMdPath, 'utf-8'));
   }
+  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+    appendParts.push(fs.readFileSync(globalClaudeMdPath, 'utf-8'));
+  }
+  const systemPromptAppend =
+    appendParts.length > 0 ? appendParts.join('\n\n---\n\n') : undefined;
+
+  // Rules are loaded by the SDK via the tessl chain: CLAUDE.md → AGENTS.md → .tessl/RULES.md
+  // For untrusted groups, the orchestrator copies .tessl from a main group's session.
 
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
@@ -442,13 +478,15 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
+      systemPrompt: systemPromptAppend
         ? {
             type: 'preset' as const,
             preset: 'claude_code' as const,
-            append: globalClaudeMd,
+            append: systemPromptAppend,
           }
         : undefined,
+      model: 'opus[1m]',
+      effort: 'max',
       allowedTools: [
         'Bash',
         'Read',
@@ -482,8 +520,30 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            ...(containerInput.replyToMessageId
+              ? { NANOCLAW_REPLY_TO_MESSAGE_ID: containerInput.replyToMessageId }
+              : {}),
           },
         },
+        ...(process.env.COMPOSIO_API_KEY
+          ? {
+              composio: {
+                type: 'http' as const,
+                url: 'https://connect.composio.dev/mcp',
+                headers: {
+                  'x-consumer-api-key': process.env.COMPOSIO_API_KEY,
+                },
+              },
+            }
+          : {}),
+        ...(fs.existsSync('/home/node/.tessl/api-credentials.json')
+          ? {
+              tessl: {
+                command: 'tessl',
+                args: ['mcp', 'start'],
+              },
+            }
+          : {}),
       },
       hooks: {
         PreCompact: [
@@ -501,6 +561,22 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Extract text content for streaming preview
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+      if (content) {
+        const text = content
+          .filter((c) => c.type === 'text' && c.text)
+          .map((c) => c.text!)
+          .join('');
+        if (text) {
+          streamingTextAccum = text;
+          const now = Date.now();
+          if (now - lastStreamEmit >= STREAM_THROTTLE_MS) {
+            writeOutput({ status: 'success', result: null, streamText: streamingTextAccum, newSessionId });
+            lastStreamEmit = now;
+          }
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -534,9 +610,11 @@ async function runQuery(
         result: textResult || null,
         newSessionId,
       });
-      // Break so control returns to the outer while(true) loop where
-      // waitForIpcMessage() handles follow-ups. Without this, the
-      // for-await iterator hangs and IPC messages are silently lost.
+      // Break out of the for-await loop after receiving the result.
+      // Without this, the iterator hangs waiting for more SDK messages
+      // that will never come, and follow-up IPC messages are lost.
+      // The outer while(true) loop handles follow-ups via waitForIpcMessage().
+      // See: https://github.com/qwibitai/nanoclaw/issues/233
       break;
     }
   }
@@ -656,6 +734,106 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
+  // --- Slash command handling ---
+  // Only known session slash commands are handled here. This prevents
+  // accidental interception of user prompts that happen to start with '/'.
+  const KNOWN_SESSION_COMMANDS = new Set(['/compact']);
+  const trimmedPrompt = prompt.trim();
+  const isSessionSlashCommand = KNOWN_SESSION_COMMANDS.has(trimmedPrompt);
+
+  if (isSessionSlashCommand) {
+    log(`Handling session command: ${trimmedPrompt}`);
+    let slashSessionId: string | undefined;
+    let compactBoundarySeen = false;
+    let hadError = false;
+    let resultEmitted = false;
+
+    try {
+      for await (const message of query({
+        prompt: trimmedPrompt,
+        options: {
+          cwd: '/workspace/group',
+          resume: sessionId,
+          systemPrompt: undefined,
+          allowedTools: [],
+          env: sdkEnv,
+          permissionMode: 'bypassPermissions' as const,
+          allowDangerouslySkipPermissions: true,
+          settingSources: ['project', 'user'] as const,
+          hooks: {
+            PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+          },
+        },
+      })) {
+        const msgType = message.type === 'system'
+          ? `system/${(message as { subtype?: string }).subtype}`
+          : message.type;
+        log(`[slash-cmd] type=${msgType}`);
+
+        if (message.type === 'system' && message.subtype === 'init') {
+          slashSessionId = message.session_id;
+          log(`Session after slash command: ${slashSessionId}`);
+        }
+
+        // Observe compact_boundary to confirm compaction completed
+        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+          compactBoundarySeen = true;
+          log('Compact boundary observed — compaction completed');
+        }
+
+        if (message.type === 'result') {
+          const resultSubtype = (message as { subtype?: string }).subtype;
+          const textResult = 'result' in message ? (message as { result?: string }).result : null;
+
+          if (resultSubtype?.startsWith('error')) {
+            hadError = true;
+            writeOutput({
+              status: 'error',
+              result: null,
+              error: textResult || 'Session command failed.',
+              newSessionId: slashSessionId,
+            });
+          } else {
+            writeOutput({
+              status: 'success',
+              result: textResult || 'Conversation compacted.',
+              newSessionId: slashSessionId,
+            });
+          }
+          resultEmitted = true;
+        }
+      }
+    } catch (err) {
+      hadError = true;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      log(`Slash command error: ${errorMsg}`);
+      writeOutput({ status: 'error', result: null, error: errorMsg });
+    }
+
+    log(`Slash command done. compactBoundarySeen=${compactBoundarySeen}, hadError=${hadError}`);
+
+    // Warn if compact_boundary was never observed — compaction may not have occurred
+    if (!hadError && !compactBoundarySeen) {
+      log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
+    }
+
+    // Only emit final session marker if no result was emitted yet and no error occurred
+    if (!resultEmitted && !hadError) {
+      writeOutput({
+        status: 'success',
+        result: compactBoundarySeen
+          ? 'Conversation compacted.'
+          : 'Compaction requested but compact_boundary was not observed.',
+        newSessionId: slashSessionId,
+      });
+    } else if (!hadError) {
+      // Emit session-only marker so host updates session tracking
+      writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
+    }
+    return;
+  }
+  // --- End slash command handling ---
+
   // Script phase: run script before waking agent
   if (containerInput.script && containerInput.isScheduledTask) {
     log('Running task script...');
@@ -678,6 +856,13 @@ async function main(): Promise<void> {
     prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
   }
 
+  // Tag untrusted group prompts with origin markers so the model (and compaction)
+  // can distinguish user instructions from untrusted input. Trusted and main group
+  // prompts are left untagged — they carry the same authority as system instructions.
+  if (!containerInput.isMain && !containerInput.isTrusted) {
+    prompt = `<untrusted-input source="${containerInput.groupFolder}">\n${prompt}\n</untrusted-input>`;
+  }
+
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
   try {
@@ -686,14 +871,27 @@ async function main(): Promise<void> {
         `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
       );
 
-      const queryResult = await runQuery(
-        prompt,
-        sessionId,
-        mcpServerPath,
-        containerInput,
-        sdkEnv,
-        resumeAt,
-      );
+      let queryResult;
+      try {
+        queryResult = await runQuery(
+          prompt,
+          sessionId,
+          mcpServerPath,
+          containerInput,
+          sdkEnv,
+          resumeAt,
+        );
+      } catch (resumeErr) {
+        const msg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+        if (sessionId && /session|conversation not found|resume/i.test(msg)) {
+          log(`Session resume failed (${msg}), retrying with fresh session`);
+          sessionId = undefined;
+          resumeAt = undefined;
+          queryResult = await runQuery(prompt, undefined, mcpServerPath, containerInput, sdkEnv, undefined);
+        } else {
+          throw resumeErr;
+        }
+      }
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }

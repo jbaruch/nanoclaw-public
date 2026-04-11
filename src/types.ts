@@ -30,6 +30,7 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  trusted?: boolean; // Trusted groups get limited credentials (e.g. voice transcription)
 }
 
 export interface RegisteredGroup {
@@ -87,7 +88,11 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(
+    jid: string,
+    text: string,
+    replyToMessageId?: string,
+  ): Promise<string | void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -95,6 +100,24 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: send an emoji reaction to a message.
+  sendReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
+  // Optional: react to the most recent message in a chat.
+  reactToLatestMessage?(jid: string, emoji: string): Promise<void>;
+  // Optional: pin a message in the chat.
+  pinMessage?(jid: string, messageId: string): Promise<void>;
+  // Optional: send a file to the chat.
+  sendFile?(
+    jid: string,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: string,
+  ): Promise<void>;
+  // Optional: create a draft stream for progressive message display.
+  createDraftStream?(
+    jid: string,
+    replyToMessageId?: string,
+  ): import('./draft-stream.js').DraftStream;
 }
 
 // Callback type that channels use to deliver inbound messages

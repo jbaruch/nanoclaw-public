@@ -34,6 +34,44 @@ function writeIpcFile(dir: string, data: object): string {
   return filename;
 }
 
+/**
+ * Send a named host operation via IPC and poll for the result.
+ * Each operation maps to a specific handler on the host with locked-down credentials.
+ */
+async function runHostOperation(
+  type: string,
+  extra?: Record<string, unknown>,
+  timeoutMs = 180_000,
+): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  writeIpcFile(TASKS_DIR, {
+    type,
+    groupFolder,
+    chatJid,
+    requestId,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  });
+
+  const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+  const pollMs = 500;
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    if (fs.existsSync(resultPath)) {
+      const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+      fs.unlinkSync(resultPath);
+      if (result.error) {
+        return { content: [{ type: 'text' as const, text: `Error: ${result.error}` }], isError: true };
+      }
+      return { content: [{ type: 'text' as const, text: result.stdout || '(no output)' }] };
+    }
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+
+  return { content: [{ type: 'text' as const, text: `Operation ${type} timed out` }], isError: true };
+}
+
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
@@ -41,7 +79,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message.",
   {
     text: z.string().describe('The message text to send'),
     sender: z
@@ -50,9 +88,11 @@ server.tool(
       .describe(
         'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
       ),
+    reply_to: z.string().optional().describe('Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, auto-replies to the most recent incoming message (first call only).'),
+    pin: z.boolean().optional().describe('Pin this message in the chat after sending. Use for important messages like daily briefs.'),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
+    const data: Record<string, string | boolean | undefined> = {
       type: 'message',
       chatJid,
       text: args.text,
@@ -61,9 +101,71 @@ server.tool(
       timestamp: new Date().toISOString(),
     };
 
+    // Only reply-thread when explicitly requested
+    if (args.reply_to) {
+      data.replyToMessageId = args.reply_to;
+    }
+
+    if (args.pin) {
+      data.pin = true;
+    }
+
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    return { content: [{ type: 'text' as const, text: args.pin ? 'Message sent and pinned.' : 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'send_file',
+  'Send a file from the workspace to the user via Telegram. The file must exist on the container filesystem. Use for generated reports, exports, or any file the user asked you to create. Trusted containers only.',
+  {
+    filePath: z.string().describe('Absolute path to the file in the container (e.g., /workspace/group/report.csv)'),
+    caption: z.string().optional().describe('Optional caption to send with the file'),
+    reply_to: z.string().optional().describe('Message ID to reply to'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.filePath)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.filePath}` }],
+        isError: true,
+      };
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'send_file',
+      chatJid,
+      filePath: args.filePath,
+      caption: args.caption,
+      replyToMessageId: args.reply_to,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `File queued for sending: ${path.basename(args.filePath)}` }] };
+  },
+);
+
+server.tool(
+  'react_to_message',
+  'React to a message with an emoji. Use to acknowledge, approve, or express sentiment without sending a full text reply. Invalid emoji falls back to 👍.',
+  {
+    messageId: z.string().optional().describe('Message ID to react to. If omitted, reacts to the most recent message.'),
+    emoji: z.string().describe('Telegram reaction emoji. 73 supported: 👍👎❤🔥🥰👏😁🤔🤯😱🤬😢🎉🤩🤮💩🙏👌🕊🤡🥱🥴😍🐳❤‍🔥🌚🌭💯🤣⚡🍌🏆💔🤨😐🍓🍾💋🖕😈😴😭🤓👻👨‍💻👀🎃🙈😇😨🤝✍🤗🫡🎅🎄☃💅🤪🗿🆒💘🙉🦄😘💊🙊😎👾🤷‍♂🤷🤷‍♀😡. Invalid falls back to 👍.'),
+  },
+  async (args) => {
+    const data: Record<string, string | undefined> = {
+      type: 'react_to_message',
+      chatJid,
+      messageId: args.messageId || undefined,
+      emoji: args.emoji,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(MESSAGES_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Reacted with ${args.emoji}` }] };
   },
 );
 
@@ -466,6 +568,12 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       .describe(
         'Whether messages must start with the trigger word. Default: false (respond to all messages). Set to true for busy groups with many participants where you only want the agent to respond when explicitly mentioned.',
       ),
+    trusted: z.boolean().optional().describe('Whether the group gets a trusted container (read-write filesystem, admin tiles, longer timeout). Default: false. Set true for personal/friends groups.'),
+    additionalMounts: z.array(z.object({
+      hostPath: z.string().describe('Path on the host (supports "~" expansion; does not need to be absolute).'),
+      containerPath: z.string().optional().describe('Optional mount name inside /workspace/extra/. When omitted, the host derives it from basename(hostPath).'),
+      readonly: z.boolean().optional().describe('Mount as read-only (default). Set to false to request read-write access.'),
+    })).optional().describe('Extra volume mounts for the container, passed through to the host.'),
   },
   async (args) => {
     if (!isMain) {
@@ -480,6 +588,13 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       };
     }
 
+    const containerConfig = (args.trusted !== undefined || args.additionalMounts)
+      ? {
+          ...(args.trusted !== undefined ? { trusted: args.trusted } : {}),
+          ...(args.additionalMounts ? { additionalMounts: args.additionalMounts } : {}),
+        }
+      : undefined;
+
     const data = {
       type: 'register_group',
       jid: args.jid,
@@ -487,6 +602,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       folder: args.folder,
       trigger: args.trigger,
       requiresTrigger: args.requiresTrigger ?? false,
+      containerConfig,
       timestamp: new Date().toISOString(),
     };
 
@@ -499,6 +615,131 @@ Use available_groups.json to find the JID for a group. The folder name must be c
           text: `Group "${args.name}" registered. It will start receiving messages immediately.`,
         },
       ],
+    };
+  },
+);
+
+server.tool(
+  'nuke_session',
+  'Kill this container and start a fresh session on the next message. Use when context is corrupted, rules are stale, or user asks to start fresh. The current conversation will end immediately.',
+  {},
+  async () => {
+    const data = {
+      type: 'nuke_session',
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Session nuked. Container will be killed. Next message starts fresh.' }] };
+  },
+);
+
+// --- Named host operations ---
+
+server.tool(
+  'github_backup',
+  'Commit and push the group backup repo to GitHub. Use for nightly backups or when important state changes. The host handles git credentials — the container just triggers it.',
+  {
+    message: z.string().optional().describe('Commit message. Default: "backup: <ISO date>"'),
+  },
+  async (args) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const data = {
+      type: 'github_backup',
+      groupFolder,
+      chatJid,
+      message: args.message,
+      requestId,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Poll for result file
+    const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+    const timeoutMs = 60_000;
+    const pollMs = 500;
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      if (fs.existsSync(resultPath)) {
+        const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+        fs.unlinkSync(resultPath);
+        if (result.error) {
+          return {
+            content: [{ type: 'text' as const, text: `Backup failed: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: 'text' as const, text: result.stdout || 'Backup pushed.' }],
+        };
+      }
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Backup timed out after 60s' }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
+  'promote_staging',
+  'Promote staged skills and rules to tessl tiles. Runs the full pipeline: copy from staging, lint, git commit+push, publish to registry, install. Main group only.',
+  {
+    tileName: z.string().describe('Target tile: "nanoclaw-admin", "nanoclaw-core", or "nanoclaw-untrusted"'),
+    skillName: z.string().optional().describe('Specific skill to promote. Omit for all staging items. Use "--rules-only" to promote only rules.'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can promote tiles.' }],
+        isError: true,
+      };
+    }
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const data = {
+      type: 'promote_staging',
+      groupFolder,
+      tileName: args.tileName,
+      skillName: args.skillName || 'all',
+      requestId,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Poll for result (promotion can take a while — tessl publish, git push)
+    const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+    const timeoutMs = 300_000;
+    const pollMs = 1000;
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      if (fs.existsSync(resultPath)) {
+        const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+        fs.unlinkSync(resultPath);
+        if (result.error) {
+          return {
+            content: [{ type: 'text' as const, text: `Promotion failed: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: 'text' as const, text: result.stdout || 'Promotion complete.' }],
+        };
+      }
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Promotion timed out after 5 minutes.' }],
+      isError: true,
     };
   },
 );

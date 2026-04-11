@@ -1,0 +1,9 @@
+{
+  "name": "nanoclaw",
+  "mode": "vendored",
+  "dependencies": {
+    "jbaruch/nanoclaw-host": {
+      "version": "0.1.12"
+    }
+  }
+}

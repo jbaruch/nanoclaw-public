@@ -1,0 +1,18 @@
+{
+  "name": "nanoclaw-orchestrator",
+  "mode": "managed",
+  "dependencies": {
+    "jbaruch/nanoclaw-core": {
+      "version": "0.1.60"
+    },
+    "jbaruch/nanoclaw-untrusted": {
+      "version": "0.1.15"
+    },
+    "jbaruch/nanoclaw-trusted": {
+      "version": "0.1.30"
+    },
+    "jbaruch/nanoclaw-host": {
+      "version": "0.1.2"
+    }
+  }
+}
