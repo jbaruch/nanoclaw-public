@@ -56,11 +56,19 @@ export function readonlyMountArgs(
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/** Stop a container by name. Uses spawnSync with args array to avoid shell injection. */
+/** Stop a container by name. Tries graceful stop first, then SIGKILL. */
 export function stopContainer(name: string): void {
-  spawnSync(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', name], {
+  const stop = spawnSync(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', name], {
     stdio: 'pipe',
+    timeout: 10_000,
   });
+  if (stop.status !== 0) {
+    // Graceful stop failed — force kill
+    spawnSync(CONTAINER_RUNTIME_BIN, ['kill', name], {
+      stdio: 'pipe',
+      timeout: 5_000,
+    });
+  }
 }
 
 /** Ensure the container runtime (Docker) is running. */
