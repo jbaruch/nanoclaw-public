@@ -818,22 +818,70 @@ export class TelegramChannel implements Channel {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
-      this.bot!.start({
-        onStart: (botInfo) => {
-          logger.info(
-            { username: botInfo.username, id: botInfo.id },
-            'Telegram bot connected',
-          );
-          console.log(`\n  Telegram bot: @${botInfo.username}`);
-          console.log(
-            `  Send /chatid to the bot to get a chat's registration ID\n`,
-          );
-          resolve();
-        },
+    // Start polling with auto-restart on transient failures (e.g. 409 Conflict).
+    // Grammy's polling loop dies silently on getUpdates errors — we catch that
+    // and restart after a backoff so the bot doesn't go deaf.
+    const MAX_POLLING_RETRIES = 5;
+    let pollingRetries = 0;
+
+    const startPolling = (): Promise<void> => {
+      return new Promise<void>((resolve, reject) => {
+        let resolved = false;
+        this.bot!
+          .start({
+            onStart: (botInfo) => {
+              logger.info(
+                { username: botInfo.username, id: botInfo.id },
+                'Telegram bot connected',
+              );
+              console.log(`\n  Telegram bot: @${botInfo.username}`);
+              console.log(
+                `  Send /chatid to the bot to get a chat's registration ID\n`,
+              );
+              pollingRetries = 0; // reset on successful start
+              if (!resolved) {
+                resolved = true;
+                resolve();
+              }
+            },
+          })
+          .catch((err: Error) => {
+            pollingRetries++;
+            if (pollingRetries > MAX_POLLING_RETRIES) {
+              logger.fatal(
+                { err: err.message, retries: pollingRetries },
+                'Telegram polling failed too many times, giving up',
+              );
+              if (!resolved) {
+                resolved = true;
+                reject(err);
+              }
+              return;
+            }
+            const backoffMs = Math.min(10_000 * pollingRetries, 60_000);
+            logger.error(
+              { err: err.message, retry: pollingRetries, backoffMs },
+              'Telegram polling loop crashed, restarting',
+            );
+            setTimeout(() => {
+              logger.info({ retry: pollingRetries }, 'Restarting Telegram polling loop');
+              startPolling().catch((retryErr: Error) => {
+                logger.error(
+                  { err: retryErr.message },
+                  'Telegram polling restart failed',
+                );
+              });
+            }, backoffMs);
+            // Only reject if we haven't resolved the initial start yet
+            if (!resolved) {
+              resolved = true;
+              reject(err);
+            }
+          });
       });
-    });
+    };
+
+    return startPolling();
   }
 
   async sendMessage(
