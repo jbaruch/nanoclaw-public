@@ -1053,6 +1053,23 @@ async function main(): Promise<void> {
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
 
+  // Write available_groups.json for all main/trusted groups on startup.
+  // Otherwise the snapshot only updates when a container spawns, which can
+  // leave it weeks stale if the group doesn't get traffic.
+  const startupGroups = getAvailableGroups();
+  const startupRegisteredJids = new Set(Object.keys(registeredGroups));
+  for (const [, group] of Object.entries(registeredGroups)) {
+    if (group.isMain || group.containerConfig?.trusted) {
+      writeGroupsSnapshot(
+        group.folder,
+        group.isMain === true,
+        startupGroups,
+        startupRegisteredJids,
+        !!group.containerConfig?.trusted,
+      );
+    }
+  }
+
   // Periodic tile update from registry (every 15 min)
   // Heartbeat runs in the container and can't call tessl update.
   // This catches publishes that the post-promote timer missed.

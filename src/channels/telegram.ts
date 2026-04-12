@@ -818,22 +818,46 @@ export class TelegramChannel implements Channel {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
-      this.bot!.start({
-        onStart: (botInfo) => {
-          logger.info(
-            { username: botInfo.username, id: botInfo.id },
-            'Telegram bot connected',
-          );
-          console.log(`\n  Telegram bot: @${botInfo.username}`);
-          console.log(
-            `  Send /chatid to the bot to get a chat's registration ID\n`,
-          );
-          resolve();
-        },
+    // Start polling with auto-restart on transient failures (e.g. 409 Conflict).
+    // Grammy's polling loop dies silently on getUpdates errors — we catch that
+    // and restart after a backoff so the bot doesn't go deaf.
+    const startPolling = (bot: Bot): Promise<void> => {
+      return new Promise<void>((resolve, reject) => {
+        let resolved = false;
+        bot.start({
+          onStart: (botInfo) => {
+            logger.info(
+              { username: botInfo.username, id: botInfo.id },
+              'Telegram bot connected',
+            );
+            console.log(`\n  Telegram bot: @${botInfo.username}`);
+            console.log(
+              `  Send /chatid to the bot to get a chat's registration ID\n`,
+            );
+            if (!resolved) {
+              resolved = true;
+              resolve();
+            }
+          },
+        }).catch((err: Error) => {
+          // Polling loop crashed — restart after backoff
+          logger.error({ err: err.message }, 'Telegram polling loop crashed, restarting in 10s');
+          setTimeout(() => {
+            logger.info('Restarting Telegram polling loop');
+            startPolling(bot).catch((retryErr: Error) => {
+              logger.error({ err: retryErr.message }, 'Telegram polling restart failed');
+            });
+          }, 10_000);
+          // Only reject if we haven't resolved the initial start yet
+          if (!resolved) {
+            resolved = true;
+            reject(err);
+          }
+        });
       });
-    });
+    };
+
+    return startPolling(this.bot!);
   }
 
   async sendMessage(
