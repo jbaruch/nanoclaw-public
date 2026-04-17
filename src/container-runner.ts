@@ -72,6 +72,21 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const AGENT_MODEL = 'claude-opus-4-7[1m]';
 
 /**
+ * Effort level the agent-runner passes to the SDK's `query()` call.
+ * Forwarded as `AGENT_EFFORT` on container spawn. Tunable per deploy
+ * without rebuilding the agent-runner image — useful for cost/latency
+ * experimentation.
+ *
+ * Valid values: `'low' | 'medium' | 'high' | 'xhigh' | 'max'`.
+ * - On Opus 4.7: `xhigh` is Anthropic's recommended default for
+ *   coding/agentic work; `max` is reserved for frontier problems.
+ * - On Opus 4.6 / Sonnet 4.6: `xhigh` silently falls back to `high` in
+ *   the SDK.
+ * See https://docs.anthropic.com/en/docs/build-with-claude/effort
+ */
+const AGENT_EFFORT = 'xhigh';
+
+/**
  * Create a filtered copy of messages.db containing only one group's messages.
  * Returns the path to the filtered DB, or null if the source DB doesn't exist.
  */
@@ -627,10 +642,13 @@ function buildContainerArgs(
     }
   }
 
-  // Select which model the agent-runner's SDK query() uses. The runner
-  // reads `process.env.AGENT_MODEL` — see `AGENT_MODEL` constant at the
-  // top of this file.
+  // Select which model + effort the agent-runner's SDK query() uses.
+  // The runner reads `process.env.AGENT_MODEL` and `process.env.AGENT_EFFORT`
+  // — see constants at the top of this file. Keeping these on the env
+  // (not baked into the agent image) lets model bumps / effort retuning
+  // ship with an orchestrator rebuild only.
   args.push('-e', `AGENT_MODEL=${AGENT_MODEL}`);
+  args.push('-e', `AGENT_EFFORT=${AGENT_EFFORT}`);
 
   // Pass chat JID so container scripts know which group they're in
   if (chatJid) {
