@@ -63,7 +63,14 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
  * `container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`
  * for the `model` field on `Options`.
  */
-const AGENT_MODEL = 'claude-opus-4-7[1m]';
+// Default keeps the 4.6-resolving alias (`opus[1m]`) — switching to
+// `claude-opus-4-7[1m]` without also updating the agent-runner's
+// query() call breaks every request with:
+//   "\"thinking.type.enabled\" is not supported for this model.
+//    Use \"thinking.type.adaptive\" and \"output_config.effort\" to
+//    control thinking behavior."
+// Move to 4.7 after updating agent-runner to the new thinking shape.
+const AGENT_MODEL = 'opus[1m]';
 
 /**
  * Create a filtered copy of messages.db containing only one group's messages.
