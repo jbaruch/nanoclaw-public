@@ -62,15 +62,37 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
  * (`claude-opus-4-7[1m]`). See
  * `container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts`
  * for the `model` field on `Options`.
+ *
+ * NOTE: changing the model family may require matching changes in
+ * agent-runner's `query()` call. Opus 4.7 specifically needs
+ * `thinking: { type: 'adaptive' }` (manual `type: 'enabled'` is rejected)
+ * and does not support `effort: 'max'` well. The current runner is set up
+ * for 4.7's expectations.
  */
-// Default keeps the 4.6-resolving alias (`opus[1m]`) — switching to
-// `claude-opus-4-7[1m]` without also updating the agent-runner's
-// query() call breaks every request with:
-//   "\"thinking.type.enabled\" is not supported for this model.
-//    Use \"thinking.type.adaptive\" and \"output_config.effort\" to
-//    control thinking behavior."
-// Move to 4.7 after updating agent-runner to the new thinking shape.
-const AGENT_MODEL = 'opus[1m]';
+const AGENT_MODEL = 'claude-opus-4-7[1m]';
+
+/**
+ * Effort level the agent-runner passes to the SDK's `query()` call.
+ * Forwarded as `AGENT_EFFORT` on container spawn.
+ *
+ * Resolution order (from highest precedence):
+ *   1. `AGENT_EFFORT` environment variable on the orchestrator process
+ *   2. The hardcoded default below (`xhigh`)
+ *
+ * Operators can override at runtime by setting `AGENT_EFFORT` in the
+ * orchestrator's env (e.g. docker-compose, systemd unit), no rebuild
+ * needed. The agent-runner validates the forwarded value against the
+ * allowed set and falls back to `xhigh` on invalid input, so a typo
+ * here won't crash containers — it'll log a warning inside the runner.
+ *
+ * Valid values: `'low' | 'medium' | 'high' | 'xhigh' | 'max'`.
+ * - On Opus 4.7: `xhigh` is Anthropic's recommended default for
+ *   coding/agentic work; `max` is reserved for frontier problems.
+ * - On Opus 4.6 / Sonnet 4.6: `xhigh` silently falls back to `high` in
+ *   the SDK.
+ * See https://docs.anthropic.com/en/docs/build-with-claude/effort
+ */
+const AGENT_EFFORT = process.env.AGENT_EFFORT || 'xhigh';
 
 /**
  * Create a filtered copy of messages.db containing only one group's messages.
@@ -628,10 +650,13 @@ function buildContainerArgs(
     }
   }
 
-  // Select which model the agent-runner's SDK query() uses. The runner
-  // reads `process.env.AGENT_MODEL` — see `AGENT_MODEL` constant at the
-  // top of this file.
+  // Select which model + effort the agent-runner's SDK query() uses.
+  // The runner reads `process.env.AGENT_MODEL` and `process.env.AGENT_EFFORT`
+  // — see constants at the top of this file. Keeping these on the env
+  // (not baked into the agent image) lets model bumps / effort retuning
+  // ship with an orchestrator rebuild only.
   args.push('-e', `AGENT_MODEL=${AGENT_MODEL}`);
+  args.push('-e', `AGENT_EFFORT=${AGENT_EFFORT}`);
 
   // Pass chat JID so container scripts know which group they're in
   if (chatJid) {

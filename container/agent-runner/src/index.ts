@@ -68,6 +68,34 @@ const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
 /**
+ * Effort levels the SDK's `query()` accepts (as of
+ * `@anthropic-ai/claude-agent-sdk` 0.2.112). Kept here as a runtime
+ * whitelist so a typo in `AGENT_EFFORT` doesn't propagate to the API
+ * as a 400 — we fall back to the default and log.
+ */
+const VALID_AGENT_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+type AgentEffort = (typeof VALID_AGENT_EFFORTS)[number];
+const DEFAULT_AGENT_EFFORT: AgentEffort = 'xhigh';
+
+function resolveAgentEffort(raw: string | undefined): AgentEffort {
+  if (!raw) return DEFAULT_AGENT_EFFORT;
+  if ((VALID_AGENT_EFFORTS as readonly string[]).includes(raw)) {
+    return raw as AgentEffort;
+  }
+  console.error(
+    `[agent-runner] Invalid AGENT_EFFORT="${raw}" — falling back to ` +
+      `"${DEFAULT_AGENT_EFFORT}". Valid values: ${VALID_AGENT_EFFORTS.join(', ')}.`,
+  );
+  return DEFAULT_AGENT_EFFORT;
+}
+
+/**
  * Push-based async iterable for streaming user messages to the SDK.
  * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
  */
@@ -489,7 +517,27 @@ async function runQuery(
       // so the model can be bumped without rebuilding the agent-runner image.
       // Fallback matches the historical hardcoded value.
       model: process.env.AGENT_MODEL || 'opus[1m]',
-      effort: 'max',
+      // Opus 4.7 rejects the old `thinking.type=enabled` shape entirely
+      // and runs with thinking OFF unless adaptive is explicitly requested.
+      // Adaptive also auto-enables interleaved thinking, which matters for
+      // our multi-tool-call agentic workflow. Safe on 4.6/Sonnet 4.6 (both
+      // support adaptive and will use it over the deprecated manual mode).
+      // See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
+      thinking: { type: 'adaptive' as const },
+      // AGENT_EFFORT is set by the orchestrator alongside AGENT_MODEL so
+      // cost/latency can be tuned per deploy without rebuilding this image.
+      // xhigh is Opus 4.7's recommended default for coding/agentic work
+      // (Anthropic docs: "recommended starting point for coding and agentic
+      // work"). On 4.6 and Sonnet 4.6 the SDK silently falls back to `high`.
+      // Dropped from `max` — Anthropic recommends against max on 4.7 unless
+      // evals show measurable headroom; xhigh is the sweet spot.
+      //
+      // NOTE: `thinking` is deliberately NOT env-configurable — its valid
+      // shape is coupled to the model family (4.7 rejects `type: 'enabled'`,
+      // older models require it), so independent config would let the two
+      // drift and silently reproduce the 400-error outage. Model-family
+      // changes are a code review, not a redeploy knob.
+      effort: resolveAgentEffort(process.env.AGENT_EFFORT),
       allowedTools: [
         'Bash',
         'Read',
