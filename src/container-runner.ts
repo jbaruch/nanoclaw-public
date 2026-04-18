@@ -97,8 +97,14 @@ const AGENT_EFFORT = process.env.AGENT_EFFORT || 'xhigh';
 /**
  * Create a filtered copy of messages.db containing only one group's messages.
  * Returns the path to the filtered DB, or null if the source DB doesn't exist.
+ *
+ * @internal Exported for tests only — untrusted-group DB isolation is
+ *   security-critical and must be pinned by regression tests.
  */
-function createFilteredDb(chatJid: string, groupFolder: string): string | null {
+export function createFilteredDb(
+  chatJid: string,
+  groupFolder: string,
+): string | null {
   const srcDb = path.join(STORE_DIR, 'messages.db');
   if (!fs.existsSync(srcDb)) return null;
 
@@ -158,6 +164,18 @@ export interface ContainerInput {
   assistantName?: string;
   script?: string;
   replyToMessageId?: string;
+  /**
+   * Which per-group session this container run belongs to. Drives the
+   * `.claude/` dir location and the group-queue slot key.
+   * - `'default'` (omitted): user-facing AyeAye, serves inbound IPC messages.
+   * - `'maintenance'`: scheduled AyeAye, runs scheduled_tasks (heartbeat,
+   *   nightly, weekly, reminders). Runs in parallel with `'default'` for the
+   *   same group so maintenance never blocks user replies.
+   *
+   * Invariant: inbound Telegram/etc. messages ALWAYS route to `'default'`.
+   * `src/task-scheduler.ts` is the sole writer of `'maintenance'`.
+   */
+  sessionName?: string;
 }
 
 export interface ContainerOutput {
@@ -198,11 +216,76 @@ function toHostPath(localPath: string): string {
   return path.join(HOST_PROJECT_ROOT, rel);
 }
 
-function buildVolumeMounts(
+/**
+ * Files in the project root that contain secrets (bot tokens, API keys).
+ * Main-group containers get `/dev/null` mounted over each of these so agents
+ * can't read tokens and bypass the credential proxy.
+ *
+ * Security-critical: adding a new secret file ANYWHERE in the repo requires
+ * adding it to this list, or an agent in the main group can read it.
+ */
+export const SECRET_FILES = [
+  '.env',
+  '.env.bak',
+  'data/env/env',
+  'scripts/heartbeat-external.conf',
+] as const;
+
+/**
+ * Default `sessionName` when callers don't pass one. User-facing paths
+ * (inbound IPC messages) resolve here. Scheduled tasks pass `'maintenance'`
+ * to get a parallel container slot. See `ContainerInput.sessionName` docs.
+ */
+export const DEFAULT_SESSION_NAME = 'default';
+
+/**
+ * Per-session subdir name under `<DATA_DIR>/ipc/<folder>/` for the input
+ * side of the IPC channel. Each session gets its own subdir so `_close`
+ * sentinels and follow-up JSON messages written for one session never
+ * leak into the other session's container.
+ *
+ * Exported so group-queue writes to the same path the container-runner
+ * mounted — both must agree on the location. Kept in sync at compile time.
+ *
+ * Session name is validated here so every caller (orchestrator-trusted
+ * and IPC-untrusted alike) gets the same guard. A malicious container
+ * that manages to stamp `sessionName: "../default"` onto its IPC request
+ * would, without this check, redirect `scriptResultPath` or mount
+ * construction into a directory outside the expected `ipc/<group>/`
+ * subtree. The allowlist pattern is deliberately narrow — `default`,
+ * `maintenance`, and any hypothetical future slot all fit within
+ * `[A-Za-z0-9_-]+`.
+ */
+const VALID_SESSION_NAME_RE = /^[A-Za-z0-9_-]+$/;
+export function sessionInputDirName(sessionName: string): string {
+  if (!VALID_SESSION_NAME_RE.test(sessionName)) {
+    throw new Error(
+      `Invalid session name: ${JSON.stringify(sessionName)} — must match ${VALID_SESSION_NAME_RE}`,
+    );
+  }
+  return `input-${sessionName}`;
+}
+
+/**
+ * @internal Exported for tests only — mount-list construction is
+ *   security-critical (trust tiers, secret shadowing, untrusted read-only).
+ */
+export function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
   chatJid: string,
+  sessionName: string = DEFAULT_SESSION_NAME,
 ): VolumeMount[] {
+  // Validate `sessionName` at the earliest point it's used as a filesystem
+  // path segment. The same allowlist `sessionInputDirName` enforces — kept
+  // in sync so no mount can be built with a name that would later be
+  // rejected at IPC time, and no caller can smuggle `..` into the sessions
+  // dir path (which happens BEFORE `sessionInputDirName` is reached).
+  if (!VALID_SESSION_NAME_RE.test(sessionName)) {
+    throw new Error(
+      `Invalid session name: ${JSON.stringify(sessionName)} — must match ${VALID_SESSION_NAME_RE}`,
+    );
+  }
   const mounts: VolumeMount[] = [];
   const groupDir = resolveGroupFolderPath(group.folder);
 
@@ -223,6 +306,20 @@ function buildVolumeMounts(
       containerPath: '/workspace/project',
       readonly: true,
     });
+    // Shadow ALL files containing secrets so agents can't read bot tokens.
+    // Without this, subagents curl the Telegram API directly, bypassing MCP.
+    // mount --bind inside the container doesn't work (needs CAP_SYS_ADMIN),
+    // so we mount /dev/null over every secret file from the orchestrator.
+    for (const relPath of SECRET_FILES) {
+      const absPath = path.join(process.cwd(), relPath);
+      if (fs.existsSync(absPath)) {
+        mounts.push({
+          hostPath: '/dev/null',
+          containerPath: `/workspace/project/${relPath}`,
+          readonly: true,
+        });
+      }
+    }
   }
 
   // Group folder mount. Untrusted groups get read-only (disk exhaustion protection).
@@ -303,11 +400,15 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
+  // Per-group-per-session Claude sessions directory. The extra `sessionName`
+  // segment isolates the user-facing (`default`) and scheduled (`maintenance`)
+  // AyeAyes so their SDK transcripts, `settings.json`, skills/ and .tessl/
+  // trees never collide when both run concurrently for the same group.
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
     group.folder,
+    sessionName,
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
@@ -366,6 +467,23 @@ function buildVolumeMounts(
     'tiles',
     TILE_OWNER,
   );
+
+  // Build the group's tile-managed scripts/ in a sibling tmp dir, then
+  // publish it atomically via a symlink flip (see the swap block below).
+  // Writing directly into `groups/<folder>/scripts/` would create two
+  // separate problems the moment two sessions run concurrently:
+  //   1. Stale scripts from removed-in-new-tile skills lingered (the bug
+  //      that drove the "DB size crossed N MB" rogue-heartbeat behaviour).
+  //   2. A naive `rmSync(groupScriptsDir)` before the copy loop opens a
+  //      race window where the other session reads a half-populated dir.
+  // Tmp-then-publish gives both sessions a valid snapshot at all times:
+  // whichever session finishes last wins the publish, and both end states
+  // are equivalent (same installed tile version).
+  const groupScriptsDir = path.join(groupDir, 'scripts');
+  const scriptsTmpSuffix = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const tmpScriptsDir = `${groupScriptsDir}.new.${scriptsTmpSuffix}`;
+  fs.mkdirSync(tmpScriptsDir, { recursive: true });
+
   const rulesContent: string[] = [];
   for (const tileName of tilesToInstall) {
     const tileSrc = path.join(registryTiles, tileName);
@@ -404,19 +522,135 @@ function buildVolumeMounts(
         fs.cpSync(skillSrcDir, path.join(skillsDst, `tessl__${skillDir}`), {
           recursive: true,
         });
-        // Copy bundled scripts to group's scripts/ dir (used by named host operations)
+        // Copy bundled scripts into the tmp scripts dir; swap happens below,
+        // after all tiles' skills are processed. Scripts at this path are
+        // used by named host operations and referenced from skills as
+        // `/workspace/group/scripts/<name>`.
         const skillScriptsDir = path.join(skillSrcDir, 'scripts');
         if (fs.existsSync(skillScriptsDir)) {
-          const groupScriptsDir = path.join(groupDir, 'scripts');
-          fs.mkdirSync(groupScriptsDir, { recursive: true });
           for (const scriptFile of fs.readdirSync(skillScriptsDir)) {
             fs.cpSync(
               path.join(skillScriptsDir, scriptFile),
-              path.join(groupScriptsDir, scriptFile),
+              path.join(tmpScriptsDir, scriptFile),
             );
           }
         }
       }
+    }
+  }
+
+  // Atomic symlink-based publish for `groups/<folder>/scripts/`. Readers
+  // must ALWAYS find `groupScriptsDir` present — the previous "rename old
+  // aside, rename new into place" design had a brief ENOENT window between
+  // the two renames where a concurrent agent running `/workspace/group/
+  // scripts/<file>` would fail (CodeQL correctness finding).
+  //
+  // New layout:
+  //   groups/<folder>/scripts             ──► symlink
+  //   groups/<folder>/scripts.version.<id> ──► real directory (one per publish)
+  //
+  // Publish steps:
+  //   1. rename `tmpScriptsDir` → `scripts.version.<id>` (a unique sibling)
+  //   2. create a temporary symlink `scripts.link.<id>` → that version
+  //   3. atomically rename the symlink over `groupScriptsDir` (POSIX rename
+  //      on a symlink replaces an existing symlink atomically)
+  //   4. delete the previous version dir (if any)
+  //
+  // First-install path: no `groupScriptsDir` exists; we just rename the
+  // temp symlink into place — still atomic, no window.
+  //
+  // Legacy path: pre-this-commit installs have a REAL directory at
+  // `groupScriptsDir` (not a symlink). We can't atomically replace a
+  // non-empty directory with a symlink. For that one-time transition we
+  // do `rm -rf <dir>` + `symlink` — has a brief window, but runs exactly
+  // once per group, ever, and is bounded.
+  const RACE_CODES = new Set(['EEXIST', 'ENOTEMPTY']);
+  const swapId = `${Date.now()}.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+  const newVersionDir = `${groupScriptsDir}.version.${swapId}`;
+  const tmpLink = `${groupScriptsDir}.link.${swapId}`;
+  let previousVersionDir: string | null = null;
+
+  const rmBestEffort = (target: string): void => {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+    } catch {
+      /* ignore — orphaned artefacts don't affect correctness */
+    }
+  };
+
+  try {
+    // 1. Publish our tmp build as a versioned sibling.
+    fs.renameSync(tmpScriptsDir, newVersionDir);
+
+    // 2. Inspect what's currently at `groupScriptsDir` (symlink, real dir,
+    //    or missing).
+    let liveStat: fs.Stats | null = null;
+    try {
+      liveStat = fs.lstatSync(groupScriptsDir);
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') throw err;
+    }
+    if (liveStat && liveStat.isSymbolicLink()) {
+      // Remember the previous version so we can clean it up after the flip.
+      try {
+        const currentTarget = fs.readlinkSync(groupScriptsDir);
+        previousVersionDir = path.isAbsolute(currentTarget)
+          ? currentTarget
+          : path.resolve(path.dirname(groupScriptsDir), currentTarget);
+      } catch {
+        /* ignore — if we can't read the link we just won't clean it up */
+      }
+    }
+
+    // 3. Create the temp symlink. Relative target so moves of the parent
+    //    dir don't break the link. `'dir'` hint matters only on Windows.
+    fs.symlinkSync(path.basename(newVersionDir), tmpLink, 'dir');
+
+    if (liveStat && !liveStat.isSymbolicLink()) {
+      // Legacy layout: real dir at `groupScriptsDir`. Can't atomically
+      // replace a non-empty directory with a symlink; remove it first.
+      // This is the one-time per-group transition; steady state uses
+      // the pure atomic rename below.
+      fs.rmSync(groupScriptsDir, { recursive: true, force: true });
+    }
+
+    // 4. Atomic flip: POSIX rename on a symlink replaces an existing
+    //    symlink atomically. On the first-install path (no prior
+    //    symlink) this just creates the symlink. Either way
+    //    `groupScriptsDir` resolves to a valid versioned dir from
+    //    here on.
+    fs.renameSync(tmpLink, groupScriptsDir);
+
+    // 5. Clean up the previous versioned dir (if any).
+    if (previousVersionDir) rmBestEffort(previousVersionDir);
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException).code;
+    const isRace = code ? RACE_CODES.has(code) : false;
+
+    // Always drop our publish artefacts: if the race winner placed a
+    // correct `groupScriptsDir` our versioned dir is redundant; on a
+    // real error we can't trust our partial build.
+    rmBestEffort(tmpLink);
+    rmBestEffort(newVersionDir);
+    rmBestEffort(tmpScriptsDir);
+
+    if (isRace) {
+      logger.debug(
+        { err, groupScriptsDir },
+        'scripts/ publish raced with concurrent setup; keeping winning copy',
+      );
+    } else {
+      logger.error(
+        { err, code, groupScriptsDir },
+        'scripts/ publish failed unexpectedly (not a race)',
+      );
+      // Rethrow non-race errors so the spawn fails loudly. Unlike the
+      // previous design, `groupScriptsDir` (if it existed) is still
+      // present — either still a symlink pointing at the previous
+      // version, or still the legacy real dir — so even a failed
+      // publish doesn't leave the group with missing scripts.
+      throw err;
     }
   }
 
@@ -503,10 +737,13 @@ function buildVolumeMounts(
 
   // Claude Code config file — lives at /home/node/.claude.json (outside .claude/).
   // Read-only rootfs can't create it, so we bind-mount it from the sessions dir.
+  // Kept alongside the per-session `.claude/` dir so default and maintenance
+  // AyeAyes don't share Claude Code's per-session config.
   const claudeJsonPath = path.join(
     DATA_DIR,
     'sessions',
     group.folder,
+    sessionName,
     '.claude.json',
   );
   if (!fs.existsSync(claudeJsonPath)) {
@@ -528,11 +765,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Per-group IPC namespace
+  // Per-group IPC namespace. `input/` is per-session so parallel default
+  // and maintenance containers don't step on each other's _close sentinel
+  // or follow-up JSON files. `messages/` and `tasks/` stay shared — they're
+  // outbound from the container and the host aggregates both sessions' output.
   const groupIpcDir = resolveGroupIpcPath(group.folder);
+  const sessionInputSubdir = sessionInputDirName(sessionName);
+  const sessionInputDir = path.join(groupIpcDir, sessionInputSubdir);
   const isTrustedIpc = isMain || !!group.containerConfig?.trusted;
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(sessionInputDir, { recursive: true });
   if (isTrustedIpc) {
     fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   }
@@ -542,8 +784,8 @@ function buildVolumeMounts(
   if (ipcUid !== 0) {
     try {
       const subsToChown = isTrustedIpc
-        ? ['', 'messages', 'tasks', 'input']
-        : ['messages', 'input'];
+        ? ['', 'messages', 'tasks', sessionInputSubdir]
+        : ['messages', sessionInputSubdir];
       for (const sub of subsToChown) {
         fs.chownSync(path.join(groupIpcDir, sub), ipcUid, ipcGid);
       }
@@ -553,22 +795,31 @@ function buildVolumeMounts(
   }
 
   if (isTrustedIpc) {
-    // Trusted/main: single mount for entire IPC directory
+    // Trusted/main: mount the whole IPC dir at /workspace/ipc, then overlay
+    // the per-session input dir onto /workspace/ipc/input. Docker applies
+    // nested bind mounts in order — the second mount replaces the dir entry
+    // from the first, giving the container a session-isolated input/ while
+    // the shared messages/tasks/ and IPC root files remain aggregated.
     mounts.push({
       hostPath: toHostPath(groupIpcDir),
       containerPath: '/workspace/ipc',
       readonly: false,
     });
+    mounts.push({
+      hostPath: toHostPath(sessionInputDir),
+      containerPath: '/workspace/ipc/input',
+      readonly: false,
+    });
   } else {
-    // Untrusted: split mounts — messages/ writable, input/ read-only, no tasks/
-    // No root IPC files (available_groups.json, current_tasks.json)
+    // Untrusted: split mounts — messages/ writable, input/ read-only, no tasks/.
+    // Per-session input dir isolates _close sentinels between sessions.
     mounts.push({
       hostPath: toHostPath(path.join(groupIpcDir, 'messages')),
       containerPath: '/workspace/ipc/messages',
       readonly: false,
     });
     mounts.push({
-      hostPath: toHostPath(path.join(groupIpcDir, 'input')),
+      hostPath: toHostPath(sessionInputDir),
       containerPath: '/workspace/ipc/input',
       readonly: true,
     });
@@ -722,12 +973,19 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  // Clean up stale _reply_to file from previous container runs.
-  // Scheduled tasks have no replyToMessageId — a leftover file would
-  // cause the MCP server to quote a random old message.
+  const sessionName = input.sessionName ?? DEFAULT_SESSION_NAME;
+
+  // Clean up stale _reply_to file from previous container runs in THIS
+  // session. The file must match the path the container reads — with
+  // per-session input dirs the container's `/workspace/ipc/input/_reply_to`
+  // maps to `<ipc>/<group>/input-<sessionName>/_reply_to`, so the cleanup
+  // must target the same session-scoped path. A cleanup against the legacy
+  // shared `input/` path would leave the real file in place, and a
+  // scheduled task with no replyToMessageId would quote a random old
+  // message from a prior run.
   const replyToFile = path.join(
     resolveGroupIpcPath(group.folder),
-    'input',
+    sessionInputDirName(sessionName),
     '_reply_to',
   );
   try {
@@ -736,9 +994,20 @@ export async function runContainerAgent(
     /* file doesn't exist — fine */
   }
 
-  const mounts = buildVolumeMounts(group, input.isMain, input.chatJid);
+  const mounts = buildVolumeMounts(
+    group,
+    input.isMain,
+    input.chatJid,
+    sessionName,
+  );
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+  // Suffix the container name with sessionName (when non-default) so that
+  // `docker ps` makes it obvious which slot a running container occupies.
+  // Main-group parallelism means two containers can share the group folder;
+  // the sessionName tag distinguishes them.
+  const sessionSuffix =
+    sessionName === DEFAULT_SESSION_NAME ? '' : `-${sessionName}`;
+  const containerName = `nanoclaw-${safeName}${sessionSuffix}-${Date.now()}`;
   const containerArgs = buildContainerArgs(
     mounts,
     containerName,

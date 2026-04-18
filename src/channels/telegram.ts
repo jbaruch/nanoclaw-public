@@ -10,6 +10,7 @@ import { getLatestMessage, getMessageById, storeReaction } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
+import { sanitizeTelegramHtml } from './telegram-sanitize.js';
 import {
   Channel,
   OnChatMetadata,
@@ -38,14 +39,21 @@ async function sendTelegramMessage(
     reply_parameters?: { message_id: number };
   } = {},
 ): Promise<number | undefined> {
+  // Idempotent Markdown→HTML pass — agents sometimes produce `**bold**` or
+  // `[text](url)` despite being told to use HTML. Well-formed HTML passes
+  // through unchanged; URLs/emails/existing tags are protected.
+  const sanitized = sanitizeTelegramHtml(text);
   try {
-    const msg = await api.sendMessage(chatId, text, {
+    const msg = await api.sendMessage(chatId, sanitized, {
       ...options,
       parse_mode: 'HTML',
     });
     return msg.message_id;
   } catch (err) {
-    // Fallback: send as plain text if HTML parsing fails
+    // Fallback: HTML parsing failed — send the ORIGINAL text without
+    // parse_mode. Sending `sanitized` here would render raw `<b>…</b>`
+    // tags literally to the user, which is strictly worse than the raw
+    // Markdown the agent produced.
     logger.debug({ err }, 'HTML send failed, falling back to plain text');
     const msg = await api.sendMessage(chatId, text, options);
     return msg.message_id;

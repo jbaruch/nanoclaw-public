@@ -56,8 +56,11 @@ EXCLUDES=(
   --exclude='logs/'
   --exclude='dist/'
   --exclude='.claude-memory/'
-  --exclude='.claude/projects/'
-  --exclude='.claude/worktrees/'
+  # Whole `.claude/` dir: mix of Claude Code settings (sandbox config,
+  # local permissions) and runtime state (scheduled_tasks.lock with pid
+  # + session id). None of it is NanoClaw source — users installing
+  # NanoClaw create their own on first run.
+  --exclude='.claude/'
   --exclude='container/agent-runner/dist/'
   --exclude='.DS_Store'
   --exclude='._*'

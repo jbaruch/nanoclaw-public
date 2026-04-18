@@ -1,11 +1,14 @@
 {
   "name": "jbaruch/nanoclaw-host",
-  "version": "0.1.12",
-  "summary": "Skills and rules for the NanoClaw host agent (Claude Code on Mac). Tile promotion, container management, staging checks, and reconciliation.",
+  "version": "0.1.15",
+  "summary": "Skills and rules for the NanoClaw host agent (Claude Code on Mac). Tile promotion, container management, staging checks, repo chain safety, and public sync.",
   "private": false,
   "rules": {
     "host-conventions": {
       "rules": "rules/host-conventions.md"
+    },
+    "repo-chain": {
+      "rules": "rules/repo-chain.md"
     }
   },
   "skills": {
@@ -20,6 +23,15 @@
     },
     "reconcile": {
       "path": "skills/reconcile/SKILL.md"
+    },
+    "sync-to-public": {
+      "path": "skills/sync-to-public/SKILL.md"
+    },
+    "update-from-public": {
+      "path": "skills/update-from-public/SKILL.md"
+    },
+    "ship-code": {
+      "path": "skills/ship-code/SKILL.md"
     }
   }
 }
