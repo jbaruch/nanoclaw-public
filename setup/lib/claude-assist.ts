@@ -64,6 +64,10 @@ const STEP_FILES: Record<string, string[]> = {
   'telegram-validate': ['setup/channels/telegram.ts'],
   'pair-telegram': ['setup/pair-telegram.ts', 'setup/channels/telegram.ts'],
   'discord-install': ['setup/add-discord.sh', 'setup/channels/discord.ts'],
+  'slack-install': ['setup/add-slack.sh', 'setup/channels/slack.ts'],
+  'slack-validate': ['setup/channels/slack.ts'],
+  'imessage-install': ['setup/add-imessage.sh', 'setup/channels/imessage.ts'],
+  'imessage': ['setup/channels/imessage.ts'],
   'teams-install': ['setup/add-teams.sh', 'setup/channels/teams.ts'],
   'teams-manifest': ['setup/lib/teams-manifest.ts', 'setup/channels/teams.ts'],
   'init-first-agent': [

@@ -19,6 +19,10 @@ export interface PendingSenderApproval {
   original_message: string;
   approver_user_id: string;
   created_at: string;
+  /** Card title shown at creation and re-used by getAskQuestionRender on click. */
+  title: string;
+  /** Normalized options (JSON-encoded NormalizedOption[]) — same shape persisted on pending_approvals. */
+  options_json: string;
 }
 
 export function createPendingSenderApproval(row: PendingSenderApproval): void {
@@ -26,11 +30,13 @@ export function createPendingSenderApproval(row: PendingSenderApproval): void {
     .prepare(
       `INSERT INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
-         sender_name, original_message, approver_user_id, created_at
+         sender_name, original_message, approver_user_id, created_at,
+         title, options_json
        )
        VALUES (
          @id, @messaging_group_id, @agent_group_id, @sender_identity,
-         @sender_name, @original_message, @approver_user_id, @created_at
+         @sender_name, @original_message, @approver_user_id, @created_at,
+         @title, @options_json
        )`,
     )
     .run(row);

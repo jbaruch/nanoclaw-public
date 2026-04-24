@@ -27,6 +27,9 @@ import * as p from '@clack/prompts';
 import k from 'kleur';
 
 import { runDiscordChannel } from './channels/discord.js';
+import { runIMessageChannel } from './channels/imessage.js';
+import { runSignalChannel } from './channels/signal.js';
+import { runSlackChannel } from './channels/slack.js';
 import { runTeamsChannel } from './channels/teams.js';
 import { runTelegramChannel } from './channels/telegram.js';
 import { runWhatsAppChannel } from './channels/whatsapp.js';
@@ -47,6 +50,16 @@ import { isValidTimezone } from '../src/timezone.js';
 
 const CLI_AGENT_NAME = 'Terminal Agent';
 const RUN_START = Date.now();
+
+type ChannelChoice =
+  | 'telegram'
+  | 'discord'
+  | 'whatsapp'
+  | 'signal'
+  | 'teams'
+  | 'slack'
+  | 'imessage'
+  | 'skip';
 
 async function main(): Promise<void> {
   printIntro();
@@ -295,8 +308,7 @@ async function main(): Promise<void> {
     await runTimezoneStep();
   }
 
-  let channelChoice: 'telegram' | 'discord' | 'whatsapp' | 'teams' | 'skip' =
-    'skip';
+  let channelChoice: ChannelChoice = 'skip';
   if (!skip.has('channel')) {
     channelChoice = await askChannelChoice();
     if (channelChoice === 'telegram') {
@@ -305,12 +317,18 @@ async function main(): Promise<void> {
       await runDiscordChannel(displayName!);
     } else if (channelChoice === 'whatsapp') {
       await runWhatsAppChannel(displayName!);
+    } else if (channelChoice === 'signal') {
+      await runSignalChannel(displayName!);
     } else if (channelChoice === 'teams') {
       await runTeamsChannel(displayName!);
+    } else if (channelChoice === 'slack') {
+      await runSlackChannel(displayName!);
+    } else if (channelChoice === 'imessage') {
+      await runIMessageChannel(displayName!);
     } else {
       p.log.info(
         wrapForGutter(
-          'No messaging app for now. You can add one later (like Telegram, Discord, WhatsApp, Teams, or Slack).',
+          'No messaging app for now. You can add one later (like Telegram, Discord, WhatsApp, Teams, Slack, or iMessage).',
           4,
         ),
       );
@@ -420,9 +438,7 @@ async function main(): Promise<void> {
   }
 }
 
-function channelDmLabel(
-  choice: 'telegram' | 'discord' | 'whatsapp' | 'teams' | 'skip',
-): string | null {
+function channelDmLabel(choice: ChannelChoice): string | null {
   switch (choice) {
     case 'telegram':
       return 'Telegram';
@@ -430,8 +446,17 @@ function channelDmLabel(
       return 'Discord DMs';
     case 'whatsapp':
       return 'WhatsApp';
+    case 'signal':
+      return 'Signal';
     case 'teams':
       return 'Teams';
+    case 'imessage':
+      return 'iMessage';
+    case 'slack':
+      // Slack install doesn't wire an agent or send a welcome DM — the
+      // driver prints its own "finish in your Slack app" note. Falling
+      // through to null avoids a misleading "check your Slack DMs" banner.
+      return null;
     default:
       return null;
   }
@@ -807,16 +832,30 @@ async function askDisplayName(fallback: string): Promise<string> {
   return value;
 }
 
-async function askChannelChoice(): Promise<
-  'telegram' | 'discord' | 'whatsapp' | 'teams' | 'skip'
-> {
+async function askChannelChoice(): Promise<ChannelChoice> {
+  const isMac = process.platform === 'darwin';
   const choice = ensureAnswer(
-    await brightSelect({
+    await brightSelect<ChannelChoice>({
       message: 'Want to chat with your assistant from your phone?',
       options: [
         { value: 'telegram', label: 'Yes, connect Telegram', hint: 'recommended' },
         { value: 'discord', label: 'Yes, connect Discord' },
         { value: 'whatsapp', label: 'Yes, connect WhatsApp' },
+        {
+          value: 'signal',
+          label: 'Yes, connect Signal',
+          hint: 'needs signal-cli installed',
+        },
+        {
+          value: 'imessage',
+          label: 'Yes, connect iMessage (experimental)',
+          hint: isMac ? 'local macOS mode' : 'remote Photon only',
+        },
+        {
+          value: 'slack',
+          label: 'Yes, connect Slack (experimental)',
+          hint: 'needs public URL',
+        },
         { value: 'teams', label: 'Yes, connect Microsoft Teams', hint: 'complex setup' },
         { value: 'skip', label: 'Skip for now', hint: "I'll just use the terminal" },
       ],
@@ -824,7 +863,7 @@ async function askChannelChoice(): Promise<
   );
   setupLog.userInput('channel_choice', String(choice));
   phEmit('channel_chosen', { channel: String(choice) });
-  return choice as 'telegram' | 'discord' | 'whatsapp' | 'teams' | 'skip';
+  return choice;
 }
 
 // ─── interactive / env helpers ─────────────────────────────────────────

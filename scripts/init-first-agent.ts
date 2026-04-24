@@ -137,13 +137,29 @@ function namespacedUserId(channel: string, raw: string): string {
   return raw.includes(':') ? raw : `${channel}:${raw}`;
 }
 
+/**
+ * Determine whether a platform ID needs a channel-type prefix.
+ *
+ * Chat SDK adapters (Telegram, Discord, Slack, Teams, etc.) namespace their
+ * platform IDs with a channel prefix: "telegram:123456", "discord:guild:chan".
+ * The router stores `channel_type` and `platform_id` in separate columns, but
+ * Chat SDK adapters send the prefixed form as the platform_id, so this script
+ * must match that format.
+ *
+ * Native adapters (Signal, WhatsApp) use their own ID formats and send them
+ * as-is — no channel prefix. Signal sends raw phone numbers (+15551234567)
+ * for DMs and "group:<id>" for group chats. WhatsApp sends JIDs containing
+ * '@' (<phone>@s.whatsapp.net, <groupId>@g.us). Prefixing these would cause
+ * a mismatch between what the adapter sends and what the DB stores, breaking
+ * message routing.
+ */
 function namespacedPlatformId(channel: string, raw: string): string {
   if (raw.startsWith(`${channel}:`)) return raw;
-  // Adapters using native JID format (WhatsApp: <phone>@s.whatsapp.net,
-  // <groupId>@g.us) store platform_id without a channel prefix. The '@' is
-  // the discriminator — telegram/discord platform_ids don't contain it
-  // except after a channel prefix, which is already handled above.
+  // Native WhatsApp JIDs contain '@' — no prefix needed.
   if (raw.includes('@')) return raw;
+  // Native Signal IDs: phone numbers (+...) and group IDs (group:...).
+  if (raw.startsWith('+') || raw.startsWith('group:')) return raw;
+  // Chat SDK adapters — add the channel prefix.
   return `${channel}:${raw}`;
 }
 

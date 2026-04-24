@@ -17,6 +17,10 @@ export interface PendingChannelApproval {
   original_message: string;
   approver_user_id: string;
   created_at: string;
+  /** Card title shown at creation and re-used by getAskQuestionRender on click. */
+  title: string;
+  /** Normalized options (JSON-encoded NormalizedOption[]) — same shape persisted on pending_approvals. */
+  options_json: string;
 }
 
 export function createPendingChannelApproval(row: PendingChannelApproval): void {
@@ -24,11 +28,11 @@ export function createPendingChannelApproval(row: PendingChannelApproval): void 
     .prepare(
       `INSERT INTO pending_channel_approvals (
          messaging_group_id, agent_group_id, original_message,
-         approver_user_id, created_at
+         approver_user_id, created_at, title, options_json
        )
        VALUES (
          @messaging_group_id, @agent_group_id, @original_message,
-         @approver_user_id, @created_at
+         @approver_user_id, @created_at, @title, @options_json
        )`,
     )
     .run(row);

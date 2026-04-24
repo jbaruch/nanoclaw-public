@@ -321,7 +321,7 @@ async function deliverMessage(
         questionId: content.questionId,
       });
     } else {
-      createPendingQuestion({
+      const inserted = createPendingQuestion({
         question_id: content.questionId,
         session_id: session.id,
         message_out_id: msg.id,
@@ -332,7 +332,9 @@ async function deliverMessage(
         options: normalizeOptions(rawOptions as never),
         created_at: new Date().toISOString(),
       });
-      log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
+      if (inserted) {
+        log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
+      }
     }
   }
 

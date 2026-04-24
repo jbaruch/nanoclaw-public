@@ -85,6 +85,7 @@ async function main(): Promise<void> {
             content: JSON.stringify(message.content),
             timestamp: message.timestamp,
             isMention: message.isMention,
+            isGroup: message.isGroup,
           },
         }).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });

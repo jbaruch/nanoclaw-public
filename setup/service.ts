@@ -11,6 +11,7 @@ import path from 'path';
 
 import { log } from '../src/log.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
+import { cleanupUnhealthyPeers } from './peer-cleanup.js';
 import {
   commandExists,
   getPlatform,
@@ -52,6 +53,19 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   fs.mkdirSync(path.join(projectRoot, 'logs'), { recursive: true });
+
+  // Peer preflight — a crash-looping peer install (most often the legacy v1
+  // `com.nanoclaw` plist) will keep trashing this install's containers on
+  // every respawn via its own cleanupOrphans. Detect and unload any peer
+  // that's unhealthy before we install our service. Healthy peers are left
+  // alone now that container reaping is install-label-scoped.
+  const peerReport = cleanupUnhealthyPeers(projectRoot);
+  if (peerReport.unloaded.length > 0) {
+    log.warn('Unloaded unhealthy peer NanoClaw services', {
+      count: peerReport.unloaded.length,
+      labels: peerReport.unloaded.map((p) => p.label),
+    });
+  }
 
   if (platform === 'macos') {
     setupLaunchd(projectRoot, nodePath, homeDir);

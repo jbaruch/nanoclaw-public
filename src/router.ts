@@ -170,7 +170,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       channel_type: event.channelType,
       platform_id: event.platformId,
       name: null,
-      is_group: 0,
+      is_group: event.message.isGroup ? 1 : 0,
       unknown_sender_policy: 'request_approval',
       denied_at: null,
       created_at: new Date().toISOString(),
