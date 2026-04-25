@@ -1168,7 +1168,6 @@ async function main(): Promise<void> {
     }
   }
 
-
   // Periodic tile update from registry (every 15 min)
   // Heartbeat runs in the container and can't call tessl update.
   // This catches publishes that the post-promote timer missed.
