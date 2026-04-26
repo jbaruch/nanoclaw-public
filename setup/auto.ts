@@ -48,7 +48,6 @@ import { runAdvancedScreen } from './lib/setup-config-screen.js';
 import { runWindowedStep } from './lib/windowed-runner.js';
 import { pollHealth } from './onecli.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
-import { pollHealth } from './onecli.js';
 import { claudeCliAvailable, resolveTimezoneViaClaude } from './lib/tz-from-claude.js';
 import * as setupLog from './logs.js';
 import { ensureAnswer, fail, runQuietChild, runQuietStep } from './lib/runner.js';
