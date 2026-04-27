@@ -747,4 +747,69 @@ describe('task scheduler', () => {
 
     warnSpy.mockRestore();
   });
+
+  it('freshly-created recurring task with NULL last_run is NOT flagged dormant', async () => {
+    // A cron created moments ago — last_run is NULL because it simply
+    // hasn't been due yet, not because dispatch is broken. The dormant
+    // scan should NOT warn until the task's age (created_at) crosses
+    // DORMANT_CRON_THRESHOLD_MS. Pre-fix, the SQL used
+    // `last_run IS NULL OR last_run < ?` which matched any NULL row
+    // regardless of age and produced a false positive on the very first
+    // scheduler tick.
+    const t0 = Date.parse('2026-04-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+
+    createTask({
+      id: 'fresh-cron',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'morning brief',
+      schedule_type: 'cron',
+      schedule_value: '0 8 * * *',
+      context_mode: 'group',
+      next_run: new Date(t0 + 60_000).toISOString(),
+      status: 'active',
+      // created_at = "now" — fresh task, well within DORMANT_CRON_THRESHOLD_MS.
+      created_at: new Date(t0).toISOString(),
+    });
+    // Deliberately do NOT call updateTaskAfterRun — last_run stays NULL,
+    // mirroring a never-run cron.
+
+    const warnSpy = vi.spyOn(logger, 'warn');
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+    // First tick passes the prune gate (lastPruneAt=0). The dormant
+    // sweep runs; with the COALESCE fix it must NOT flag this task.
+    await vi.advanceTimersByTimeAsync(10);
+
+    const dormantWarns = warnSpy.mock.calls.filter(
+      (call) =>
+        typeof call[1] === 'string' &&
+        call[1].startsWith('Dormant recurring task') &&
+        (call[0] as { taskId: string }).taskId === 'fresh-cron',
+    );
+    expect(dormantWarns.length).toBe(0);
+
+    // Sanity check: once the row's `created_at` is older than the
+    // dormancy threshold, it DOES qualify — confirming the fix didn't
+    // accidentally exclude all NULL-last_run rows. Roll the clock past
+    // the threshold and re-open the prune gate.
+    vi.setSystemTime(t0 + DORMANT_CRON_THRESHOLD_MS + 60 * 60_000);
+    await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS + 10);
+    const dormantWarnsAfter = warnSpy.mock.calls.filter(
+      (call) =>
+        typeof call[1] === 'string' &&
+        call[1].startsWith('Dormant recurring task') &&
+        (call[0] as { taskId: string }).taskId === 'fresh-cron',
+    );
+    expect(dormantWarnsAfter.length).toBe(1);
+
+    warnSpy.mockRestore();
+  });
 });

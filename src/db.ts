@@ -730,12 +730,19 @@ export function pruneCompletedTasks(maxAgeMs: number): number {
 
 /**
  * Find recurring (cron / interval) tasks that are still `status='active'`
- * but whose `last_run` is older than `maxAgeMs` (or NULL, meaning the task
- * has never run). These are NOT pruned — only surfaced so the scheduler
- * can emit a warn-level log. A dormant cron is a symptom, not garbage:
- * the row points at a real schedule; what's broken is dispatch (next_run
+ * whose age (last_run, falling back to created_at) is older than
+ * `maxAgeMs`. These are NOT pruned — only surfaced so the scheduler can
+ * emit a warn-level log. A dormant cron is a symptom, not garbage: the
+ * row points at a real schedule; what's broken is dispatch (next_run
  * not advancing, container queue stuck, etc.). Visibility first; humans
  * decide whether to delete.
+ *
+ * `COALESCE(last_run, created_at) < ?` (vs the original
+ * `last_run IS NULL OR last_run < ?`) prevents false-positive warnings
+ * for freshly-created recurring tasks whose `last_run` is NULL because
+ * they simply haven't been due yet — matching the threshold-based
+ * semantics for the same NULL-last_run shape that `pruneCompletedTasks`
+ * already uses.
  */
 export function getDormantRecurringTasks(maxAgeMs: number): ScheduledTask[] {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
@@ -744,7 +751,7 @@ export function getDormantRecurringTasks(maxAgeMs: number): ScheduledTask[] {
       `SELECT * FROM scheduled_tasks
        WHERE status = 'active'
          AND schedule_type IN ('cron', 'interval')
-         AND (last_run IS NULL OR last_run < ?)`,
+         AND COALESCE(last_run, created_at) < ?`,
     )
     .all(cutoff) as ScheduledTask[];
 }
