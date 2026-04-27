@@ -681,7 +681,7 @@ export function deleteTask(id: string): void {
  */
 export function pruneCompletedTasks(maxAgeMs: number): number {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const tx = db.transaction((cutoffIso: string) => {
+  const tx = db.transaction((cutoffIso: string): number => {
     db.prepare(
       `DELETE FROM task_run_logs
        WHERE task_id IN (
@@ -702,7 +702,7 @@ export function pruneCompletedTasks(maxAgeMs: number): number {
       )
       .run(cutoffIso).changes;
   });
-  return tx(cutoff) as number;
+  return tx(cutoff);
 }
 
 export function getDueTasks(): ScheduledTask[] {
