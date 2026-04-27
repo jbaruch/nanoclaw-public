@@ -99,7 +99,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message. To send to a different chat (cross-chat broadcast from main), pass chat_jid — only main containers may target other chats; trusted/untrusted containers can only target their own chat regardless of what's passed (host-side authz enforces this).",
   {
     text: z.string().describe('The message text to send'),
     sender: z
@@ -110,11 +110,17 @@ server.tool(
       ),
     reply_to: z.string().optional().describe('Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, auto-replies to the most recent incoming message (first call only).'),
     pin: z.boolean().optional().describe('Pin this message in the chat after sending. Use for important messages like daily briefs.'),
+    chat_jid: z
+      .string()
+      .optional()
+      .describe(
+        'Target chat JID for cross-chat sends (e.g., "tg:-100…"). Only honored when called from a main container; other tiers always send to their own chat. Use sparingly — most replies should go to the chat the prompt arrived in. Sent messages are recorded in messages.db just like normal sends, so the agent and heartbeat see them.',
+      ),
   },
   async (args) => {
     const data: Record<string, string | boolean | undefined> = {
       type: 'message',
-      chatJid,
+      chatJid: args.chat_jid || chatJid,
       text: args.text,
       sender: args.sender || undefined,
       groupFolder,
@@ -145,6 +151,31 @@ server.tool(
     reply_to: z.string().optional().describe('Message ID to reply to'),
   },
   async (args) => {
+    // Path must live under a host-readable mount. Anything else (notably
+    // /tmp — tmpfs inside the container, invisible to the host) gets
+    // dropped silently by the host-side validator. Reject upfront so the
+    // agent gets immediate, actionable feedback instead of fake-success.
+    const allowedPrefixes = [
+      '/workspace/group/',
+      '/workspace/trusted/',
+      '/workspace/extra/',
+    ];
+    if (!allowedPrefixes.some((p) => args.filePath.startsWith(p))) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text:
+              `Path not deliverable: ${args.filePath}. ` +
+              `send_file only sends files from host-readable mounts. ` +
+              `Write the file under /workspace/group/ (your group folder) ` +
+              `instead — /tmp/ is container-only tmpfs and the host can't read it.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
     if (!fs.existsSync(args.filePath)) {
       return {
         content: [{ type: 'text' as const, text: `File not found: ${args.filePath}` }],
