@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  _writeRawRegisteredGroup,
   createTask,
   deleteTask,
   getAllChats,
@@ -9,6 +10,7 @@ import {
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
+  getRegisteredGroup,
   getTaskById,
   setRegisteredGroup,
   storeChatMetadata,
@@ -648,5 +650,86 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- Defensive container_config parsing (issue #156) ---
+
+describe('registered group malformed container_config', () => {
+  it('getAllRegisteredGroups skips parse errors and keeps loading other rows', () => {
+    setRegisteredGroup('good@g.us', {
+      name: 'Good Group',
+      folder: 'whatsapp_good',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      containerConfig: { trusted: true },
+    });
+
+    _writeRawRegisteredGroup({
+      jid: 'broken@g.us',
+      name: 'Broken Group',
+      folder: 'whatsapp_broken',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '{not valid json',
+    });
+
+    const groups = getAllRegisteredGroups();
+
+    expect(groups['good@g.us']).toBeDefined();
+    expect(groups['good@g.us'].containerConfig).toEqual({ trusted: true });
+
+    expect(groups['broken@g.us']).toBeDefined();
+    expect(groups['broken@g.us'].containerConfig).toBeUndefined();
+    expect(groups['broken@g.us'].name).toBe('Broken Group');
+  });
+
+  it('getRegisteredGroup returns the row with containerConfig undefined on parse failure', () => {
+    _writeRawRegisteredGroup({
+      jid: 'broken@g.us',
+      name: 'Broken Group',
+      folder: 'whatsapp_broken',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '{"trusted": tru',
+    });
+
+    const group = getRegisteredGroup('broken@g.us');
+    expect(group).toBeDefined();
+    expect(group?.containerConfig).toBeUndefined();
+    expect(group?.name).toBe('Broken Group');
+  });
+
+  it('treats valid-but-non-object JSON (null, primitives, arrays) as undefined', () => {
+    const cases = ['null', 'true', '42', '"oops"', '[]'];
+    for (let i = 0; i < cases.length; i++) {
+      const jid = `non-object-${i}@g.us`;
+      _writeRawRegisteredGroup({
+        jid,
+        name: `Group ${i}`,
+        folder: `whatsapp_non_object_${i}`,
+        trigger: '@Andy',
+        added_at: '2024-01-01T00:00:00.000Z',
+        container_config: cases[i],
+      });
+      const group = getRegisteredGroup(jid);
+      expect(group).toBeDefined();
+      expect(group?.containerConfig).toBeUndefined();
+    }
+  });
+
+  it('treats empty-string container_config as parse failure (corruption indicator), not "no config"', () => {
+    _writeRawRegisteredGroup({
+      jid: 'empty@g.us',
+      name: 'Empty Config Group',
+      folder: 'whatsapp_empty',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '',
+    });
+    const group = getRegisteredGroup('empty@g.us');
+    expect(group).toBeDefined();
+    expect(group?.containerConfig).toBeUndefined();
+    expect(group?.name).toBe('Empty Config Group');
   });
 });
