@@ -44,8 +44,9 @@ function encodeRfc2822Draft(args: {
 }
 
 // Node 20+ fetch honors HTTP(S)_PROXY / NO_PROXY env when NODE_USE_ENV_PROXY=1.
-// OneCLI proxy env is already set in the container by container-runner.ts for
-// main + trusted groups, so these calls get OAuth injection automatically.
+// OneCLI proxy env is set in the container by container-runner.ts for every
+// trust tier; OAuth injection happens transparently. The trust tier itself
+// gates which tools we register below — see UNTRUSTED_ALLOWLIST.
 
 async function gapi(
   method: string,
@@ -84,6 +85,35 @@ function ok(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
 }
 
 const server = new McpServer({ name: 'onecli', version: '0.1.0' });
+
+// Trust tier — set by container-runner via NANOCLAW_TRUST_TIER. When the
+// container is untrusted, only a small allowlist of read-only, non-
+// information-leaking tools gets exposed. Everything else (event titles,
+// attendees, mail bodies, device commands, history) is held back.
+//
+// Freebusy returns only {start, end} time pairs — no titles, attendees,
+// or any event metadata — so it's the canonical "untrusted-safe"
+// calendar primitive for letting other people query availability
+// without learning what's actually scheduled.
+const TRUST_TIER = (process.env.NANOCLAW_TRUST_TIER || 'untrusted').toLowerCase();
+const UNTRUSTED_ALLOWLIST = new Set<string>([
+  'gcal_freebusy',
+]);
+
+// Wrap registerTool so untrusted containers silently skip tools not on
+// the allowlist. Single chokepoint — adding/removing a tool from the
+// public untrusted surface is one line above, not 24 callsite edits.
+const _origRegisterTool = server.registerTool.bind(server) as (
+  ...args: unknown[]
+) => unknown;
+(server as unknown as { registerTool: (...args: unknown[]) => unknown }).registerTool =
+  (...args: unknown[]) => {
+    const name = args[0] as string;
+    if (TRUST_TIER === 'untrusted' && !UNTRUSTED_ALLOWLIST.has(name)) {
+      return undefined;
+    }
+    return _origRegisterTool(...args);
+  };
 
 // ────────────────────────────────────────────────────────────────
 // Google Calendar
@@ -268,10 +298,16 @@ server.registerTool(
     },
   },
   async ({ calendarIds, timeMin, timeMax }) => {
+    // Untrusted containers can only query the user's primary calendar.
+    // Without this clamp, a participant in an untrusted group could ask
+    // the bot to probe arbitrary calendar IDs (people's email addresses),
+    // which Google would answer with freebusy data when the calendar is
+    // shared with the user — leaking who-knows-whom information.
+    const ids = TRUST_TIER === 'untrusted' ? ['primary'] : calendarIds;
     const data = await gapi('POST', `${GCAL_BASE}/freeBusy`, {
       timeMin,
       timeMax,
-      items: calendarIds.map((id) => ({ id })),
+      items: ids.map((id) => ({ id })),
     });
     return ok(data);
   },

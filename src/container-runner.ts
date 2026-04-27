@@ -1177,13 +1177,24 @@ function buildContainerArgs(
   }
 
   // OneCLI gateway access for main + trusted containers (Google Calendar, Gmail, etc.)
-  // Untrusted groups must not reach the user's OAuth-backed apps.
+  // OneCLI proxy injection. Trust tier controls which MCP tools the
+  // agent-runner registers — the proxy itself is the same for everyone,
+  // tier-gating happens client-side in onecli-mcp-stdio.ts based on
+  // NANOCLAW_TRUST_TIER. The untrusted-security skill rules also forbid
+  // the agent from issuing raw HTTP requests on user instruction in
+  // untrusted contexts, so the MCP-tool surface is the practical
+  // contract for what an untrusted container can reach.
   const oneCliEnv = readEnvFile(['ONECLI_AGENT_TOKEN']);
   const oneCliAgentToken =
     process.env.ONECLI_AGENT_TOKEN || oneCliEnv.ONECLI_AGENT_TOKEN;
   const oneCliCa = `${process.env.HOME || os.homedir()}/.onecli/gateway-ca.pem`;
-  const oneCliEligible = isMain || group.containerConfig?.trusted === true;
-  if (oneCliEligible && oneCliAgentToken && fs.existsSync(oneCliCa)) {
+  const trustTier: 'main' | 'trusted' | 'untrusted' = isMain
+    ? 'main'
+    : group.containerConfig?.trusted === true
+      ? 'trusted'
+      : 'untrusted';
+  if (oneCliAgentToken && fs.existsSync(oneCliCa)) {
+    args.push('-e', `NANOCLAW_TRUST_TIER=${trustTier}`);
     const proxyUrl = `http://x:${oneCliAgentToken}@${CONTAINER_HOST_GATEWAY}:10255`;
     args.push('-e', `HTTPS_PROXY=${proxyUrl}`);
     args.push('-e', `HTTP_PROXY=${proxyUrl}`);
