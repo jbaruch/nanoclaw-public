@@ -681,26 +681,28 @@ export function deleteTask(id: string): void {
  */
 export function pruneCompletedTasks(maxAgeMs: number): number {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const rows = db
-    .prepare(
-      `SELECT id FROM scheduled_tasks
-       WHERE status = 'completed'
-         AND schedule_type = 'once'
-         AND last_run IS NOT NULL
-         AND last_run < ?`,
-    )
-    .all(cutoff) as { id: string }[];
-  if (rows.length === 0) return 0;
-  const deleteLogs = db.prepare('DELETE FROM task_run_logs WHERE task_id = ?');
-  const deleteRow = db.prepare('DELETE FROM scheduled_tasks WHERE id = ?');
-  const tx = db.transaction((ids: string[]) => {
-    for (const id of ids) {
-      deleteLogs.run(id);
-      deleteRow.run(id);
-    }
+  const tx = db.transaction((cutoffIso: string) => {
+    db.prepare(
+      `DELETE FROM task_run_logs
+       WHERE task_id IN (
+         SELECT id FROM scheduled_tasks
+         WHERE status = 'completed'
+           AND schedule_type = 'once'
+           AND last_run IS NOT NULL
+           AND last_run < ?
+       )`,
+    ).run(cutoffIso);
+    return db
+      .prepare(
+        `DELETE FROM scheduled_tasks
+         WHERE status = 'completed'
+           AND schedule_type = 'once'
+           AND last_run IS NOT NULL
+           AND last_run < ?`,
+      )
+      .run(cutoffIso).changes;
   });
-  tx(rows.map((r) => r.id));
-  return rows.length;
+  return tx(cutoff) as number;
 }
 
 export function getDueTasks(): ScheduledTask[] {
