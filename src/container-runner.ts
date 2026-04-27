@@ -4,7 +4,9 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import Database from 'better-sqlite3';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -50,6 +52,134 @@ export function selectTiles(isMain: boolean, isTrusted: boolean): string[] {
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+/**
+ * Container env vars whose VALUES are real secrets and must never appear
+ * on the docker process command line — `ps -ef` and `/proc/<pid>/cmdline`
+ * are world-readable on most kernels, so a `-e KEY=<real-secret>` flag
+ * leaks the secret to any local user (and to monitoring tooling that
+ * captures process tables). For these names we materialize an env-file
+ * (mode 0600) and pass it via `--env-file <path>`; for everything else
+ * (placeholders, non-secret config like AGENT_MODEL, NANOCLAW_CHAT_JID)
+ * `-e KEY=value` is fine.
+ *
+ * Relationship with the `CONTAINER_VARS` list inside `buildContainerArgs`:
+ * `CONTAINER_VARS` decides WHICH variables get forwarded at all (and is
+ * gated by the trust tier — untrusted groups forward nothing).
+ * `SECRET_CONTAINER_VARS` decides, OF THE FORWARDED ONES, which must
+ * route through the env-file rather than `-e`. The two intentionally
+ * serve different concerns; do not collapse one into the other.
+ *
+ * When introducing a new container env var that carries a real secret:
+ * (1) add it to the local `CONTAINER_VARS` list so it's forwarded, AND
+ * (2) add it here so the value goes through the env-file. Missing
+ * either step leaves the secret either un-forwarded or back on the
+ * command line.
+ *
+ * Variables with placeholder values (proxied through the credential
+ * proxy) are NOT secrets and stay on the command line.
+ */
+export const SECRET_CONTAINER_VARS: ReadonlySet<string> = new Set([
+  'COMPOSIO_API_KEY',
+]);
+
+/**
+ * Result of materializing an env-file for a container spawn.
+ * `args` are appended to the `docker run` argv; `cleanup` MUST be
+ * invoked after the container exits (close OR error path) to remove
+ * the on-disk file. The cleanup is idempotent — safe to call from
+ * either handler regardless of whether the other already ran.
+ */
+export interface SecretEnvFile {
+  args: string[];
+  cleanup: () => void;
+}
+
+/**
+ * Materialize a 0600-mode env-file containing the given secrets and
+ * return docker `--env-file` args + a cleanup callback. Returns `null`
+ * when there are no secrets to forward — the caller skips emitting
+ * any extra args.
+ *
+ * Refuses to write a value containing CR/LF/NUL: docker's env-file
+ * parser has no quoting, so an embedded newline would silently truncate
+ * the variable or smuggle a second `KEY=...` line. Failing fast at
+ * write time keeps the failure visible to the operator instead of
+ * surfacing as a confusing "container can't find env var" later.
+ *
+ * Uses `O_CREAT | O_EXCL` with a random 24-hex-char suffix so a local
+ * attacker can't pre-create the path as a symlink (symlink-race) and
+ * exfiltrate the secret on write.
+ */
+export function buildSecretEnvFile(
+  env: Record<string, string>,
+): SecretEnvFile | null {
+  const entries = Object.entries(env).filter(([, v]) => v !== '');
+  if (entries.length === 0) return null;
+
+  const lines = entries.map(([k, v]) => {
+    if (/[\r\n\0]/.test(v)) {
+      throw new Error(
+        `Secret env var ${k} contains CR/LF/NUL; refusing to write env-file (docker env-file format has no quoting).`,
+      );
+    }
+    return `${k}=${v}`;
+  });
+
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `nanoclaw-env-${randomBytes(12).toString('hex')}`,
+  );
+  // O_EXCL fails if path exists; mode 0600 keeps the file unreadable
+  // by other local users between open and the docker daemon's read.
+  const fd = fs.openSync(
+    tmpPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    0o600,
+  );
+  // Write inside a nested try so a write failure (disk full, EIO,
+  // EDQUOT) doesn't leave the file behind — the outer caller never
+  // gets a cleanup callback if we throw, so we MUST unlink here
+  // before rethrowing. Without this, a partial-secret tempfile
+  // would persist on disk until the next reboot's tmpdir clear.
+  try {
+    try {
+      fs.writeFileSync(fd, lines.join('\n') + '\n');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch (unlinkErr) {
+      if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn(
+          { err: unlinkErr, tmpPath },
+          'Failed to clean up secret env-file after write error',
+        );
+      }
+    }
+    throw err;
+  }
+
+  let cleaned = false;
+  return {
+    args: ['--env-file', tmpPath],
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+        logger.warn(
+          { err, tmpPath },
+          'Failed to clean up secret env-file; will be cleared on next reboot via tmpdir',
+        );
+      }
+    },
+  };
+}
 
 /**
  * Model the agent-runner passes to the SDK's `query()` call. Forwarded as
@@ -1025,6 +1155,14 @@ export function buildVolumeMounts(
   return mounts;
 }
 
+interface BuildContainerArgsResult {
+  args: string[];
+  // Always set — cleanup() is a no-op when no secret env-file was
+  // written, so callers can invoke it unconditionally on container
+  // exit without a null-check.
+  cleanup: () => void;
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -1032,7 +1170,7 @@ function buildContainerArgs(
   isMain: boolean,
   replyToMessageId?: string,
   chatJid?: string,
-): string[] {
+): BuildContainerArgsResult {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Resource limits and filesystem restrictions for untrusted containers
@@ -1081,12 +1219,28 @@ function buildContainerArgs(
   const varsToForward = isMain || isTrusted ? CONTAINER_VARS : [];
 
   const envFromFile = readEnvFile(CONTAINER_VARS);
+  // Partition forwarded vars: secrets get materialized into a 0600
+  // env-file (passed via `--env-file`) so they don't appear on the
+  // docker process command line; non-secrets stay on `-e KEY=value`.
+  // See the SECRET_CONTAINER_VARS docstring for the policy.
+  const secretEnv: Record<string, string> = {};
   for (const varName of varsToForward) {
     const value = process.env[varName] || envFromFile[varName];
-    if (value) {
+    if (!value) continue;
+    if (SECRET_CONTAINER_VARS.has(varName)) {
+      secretEnv[varName] = value;
+    } else {
       args.push('-e', `${varName}=${value}`);
     }
   }
+  const secretEnvFile = buildSecretEnvFile(secretEnv);
+  // Position of `--env-file` in argv is irrelevant for override
+  // semantics — docker resolves `-e` over `--env-file` regardless of
+  // order. We append here for readability of the assembled command;
+  // a future caller adding a non-secret `-e` after this point won't
+  // accidentally override a secret because the names don't overlap
+  // (SECRET_CONTAINER_VARS membership is the partition rule).
+  if (secretEnvFile) args.push(...secretEnvFile.args);
 
   // Select which model + effort the agent-runner's SDK query() uses.
   // The runner reads `process.env.AGENT_MODEL` and `process.env.AGENT_EFFORT`
@@ -1146,7 +1300,10 @@ function buildContainerArgs(
 
   args.push(CONTAINER_IMAGE);
 
-  return args;
+  return {
+    args,
+    cleanup: secretEnvFile ? secretEnvFile.cleanup : () => {},
+  };
 }
 
 export async function runContainerAgent(
@@ -1195,14 +1352,15 @@ export async function runContainerAgent(
   const sessionSuffix =
     sessionName === DEFAULT_SESSION_NAME ? '' : `-${sessionName}`;
   const containerName = `nanoclaw-${safeName}${sessionSuffix}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(
-    mounts,
-    containerName,
-    group,
-    input.isMain,
-    input.replyToMessageId,
-    input.chatJid,
-  );
+  const { args: containerArgs, cleanup: cleanupSecretEnvFile } =
+    buildContainerArgs(
+      mounts,
+      containerName,
+      group,
+      input.isMain,
+      input.replyToMessageId,
+      input.chatJid,
+    );
 
   logger.debug(
     {
@@ -1364,6 +1522,12 @@ export async function runContainerAgent(
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      // Remove the secret env-file (if any) as soon as docker has
+      // exited — the file's only consumer is the docker daemon at
+      // spawn time, so the window of exposure ends with the close
+      // event. cleanup() is idempotent; the error handler below
+      // calls it too in case `close` is skipped (spawn ENOENT etc).
+      cleanupSecretEnvFile();
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -1569,6 +1733,11 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      // Spawn-error path: docker may never have read the env-file
+      // (e.g. ENOENT on the docker binary itself), but the file is
+      // still on disk. cleanup() is idempotent — safe to call here
+      // and again from `close` if both fire.
+      cleanupSecretEnvFile();
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',
