@@ -1029,6 +1029,24 @@ export function buildVolumeMounts(
   if (isTrustedIpc) {
     fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   }
+
+  // Wipe stale sentinel files from previous container lifecycles. A `_close`
+  // left over from a graceful shutdown will be consumed by a fresh
+  // container's first IPC poll and end its input stream prematurely — the
+  // SDK still finishes the in-flight prompt, but the container exits
+  // immediately after, so the next user message takes the cost of a fresh
+  // spawn. Clean here, where we know we're about to start a new container.
+  const staleClose = path.join(sessionInputDir, '_close');
+  if (fs.existsSync(staleClose)) {
+    try {
+      fs.unlinkSync(staleClose);
+    } catch (err) {
+      logger.warn(
+        { folder: group.folder, sessionName, err },
+        'Failed to clear stale _close sentinel before container spawn',
+      );
+    }
+  }
   // Chown IPC dirs so container user can read/write/unlink files
   const ipcUid = HOST_UID ?? 1000;
   const ipcGid = HOST_GID ?? 1000;
