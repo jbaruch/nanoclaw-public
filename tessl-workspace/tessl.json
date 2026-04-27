@@ -3,13 +3,13 @@
   "mode": "managed",
   "dependencies": {
     "jbaruch/nanoclaw-core": {
-      "version": "0.1.83"
+      "version": "0.1.86"
     },
     "jbaruch/nanoclaw-untrusted": {
       "version": "0.1.26"
     },
     "jbaruch/nanoclaw-trusted": {
-      "version": "0.1.46"
+      "version": "0.1.47"
     },
     "jbaruch/nanoclaw-host": {
       "version": "0.1.23"
