@@ -730,4 +730,151 @@ describe('GroupQueue', () => {
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
   });
+
+  // --- Self-resuming continuation chain isolation ---
+  //
+  // A continuation-aware caller (helper skill) can chain scheduled
+  // tasks by enqueuing the next link from inside the current link's
+  // runtime. The contract that must hold: an inbound user message
+  // arriving mid-chain still routes to `default` and runs concurrently
+  // with the maintenance chain — neither stalling the user's reply
+  // nor disrupting the chain's progress to completion. The slot keys
+  // (`(groupJid, sessionName)`) already separate the queues, but the
+  // chain shape (task N+1 enqueued from inside task N's runtime) is a
+  // pattern the existing tests don't exercise.
+
+  it('continuation chain in maintenance slot does not block default-slot user messages', async () => {
+    const N = 3; // chain depth — keep small to bound the test
+    const maintExecutionOrder: string[] = [];
+    let userMessageProcessed = false;
+    const groupJid = 'group1@g.us';
+
+    // Each continuation link is a task that itself enqueues the next
+    // link (a continuation-aware helper would enqueue via
+    // schedule_task, which lands as another maintenance enqueueTask —
+    // same shape). The Nth (terminal) link does not re-enqueue.
+    const chainStarted: Array<() => void> = [];
+    const chainBlock: Array<Promise<void>> = [];
+    const chainRelease: Array<() => void> = [];
+
+    for (let i = 0; i < N; i++) {
+      let releaseI: () => void;
+      chainBlock.push(
+        new Promise<void>((r) => {
+          releaseI = r;
+        }),
+      );
+      // The block resolver is captured in `releaseI` (assigned inside
+      // the Promise executor, which runs synchronously during `new
+      // Promise(...)`), so the non-null assertion here is safe — the
+      // assignment has happened before we read the closure.
+      chainRelease.push(() => releaseI!());
+    }
+
+    const enqueueChainLink = (idx: number) => {
+      queue.enqueueTask(
+        groupJid,
+        `chain-link-${idx}`,
+        MAINTENANCE_SESSION_NAME,
+        async () => {
+          maintExecutionOrder.push(`link-${idx}:start`);
+          chainStarted[idx]?.();
+          // Block until the test releases this link — proves the
+          // default-slot work does NOT have to wait for the chain to
+          // complete.
+          await chainBlock[idx]!;
+          maintExecutionOrder.push(`link-${idx}:end`);
+          // Schedule the next link from inside this one — mirrors the
+          // helper's pattern of writing the continuation row +
+          // scheduling it AT END OF this run, so task-scheduler picks
+          // it up on its next poll.
+          if (idx + 1 < N) {
+            enqueueChainLink(idx + 1);
+          }
+        },
+      );
+    };
+
+    // The user-message processor on the default slot. Records that it
+    // ran and resolves immediately — the assertion is "this fired AT
+    // ALL while the chain was mid-flight", not "this raced the chain
+    // in any particular order".
+    queue.setProcessMessagesFn(async (jid: string) => {
+      if (jid === groupJid) {
+        userMessageProcessed = true;
+      }
+      return true;
+    });
+
+    // Kick off the chain (link 0 only — link 0's body enqueues link 1, etc.)
+    enqueueChainLink(0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Link 0 has started and is now blocked on chainBlock[0]. Default
+    // slot must be free. Fire the user message — it should drain
+    // through processMessages and set the flag, all while link 0 is
+    // still mid-flight on the maintenance slot.
+    expect(maintExecutionOrder).toEqual(['link-0:start']);
+    queue.enqueueMessageCheck(groupJid);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(userMessageProcessed).toBe(true);
+    // Maintenance link 0 still hasn't ended — concurrency, not
+    // serialisation. If this assertion fires, the inbound message
+    // somehow drained the maintenance slot's pending task instead of
+    // routing to default.
+    expect(maintExecutionOrder).toEqual(['link-0:start']);
+
+    // Drive the chain to completion. Releasing link N triggers link
+    // N+1 to enqueue + start; advance timers between releases so the
+    // queue drains the next enqueue.
+    for (let i = 0; i < N; i++) {
+      chainRelease[i]!();
+      await vi.advanceTimersByTimeAsync(10);
+    }
+
+    // Every link ran in order, no skips, no reordering. The mid-chain
+    // user message did not disrupt the chain's progress.
+    const expectedOrder: string[] = [];
+    for (let i = 0; i < N; i++) {
+      expectedOrder.push(`link-${i}:start`, `link-${i}:end`);
+    }
+    expect(maintExecutionOrder).toEqual(expectedOrder);
+  });
+
+  it('continuation chain proceeds serially within the maintenance slot', async () => {
+    // Companion assertion to the isolation test above: links are NOT
+    // parallelised within the maintenance slot itself — the
+    // (groupJid, MAINTENANCE_SESSION_NAME) queue is single-serial,
+    // same as the default slot. A buggy enqueue path that fanned all
+    // links out at once would silently break a stateful chain
+    // contract (link N's state-write must observe link N-1's commit).
+    const N = 3;
+    const order: string[] = [];
+    const groupJid = 'group1@g.us';
+    let inFlight = 0;
+    let peakInFlight = 0;
+
+    for (let i = 0; i < N; i++) {
+      queue.enqueueTask(
+        groupJid,
+        `serial-link-${i}`,
+        MAINTENANCE_SESSION_NAME,
+        async () => {
+          inFlight++;
+          peakInFlight = Math.max(peakInFlight, inFlight);
+          order.push(`link-${i}`);
+          // Yield once so a concurrent peer (if one existed) would
+          // overlap. With slot-serial behaviour, peak stays at 1.
+          await Promise.resolve();
+          inFlight--;
+        },
+      );
+    }
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(order).toEqual(['link-0', 'link-1', 'link-2']);
+    expect(peakInFlight).toBe(1);
+  });
 });
