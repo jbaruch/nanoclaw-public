@@ -744,4 +744,53 @@ describe('task scheduler', () => {
 
     warnSpy.mockRestore();
   });
+  it('pre-advance clears next_run AND sets completed atomically for once-tasks', async () => {
+    const pastTime = new Date(Date.now() - 60_000).toISOString();
+    createTask({
+      id: 'once-preadvance',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'fire and never complete',
+      schedule_type: 'once',
+      schedule_value: pastTime,
+      context_mode: 'isolated',
+      next_run: pastTime,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        _fn: () => Promise<void>,
+      ) => {
+        // Intentionally never invoke _fn — simulates a stuck queue.
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({
+        'main@g.us': {
+          name: 'Main',
+          folder: 'main',
+          trigger: 'always',
+          added_at: '2026-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const task = getTaskById('once-preadvance');
+    expect(task?.status).toBe('completed');
+    expect(task?.next_run).toBeNull();
+  });
+
 });

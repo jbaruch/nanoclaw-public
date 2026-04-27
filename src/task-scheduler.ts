@@ -468,8 +468,15 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         if (claimedNextRun !== null) {
           updateTask(currentTask.id, { next_run: claimedNextRun });
         } else {
-          // once-task: mark completed before dispatch
-          updateTask(currentTask.id, { status: 'completed' });
+          // once-task: mark completed AND clear next_run atomically. If
+          // runTask gets interrupted before its terminal updateTaskAfterRun
+          // (process restart, container kill, queue wedge), the row would
+          // otherwise keep a stale past next_run forever — visible in
+          // list_tasks as "status=completed, next=<past time>".
+          updateTask(currentTask.id, {
+            status: 'completed',
+            next_run: null,
+          });
         }
 
         deps.queue.enqueueTask(
@@ -495,3 +502,4 @@ export function _resetSchedulerLoopForTests(): void {
   lastPruneAt = 0;
   lastDormantWarnAt.clear();
 }
+
