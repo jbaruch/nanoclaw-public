@@ -256,44 +256,57 @@ describe('container-runner timeout behavior', () => {
 // --- Tile selection (security-critical) ---
 
 describe('selectTiles', () => {
-  it('main group gets core + trusted + admin', () => {
-    expect(selectTiles(true, false)).toEqual([
+  // Our fork returns `TileRef[]` (owner + name) for per-tile owner support;
+  // upstream returns plain `string[]`. The behavioral contract these tests
+  // pin is the same in either shape — same names in the same order. Helper
+  // peels the names so the assertions stay readable.
+  const names = (tiles: ReturnType<typeof selectTiles>): string[] =>
+    tiles.map((t) => t.name);
+
+  it('main group gets core + trusted + admin (+ flight-weather-watch fork-local)', () => {
+    expect(names(selectTiles(true, false))).toEqual([
       'nanoclaw-core',
       'nanoclaw-trusted',
       'nanoclaw-admin',
+      'flight-weather-watch',
     ]);
   });
 
   it('main group gets admin even if also marked trusted', () => {
-    expect(selectTiles(true, true)).toEqual([
+    expect(names(selectTiles(true, true))).toEqual([
       'nanoclaw-core',
       'nanoclaw-trusted',
       'nanoclaw-admin',
+      'flight-weather-watch',
     ]);
   });
 
-  it('trusted group gets core + trusted, NOT admin', () => {
-    const tiles = selectTiles(false, true);
-    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-trusted']);
-    expect(tiles).not.toContain('nanoclaw-admin');
+  it('trusted group gets core + trusted (+ flight-weather-watch), NOT admin', () => {
+    const tileNames = names(selectTiles(false, true));
+    expect(tileNames).toEqual([
+      'nanoclaw-core',
+      'nanoclaw-trusted',
+      'flight-weather-watch',
+    ]);
+    expect(tileNames).not.toContain('nanoclaw-admin');
   });
 
   it('untrusted group gets core + untrusted, NOT trusted or admin', () => {
-    const tiles = selectTiles(false, false);
-    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-untrusted']);
-    expect(tiles).not.toContain('nanoclaw-trusted');
-    expect(tiles).not.toContain('nanoclaw-admin');
+    const tileNames = names(selectTiles(false, false));
+    expect(tileNames).toEqual(['nanoclaw-core', 'nanoclaw-untrusted']);
+    expect(tileNames).not.toContain('nanoclaw-trusted');
+    expect(tileNames).not.toContain('nanoclaw-admin');
   });
 
   it('all tiers include nanoclaw-core', () => {
-    expect(selectTiles(true, false)[0]).toBe('nanoclaw-core');
-    expect(selectTiles(false, true)[0]).toBe('nanoclaw-core');
-    expect(selectTiles(false, false)[0]).toBe('nanoclaw-core');
+    expect(selectTiles(true, false)[0].name).toBe('nanoclaw-core');
+    expect(selectTiles(false, true)[0].name).toBe('nanoclaw-core');
+    expect(selectTiles(false, false)[0].name).toBe('nanoclaw-core');
   });
 
   it('admin tile is NEVER in trusted or untrusted selections', () => {
-    expect(selectTiles(false, true)).not.toContain('nanoclaw-admin');
-    expect(selectTiles(false, false)).not.toContain('nanoclaw-admin');
+    expect(names(selectTiles(false, true))).not.toContain('nanoclaw-admin');
+    expect(names(selectTiles(false, false))).not.toContain('nanoclaw-admin');
   });
 });
 
