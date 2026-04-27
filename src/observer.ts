@@ -160,6 +160,29 @@ function newState(): QueryState {
   };
 }
 
+// Telegram caps messages at 4096 chars; leave headroom for any HTML the
+// channel layer may add and for our own continuation marker.
+const OBSERVER_CHUNK_SIZE = 3800;
+
+function chunkText(text: string, size: number): string[] {
+  if (text.length <= size) return [text];
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + size, text.length);
+    // Try to break at the nearest whitespace within the last 200 chars
+    // so we don't cut a word in half. If no whitespace found, hard-cut.
+    if (end < text.length) {
+      const slack = text.lastIndexOf(' ', end);
+      if (slack > i + size - 200) end = slack;
+    }
+    chunks.push(text.slice(i, end));
+    i = end;
+    while (i < text.length && text[i] === ' ') i++;
+  }
+  return chunks;
+}
+
 function send(text: string): void {
   if (!OBSERVER_CHAT_JID || !channelsRef) return;
   const channel = channelsRef.find(
@@ -169,8 +192,20 @@ function send(text: string): void {
     logger.warn({ jid: OBSERVER_CHAT_JID }, 'Observer: no channel owns JID');
     return;
   }
-  channel.sendMessage(OBSERVER_CHAT_JID, text).catch((err: unknown) => {
-    logger.warn({ err, jid: OBSERVER_CHAT_JID }, 'Observer send failed');
+  const parts = chunkText(text, OBSERVER_CHUNK_SIZE);
+  // Send sequentially so chunks land in order. Failure on any chunk is
+  // logged but does not abort the rest — partial visibility beats none.
+  let chain: Promise<unknown> = Promise.resolve();
+  parts.forEach((part, idx) => {
+    const body = parts.length > 1 ? `${part} (${idx + 1}/${parts.length})` : part;
+    chain = chain.then(() =>
+      channel.sendMessage(OBSERVER_CHAT_JID, body).catch((err: unknown) => {
+        logger.warn(
+          { err, jid: OBSERVER_CHAT_JID, chunk: idx + 1, of: parts.length },
+          'Observer send failed',
+        );
+      }),
+    );
   });
 }
 
@@ -197,9 +232,10 @@ export function onAgentLine(source: string, raw: string): void {
   const state = states.get(source);
   if (!state) return;
 
-  // Thinking block — count AND live-stream the preview so you can watch
-  // the agent's reasoning unfold in real time. The agent-runner already
-  // caps each thinking line at 400 chars; we pass it through.
+  // Thinking block — count AND live-stream the full content so you can
+  // watch the agent's reasoning unfold in real time. The agent-runner emits
+  // the full thinking text on a single log line (whitespace collapsed); the
+  // chunker in send() splits anything over Telegram's 4096-char cap.
   const thinkingMatch = line.match(/^\[msg #\d+\] thinking="(.*)"$/);
   if (thinkingMatch) {
     state.thinkingCount++;

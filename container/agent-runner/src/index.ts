@@ -809,7 +809,11 @@ async function runQuery(
         );
         for (const block of content) {
           if (block.type === 'thinking' && block.thinking) {
-            log(`[msg #${messageCount}] thinking="${block.thinking.replace(/\s+/g, ' ').slice(0, 400)}"`);
+            // Collapse internal whitespace so the entire block is a single
+            // log line (downstream parsers split on newlines). No length
+            // cap — observer.ts chunks for Telegram, full content remains
+            // useful in `docker logs` for post-mortem analysis.
+            log(`[msg #${messageCount}] thinking="${block.thinking.replace(/\s+/g, ' ')}"`);
           } else if (block.type === 'redacted_thinking') {
             log(`[msg #${messageCount}] redacted_thinking (encrypted)`);
           } else if (block.type === 'text' && block.text) {
