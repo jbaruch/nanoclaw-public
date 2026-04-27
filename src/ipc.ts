@@ -606,6 +606,16 @@ export async function processTaskIpc(
     command?: string;
     payload?: string | Record<string, unknown>;
     confirm?: boolean;
+    /**
+     * Continuation marker for self-resuming cycles. Set by a
+     * continuation-aware caller when scheduling the next link of a
+     * chain via `schedule_task`. Persisted onto the scheduled_tasks
+     * row verbatim; surfaced to the spawned container at fire time as
+     * `NANOCLAW_CONTINUATION=1` + `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`.
+     * Free-form opaque slot key, but type-narrowed to string for
+     * safety; non-string values are dropped at the handler.
+     */
+    continuation_cycle_id?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -690,6 +700,20 @@ export async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
+        // Optional continuation marker. Set by a continuation-aware
+        // caller when scheduling the next link of a self-resuming
+        // cycle chain; the task-scheduler reads it at fire time and
+        // plumbs the matching env vars onto the spawned container.
+        // Untyped non-string values are dropped — the field is a
+        // free-form opaque slot key, but we never want a stray number
+        // / object to land in the DB column.
+        let continuationCycleId: string | null = null;
+        if (
+          typeof data.continuation_cycle_id === 'string' &&
+          data.continuation_cycle_id.length > 0
+        ) {
+          continuationCycleId = data.continuation_cycle_id;
+        }
         createTask({
           id: taskId,
           group_folder: targetFolder,
@@ -702,9 +726,16 @@ export async function processTaskIpc(
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),
+          continuation_cycle_id: continuationCycleId,
         });
         logger.info(
-          { taskId, sourceGroup, targetFolder, contextMode },
+          {
+            taskId,
+            sourceGroup,
+            targetFolder,
+            contextMode,
+            continuationCycleId,
+          },
           'Task created via IPC',
         );
         deps.onTasksChanged();

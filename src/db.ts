@@ -6,6 +6,7 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  ContainerConfig,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -48,7 +49,17 @@ function createSchema(database: Database.Database): void {
       last_run TEXT,
       last_result TEXT,
       status TEXT DEFAULT 'active',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      -- Continuation marker for self-resuming cycles. NULL for ordinary
+      -- one-shot scheduled tasks. When set by a continuation-aware
+      -- caller (helper skill), the task-scheduler plumbs the value into
+      -- the spawned container as NANOCLAW_CONTINUATION=1 +
+      -- NANOCLAW_CONTINUATION_CYCLE_ID=<value>. Absence of the env vars
+      -- is itself the "fresh invocation" signal the calling skill
+      -- checks for; mismatch between the prompt prefix and these env
+      -- vars fails closed to fresh, never silently takes a
+      -- continuation/lock-skip branch.
+      continuation_cycle_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -112,6 +123,22 @@ function createSchema(database: Database.Database): void {
     database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN script TEXT`);
   } catch {
     /* column already exists */
+  }
+
+  // Add continuation_cycle_id column for self-resuming cycles. NULL for
+  // ordinary tasks; set when a continuation-aware caller schedules the
+  // next link of a chain. The task-scheduler reads this value at fire
+  // time and plumbs it onto the spawned container as
+  // NANOCLAW_CONTINUATION=1 + NANOCLAW_CONTINUATION_CYCLE_ID=<value>.
+  // PRAGMA-gated rather than try/catch so the migration failure mode is
+  // visible if it ever matters.
+  const continuationCols = database
+    .prepare('PRAGMA table_info(scheduled_tasks)')
+    .all() as Array<{ name: string }>;
+  if (!continuationCols.some((c) => c.name === 'continuation_cycle_id')) {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN continuation_cycle_id TEXT`,
+    );
   }
 
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
@@ -229,6 +256,39 @@ export function _initTestDatabase(): void {
 /** @internal - for tests only. */
 export function _closeDatabase(): void {
   db.close();
+}
+
+/**
+ * @internal - for tests only.
+ *
+ * Writes a `registered_groups` row whose `container_config` column is a raw
+ * string the caller controls. Lets tests reproduce the malformed-JSON
+ * condition that the issue-156 fix guards against, without exporting the
+ * module-private `db` handle.
+ */
+export function _writeRawRegisteredGroup(args: {
+  jid: string;
+  name: string;
+  folder: string;
+  trigger: string;
+  added_at: string;
+  container_config: string | null;
+  requires_trigger?: number | null;
+  is_main?: number | null;
+}): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    args.jid,
+    args.name,
+    args.folder,
+    args.trigger,
+    args.added_at,
+    args.container_config,
+    args.requires_trigger ?? null,
+    args.is_main ?? 0,
+  );
 }
 
 /**
@@ -545,8 +605,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at, continuation_cycle_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -560,6 +620,7 @@ export function createTask(
     task.next_run,
     task.status,
     task.created_at,
+    task.continuation_cycle_id || null,
   );
 }
 
@@ -640,33 +701,86 @@ export function deleteTask(id: string): void {
 }
 
 /**
- * Delete completed once-tasks whose last_run is older than maxAgeMs.
+ * Delete completed once-tasks older than maxAgeMs.
+ *
+ * Age is measured from `COALESCE(last_run, created_at)` rather than
+ * `last_run` alone. The scheduler pre-advances `status='completed'`
+ * before dispatch (see `task-scheduler.ts`), and `updateTaskAfterRun`
+ * is what actually stamps `last_run`. If a task is marked completed but
+ * the dispatch path fails (container crash, maintenance slot wedged,
+ * task aborted before the streaming callback fires), `last_run` stays
+ * NULL forever — the original `last_run < cutoff` filter would never
+ * match, and the orphan row would linger indefinitely. Falling back to
+ * `created_at` guarantees these rows are eventually pruned by their
+ * own age.
+ *
+ * Trade-off: a once-task scheduled far in advance and only just now
+ * marked completed (with `last_run` NULL because dispatch failed) is
+ * pruned earlier than the user-facing "TTL after completion" intent —
+ * the row could disappear immediately if `created_at` is already past
+ * the cutoff. This is acceptable because (a) such rows were never
+ * visible to the user as completed during normal operation, so there's
+ * no observable regression vs. the case where the task ran and stamped
+ * last_run; (b) the alternative of letting NULL-last_run rows linger
+ * indefinitely (the bug we're fixing) is strictly worse. A future
+ * `completed_at` column would let us preserve the grace window even for
+ * orphans; until then COALESCE is the closest approximation that
+ * doesn't require a schema migration.
+ *
  * Recurring tasks never reach status='completed' (computeNextRun only
  * returns null for once-tasks), so the schedule_type='once' clause is
- * defensive. Returns the number of rows removed.
+ * defensive. Returns row count removed.
  */
 export function pruneCompletedTasks(maxAgeMs: number): number {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-  const rows = db
-    .prepare(
-      `SELECT id FROM scheduled_tasks
-       WHERE status = 'completed'
-         AND schedule_type = 'once'
-         AND last_run IS NOT NULL
-         AND last_run < ?`,
-    )
-    .all(cutoff) as { id: string }[];
-  if (rows.length === 0) return 0;
-  const deleteLogs = db.prepare('DELETE FROM task_run_logs WHERE task_id = ?');
-  const deleteRow = db.prepare('DELETE FROM scheduled_tasks WHERE id = ?');
-  const tx = db.transaction((ids: string[]) => {
-    for (const id of ids) {
-      deleteLogs.run(id);
-      deleteRow.run(id);
-    }
+  const tx = db.transaction((cutoffIso: string): number => {
+    db.prepare(
+      `DELETE FROM task_run_logs
+       WHERE task_id IN (
+         SELECT id FROM scheduled_tasks
+         WHERE status = 'completed'
+           AND schedule_type = 'once'
+           AND COALESCE(last_run, created_at) < ?
+       )`,
+    ).run(cutoffIso);
+    return db
+      .prepare(
+        `DELETE FROM scheduled_tasks
+         WHERE status = 'completed'
+           AND schedule_type = 'once'
+           AND COALESCE(last_run, created_at) < ?`,
+      )
+      .run(cutoffIso).changes;
   });
-  tx(rows.map((r) => r.id));
-  return rows.length;
+  return tx(cutoff);
+}
+
+/**
+ * Find recurring (cron / interval) tasks that are still `status='active'`
+ * whose age (last_run, falling back to created_at) is older than
+ * `maxAgeMs`. These are NOT pruned — only surfaced so the scheduler can
+ * emit a warn-level log. A dormant cron is a symptom, not garbage: the
+ * row points at a real schedule; what's broken is dispatch (next_run
+ * not advancing, container queue stuck, etc.). Visibility first; humans
+ * decide whether to delete.
+ *
+ * `COALESCE(last_run, created_at) < ?` (vs the original
+ * `last_run IS NULL OR last_run < ?`) prevents false-positive warnings
+ * for freshly-created recurring tasks whose `last_run` is NULL because
+ * they simply haven't been due yet — matching the threshold-based
+ * semantics for the same NULL-last_run shape that `pruneCompletedTasks`
+ * already uses.
+ */
+export function getDormantRecurringTasks(maxAgeMs: number): ScheduledTask[] {
+  const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_tasks
+       WHERE status = 'active'
+         AND schedule_type IN ('cron', 'interval')
+         AND COALESCE(last_run, created_at) < ?`,
+    )
+    .all(cutoff) as ScheduledTask[];
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -810,6 +924,59 @@ export function getAllSessions(): Record<string, Record<string, string>> {
 
 // --- Registered group accessors ---
 
+// Defensive parser shared by getRegisteredGroup and getAllRegisteredGroups.
+// A single malformed row (partial write, manual edit, schema-migration glitch)
+// must not crash startup — getAllRegisteredGroups runs at orchestrator boot.
+//
+// Catches SyntaxError specifically (JSON.parse's only throw); other errors
+// propagate. Validates the parsed value is a non-null object — JSON.parse
+// can legally return primitives, null, or arrays from `"null"`, `"true"`,
+// `"[]"`, etc., none of which are valid ContainerConfig shapes.
+//
+// Logs jid + payload length only — never the payload content. The raw
+// container_config string is treated as opaque/possibly-sensitive per
+// no-secrets and error-handling rules. Operators inspect the actual row
+// via the DB by jid, not via logs.
+function parseContainerConfig(
+  raw: string | null,
+  jid: string,
+): ContainerConfig | undefined {
+  // Distinguish SQL NULL from empty string: NULL is the documented
+  // "no config" state, while an empty string in a TEXT column is itself
+  // a corruption indicator (something wrote "" where it should have
+  // written NULL). Fall through into the parse path so SyntaxError
+  // surfaces it.
+  if (raw === null) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    logger.warn(
+      { errName: err.name, jid, len: raw.length },
+      'registered_groups: invalid container_config JSON, treating as undefined',
+    );
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    logger.warn(
+      {
+        jid,
+        len: raw.length,
+        parsedType:
+          parsed === null
+            ? 'null'
+            : Array.isArray(parsed)
+              ? 'array'
+              : typeof parsed,
+      },
+      'registered_groups: container_config is not a JSON object, treating as undefined',
+    );
+    return undefined;
+  }
+  return parsed as ContainerConfig;
+}
+
 export function getRegisteredGroup(
   jid: string,
 ): (RegisteredGroup & { jid: string }) | undefined {
@@ -841,9 +1008,7 @@ export function getRegisteredGroup(
     folder: row.folder,
     trigger: row.trigger_pattern,
     added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
+    containerConfig: parseContainerConfig(row.container_config, row.jid),
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
@@ -894,9 +1059,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       folder: row.folder,
       trigger: row.trigger_pattern,
       added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
+      containerConfig: parseContainerConfig(row.container_config, row.jid),
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,

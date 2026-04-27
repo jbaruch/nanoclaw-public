@@ -12,6 +12,14 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  // Our fork's auto-react gate calls getTriggerPattern(group.trigger) to
+  // build a per-group regex; tests don't override the trigger so the
+  // mock returns the default pattern regardless of input.
+  getTriggerPattern: (_trigger?: string) => /^@Andy\b/i,
+  // GROUPS_DIR is imported at module load by the Telegram channel for
+  // voice-transcription temp paths. Tests don't exercise voice; a stub
+  // is fine.
+  GROUPS_DIR: '/tmp/test-groups',
 }));
 
 // Mock logger

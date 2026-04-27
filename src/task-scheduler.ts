@@ -11,6 +11,7 @@ import {
 import { MAINTENANCE_SESSION_NAME } from './group-queue.js';
 import {
   getAllTasks,
+  getDormantRecurringTasks,
   getDueTasks,
   getTaskById,
   logTaskRun,
@@ -66,13 +67,80 @@ export function computeNextRun(task: ScheduledTask): string | null {
 }
 
 /**
- * How long a completed once-task lingers in scheduled_tasks before the
- * scheduler loop prunes it. Cancellations remove rows immediately via
- * deleteTask; this only governs the natural-completion path. 24h is long
- * enough that a user can still find a recently-completed task in
- * list_tasks output, short enough that it doesn't grow without bound.
+ * Default TTL for completed once-tasks. 24h is long enough that a user
+ * can still find a recently-completed task in `list_tasks` output, short
+ * enough that the table doesn't grow without bound. Cancellations
+ * remove rows immediately via deleteTask; this only governs the
+ * natural-completion path.
+ *
+ * The actual TTL passed to `pruneCompletedTasks` comes from
+ * `getCompletedTaskTtlMs()`, which honours the
+ * `NANOCLAW_COMPLETED_TASK_TTL_MS` env override on every read so tests
+ * (and ops at runtime) can flip it without a process restart.
  */
 export const COMPLETED_TASK_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Resolve the active completed-task TTL: the env override
+ * `NANOCLAW_COMPLETED_TASK_TTL_MS` if set to a positive integer
+ * (milliseconds), otherwise the 24h default. Invalid / non-positive
+ * env values fall back to the default and emit a warn log — the env
+ * knob is for tuning, not for disabling the prune. Read on each
+ * scheduler tick so changing the env between test cases (or via a
+ * deploy-time config flip) takes effect without re-importing.
+ */
+export function getCompletedTaskTtlMs(): number {
+  const raw = process.env.NANOCLAW_COMPLETED_TASK_TTL_MS;
+  if (!raw) return COMPLETED_TASK_TTL_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn(
+      { raw },
+      'Invalid NANOCLAW_COMPLETED_TASK_TTL_MS; using 24h default',
+    );
+    return COMPLETED_TASK_TTL_MS;
+  }
+  return parsed;
+}
+
+/**
+ * Minimum gap between successive `pruneCompletedTasks` calls. The
+ * scheduler loop ticks every `SCHEDULER_POLL_INTERVAL` (seconds-scale)
+ * but the prune query only deletes anything once a row has aged past
+ * `COMPLETED_TASK_TTL_MS` (default 24h). Running it on every tick is
+ * pure overhead — gate it to once per hour. The first tick after
+ * process start always runs (see `lastPruneAt = 0` below) so we don't
+ * skip the cleanup for an hour after a restart.
+ */
+export const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * Threshold past which an active recurring task is considered dormant
+ * and worth a warn-level log. Long enough that the daily heartbeat /
+ * morning-brief tasks always exceed any plausible `last_run` jitter,
+ * short enough that a genuinely stuck cron is surfaced before the row
+ * starts looking like it lives in the database for ornamental reasons.
+ * Dormant rows are NOT auto-deleted — see `getDormantRecurringTasks`.
+ */
+export const DORMANT_CRON_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Per-task cooldown between consecutive dormant warnings. Without this,
+ * every prune cycle (`PRUNE_INTERVAL_MS`, currently 1h) re-emits a warn
+ * for the same dormant cron — 24 noisy logs/day per stuck task. One per
+ * day per dormant task is enough to surface the problem without drowning
+ * the log. After a process restart `lastDormantWarnAt` is empty, so the
+ * first cycle warns once for every dormant task — that's the desired
+ * behaviour: a fresh operator deserves to see the current state.
+ */
+export const DORMANT_WARN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Tracks the last time we logged a dormant warning per task id. Pruned
+ * each cycle to drop ids that no longer exist in `scheduled_tasks` so
+ * the map can't grow unbounded across the lifetime of the process.
+ */
+const lastDormantWarnAt = new Map<string, number>();
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -212,6 +280,17 @@ async function runTask(
         // it runs concurrently with user-facing work. Sole writer of this
         // value — inbound paths route to `'default'` instead.
         sessionName: MAINTENANCE_SESSION_NAME,
+        // Continuation marker for self-resuming cycles. NULL on
+        // ordinary tasks; set only when a continuation-aware caller
+        // scheduled this row as the next link of a chain.
+        // Container-runner emits NANOCLAW_CONTINUATION=1 +
+        // NANOCLAW_CONTINUATION_CYCLE_ID env vars iff this is non-empty.
+        // `?? undefined` normalises the DB SELECT result (NULL for
+        // ordinary rows) into the optional ContainerInput field shape —
+        // never pass `null` here, since `if (continuationCycleId)` in
+        // buildContainerArgs would treat the string `"null"` as truthy
+        // if a stringification slipped in.
+        continuationCycleId: task.continuation_cycle_id ?? undefined,
       },
       (proc, containerName) =>
         deps.onProcess(
@@ -317,6 +396,14 @@ async function runTask(
 }
 
 let schedulerRunning = false;
+/**
+ * Wall-clock timestamp (ms) of the most recent prune sweep. Initialised
+ * to 0 so the first scheduler tick after process start always runs
+ * cleanup. Updated unconditionally on each gated entry, even if the
+ * prune itself touches zero rows — the cost we're throttling is the
+ * SELECT, not the DELETE.
+ */
+let lastPruneAt = 0;
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
@@ -328,9 +415,55 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 
   const loop = async () => {
     try {
-      const pruned = pruneCompletedTasks(COMPLETED_TASK_TTL_MS);
-      if (pruned > 0) {
-        logger.info({ count: pruned }, 'Pruned completed once-tasks');
+      // Run prune + dormant-cron sweep at most once per PRUNE_INTERVAL_MS.
+      // The first tick after process start always passes this gate
+      // (lastPruneAt initialised to 0), so a restart immediately runs
+      // cleanup rather than waiting an hour. `lastPruneAt` is updated
+      // AFTER the housekeeping calls succeed — if pruneCompletedTasks
+      // or getDormantRecurringTasks throws, the next 60s tick retries
+      // rather than gating the whole housekeeping cycle for an hour
+      // on a transient DB error.
+      const nowMs = Date.now();
+      if (nowMs - lastPruneAt >= PRUNE_INTERVAL_MS) {
+        const pruned = pruneCompletedTasks(getCompletedTaskTtlMs());
+        if (pruned > 0) {
+          logger.info({ count: pruned }, 'Pruned completed once-tasks');
+        }
+        // Dormant-cron visibility: log but never delete. A genuinely
+        // stuck cron task points at a dispatch problem (next_run not
+        // advancing, queue wedged) — surfacing it as a warn lets a
+        // human decide; auto-deleting would silently lose the schedule.
+        // Each task is warned at most once per DORMANT_WARN_COOLDOWN_MS
+        // so a long-stuck cron doesn't spam the log on every cycle.
+        const dormant = getDormantRecurringTasks(DORMANT_CRON_THRESHOLD_MS);
+        const dormantIds = new Set<string>();
+        for (const task of dormant) {
+          dormantIds.add(task.id);
+          const lastWarnedAt = lastDormantWarnAt.get(task.id) ?? 0;
+          if (nowMs - lastWarnedAt < DORMANT_WARN_COOLDOWN_MS) {
+            continue;
+          }
+          lastDormantWarnAt.set(task.id, nowMs);
+          logger.warn(
+            {
+              taskId: task.id,
+              groupFolder: task.group_folder,
+              scheduleType: task.schedule_type,
+              scheduleValue: task.schedule_value,
+              lastRun: task.last_run,
+              nextRun: task.next_run,
+            },
+            'Dormant recurring task — last_run older than threshold',
+          );
+        }
+        // Drop bookkeeping for tasks that are no longer dormant (or no
+        // longer exist) so the map can't grow without bound.
+        for (const id of lastDormantWarnAt.keys()) {
+          if (!dormantIds.has(id)) {
+            lastDormantWarnAt.delete(id);
+          }
+        }
+        lastPruneAt = nowMs;
       }
 
       const dueTasks = getDueTasks();
@@ -374,4 +507,6 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 /** @internal - for tests only. */
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
+  lastPruneAt = 0;
+  lastDormantWarnAt.clear();
 }

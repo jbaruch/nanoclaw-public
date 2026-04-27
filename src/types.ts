@@ -72,6 +72,19 @@ export interface ScheduledTask {
   last_result: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
+  /**
+   * Continuation marker for self-resuming cycles. NULL/undefined for
+   * ordinary one-shot scheduled tasks. When set by a continuation-aware
+   * caller (helper skill), the task-scheduler surfaces the value to the
+   * spawned container as `NANOCLAW_CONTINUATION=1` plus
+   * `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`. The calling skill checks
+   * the env var alongside a prompt-prefix marker; both must agree to
+   * take a continuation branch, otherwise the run is treated as a fresh
+   * user invocation. A scheduler that sets the env but mangles the
+   * prompt (or vice versa) therefore fails closed instead of silently
+   * bypassing whatever lock/state contract the chain depends on.
+   */
+  continuation_cycle_id?: string | null;
 }
 
 export interface TaskRunLog {

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  _writeRawRegisteredGroup,
   createTask,
   deleteTask,
   getAllChats,
@@ -9,6 +10,7 @@ import {
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
+  getRegisteredGroup,
   getTaskById,
   setRegisteredGroup,
   storeChatMetadata,
@@ -557,6 +559,58 @@ describe('task CRUD', () => {
     deleteTask('task-3');
     expect(getTaskById('task-3')).toBeUndefined();
   });
+
+  // --- continuation_cycle_id ---
+  //
+  // The column is opt-in: ordinary tasks omit it (DB stores NULL) and
+  // a continuation-aware caller supplies the slot key. The
+  // task-scheduler reads the value verbatim and threads it through
+  // ContainerInput so the spawned container gets the matching env
+  // vars; persistence round-tripping is the part the DB layer must
+  // guarantee.
+  it('persists continuation_cycle_id when supplied', () => {
+    createTask({
+      id: 'task-cont-1',
+      group_folder: 'main',
+      chat_jid: 'group@g.us',
+      prompt: 'continue chain',
+      schedule_type: 'once',
+      schedule_value: '2026-04-21T00:00:30.000Z',
+      context_mode: 'isolated',
+      next_run: '2026-04-21T00:00:30.000Z',
+      status: 'active',
+      created_at: '2026-04-21T00:00:00.000Z',
+      continuation_cycle_id: '2026-04-21',
+    });
+
+    const task = getTaskById('task-cont-1');
+    expect(task).toBeDefined();
+    expect(task!.continuation_cycle_id).toBe('2026-04-21');
+  });
+
+  it('stores continuation_cycle_id as NULL when omitted (ordinary task)', () => {
+    createTask({
+      id: 'task-cont-2',
+      group_folder: 'main',
+      chat_jid: 'group@g.us',
+      prompt: 'fresh task',
+      schedule_type: 'once',
+      schedule_value: '2026-04-21T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-04-21T00:00:00.000Z',
+    });
+
+    const task = getTaskById('task-cont-2');
+    expect(task).toBeDefined();
+    // DB column is TEXT NULL; better-sqlite3 surfaces SQL NULL as
+    // JS `null`, NOT `undefined`. The calling code uses
+    // `task.continuation_cycle_id ?? undefined` to normalise back to
+    // the optional-string ContainerInput field, so any non-null result
+    // here would silently emit continuation env vars on a fresh task.
+    expect(task!.continuation_cycle_id).toBeNull();
+  });
 });
 
 // --- LIMIT behavior ---
@@ -648,5 +702,86 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- Defensive container_config parsing (issue #156) ---
+
+describe('registered group malformed container_config', () => {
+  it('getAllRegisteredGroups skips parse errors and keeps loading other rows', () => {
+    setRegisteredGroup('good@g.us', {
+      name: 'Good Group',
+      folder: 'whatsapp_good',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      containerConfig: { trusted: true },
+    });
+
+    _writeRawRegisteredGroup({
+      jid: 'broken@g.us',
+      name: 'Broken Group',
+      folder: 'whatsapp_broken',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '{not valid json',
+    });
+
+    const groups = getAllRegisteredGroups();
+
+    expect(groups['good@g.us']).toBeDefined();
+    expect(groups['good@g.us'].containerConfig).toEqual({ trusted: true });
+
+    expect(groups['broken@g.us']).toBeDefined();
+    expect(groups['broken@g.us'].containerConfig).toBeUndefined();
+    expect(groups['broken@g.us'].name).toBe('Broken Group');
+  });
+
+  it('getRegisteredGroup returns the row with containerConfig undefined on parse failure', () => {
+    _writeRawRegisteredGroup({
+      jid: 'broken@g.us',
+      name: 'Broken Group',
+      folder: 'whatsapp_broken',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '{"trusted": tru',
+    });
+
+    const group = getRegisteredGroup('broken@g.us');
+    expect(group).toBeDefined();
+    expect(group?.containerConfig).toBeUndefined();
+    expect(group?.name).toBe('Broken Group');
+  });
+
+  it('treats valid-but-non-object JSON (null, primitives, arrays) as undefined', () => {
+    const cases = ['null', 'true', '42', '"oops"', '[]'];
+    for (let i = 0; i < cases.length; i++) {
+      const jid = `non-object-${i}@g.us`;
+      _writeRawRegisteredGroup({
+        jid,
+        name: `Group ${i}`,
+        folder: `whatsapp_non_object_${i}`,
+        trigger: '@Andy',
+        added_at: '2024-01-01T00:00:00.000Z',
+        container_config: cases[i],
+      });
+      const group = getRegisteredGroup(jid);
+      expect(group).toBeDefined();
+      expect(group?.containerConfig).toBeUndefined();
+    }
+  });
+
+  it('treats empty-string container_config as parse failure (corruption indicator), not "no config"', () => {
+    _writeRawRegisteredGroup({
+      jid: 'empty@g.us',
+      name: 'Empty Config Group',
+      folder: 'whatsapp_empty',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '',
+    });
+    const group = getRegisteredGroup('empty@g.us');
+    expect(group).toBeDefined();
+    expect(group?.containerConfig).toBeUndefined();
+    expect(group?.name).toBe('Empty Config Group');
   });
 });

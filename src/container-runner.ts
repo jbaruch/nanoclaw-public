@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import Database from 'better-sqlite3';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -76,6 +77,134 @@ export function selectTiles(isMain: boolean, isTrusted: boolean): TileRef[] {
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+/**
+ * Container env vars whose VALUES are real secrets and must never appear
+ * on the docker process command line — `ps -ef` and `/proc/<pid>/cmdline`
+ * are world-readable on most kernels, so a `-e KEY=<real-secret>` flag
+ * leaks the secret to any local user (and to monitoring tooling that
+ * captures process tables). For these names we materialize an env-file
+ * (mode 0600) and pass it via `--env-file <path>`; for everything else
+ * (placeholders, non-secret config like AGENT_MODEL, NANOCLAW_CHAT_JID)
+ * `-e KEY=value` is fine.
+ *
+ * Relationship with the `CONTAINER_VARS` list inside `buildContainerArgs`:
+ * `CONTAINER_VARS` decides WHICH variables get forwarded at all (and is
+ * gated by the trust tier — untrusted groups forward nothing).
+ * `SECRET_CONTAINER_VARS` decides, OF THE FORWARDED ONES, which must
+ * route through the env-file rather than `-e`. The two intentionally
+ * serve different concerns; do not collapse one into the other.
+ *
+ * When introducing a new container env var that carries a real secret:
+ * (1) add it to the local `CONTAINER_VARS` list so it's forwarded, AND
+ * (2) add it here so the value goes through the env-file. Missing
+ * either step leaves the secret either un-forwarded or back on the
+ * command line.
+ *
+ * Variables with placeholder values (proxied through the credential
+ * proxy) are NOT secrets and stay on the command line.
+ */
+export const SECRET_CONTAINER_VARS: ReadonlySet<string> = new Set([
+  'COMPOSIO_API_KEY',
+]);
+
+/**
+ * Result of materializing an env-file for a container spawn.
+ * `args` are appended to the `docker run` argv; `cleanup` MUST be
+ * invoked after the container exits (close OR error path) to remove
+ * the on-disk file. The cleanup is idempotent — safe to call from
+ * either handler regardless of whether the other already ran.
+ */
+export interface SecretEnvFile {
+  args: string[];
+  cleanup: () => void;
+}
+
+/**
+ * Materialize a 0600-mode env-file containing the given secrets and
+ * return docker `--env-file` args + a cleanup callback. Returns `null`
+ * when there are no secrets to forward — the caller skips emitting
+ * any extra args.
+ *
+ * Refuses to write a value containing CR/LF/NUL: docker's env-file
+ * parser has no quoting, so an embedded newline would silently truncate
+ * the variable or smuggle a second `KEY=...` line. Failing fast at
+ * write time keeps the failure visible to the operator instead of
+ * surfacing as a confusing "container can't find env var" later.
+ *
+ * Uses `O_CREAT | O_EXCL` with a random 24-hex-char suffix so a local
+ * attacker can't pre-create the path as a symlink (symlink-race) and
+ * exfiltrate the secret on write.
+ */
+export function buildSecretEnvFile(
+  env: Record<string, string>,
+): SecretEnvFile | null {
+  const entries = Object.entries(env).filter(([, v]) => v !== '');
+  if (entries.length === 0) return null;
+
+  const lines = entries.map(([k, v]) => {
+    if (/[\r\n\0]/.test(v)) {
+      throw new Error(
+        `Secret env var ${k} contains CR/LF/NUL; refusing to write env-file (docker env-file format has no quoting).`,
+      );
+    }
+    return `${k}=${v}`;
+  });
+
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `nanoclaw-env-${randomBytes(12).toString('hex')}`,
+  );
+  // O_EXCL fails if path exists; mode 0600 keeps the file unreadable
+  // by other local users between open and the docker daemon's read.
+  const fd = fs.openSync(
+    tmpPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    0o600,
+  );
+  // Write inside a nested try so a write failure (disk full, EIO,
+  // EDQUOT) doesn't leave the file behind — the outer caller never
+  // gets a cleanup callback if we throw, so we MUST unlink here
+  // before rethrowing. Without this, a partial-secret tempfile
+  // would persist on disk until the next reboot's tmpdir clear.
+  try {
+    try {
+      fs.writeFileSync(fd, lines.join('\n') + '\n');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch (unlinkErr) {
+      if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn(
+          { err: unlinkErr, tmpPath },
+          'Failed to clean up secret env-file after write error',
+        );
+      }
+    }
+    throw err;
+  }
+
+  let cleaned = false;
+  return {
+    args: ['--env-file', tmpPath],
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+        logger.warn(
+          { err, tmpPath },
+          'Failed to clean up secret env-file; will be cleared on next reboot via tmpdir',
+        );
+      }
+    },
+  };
+}
 
 /**
  * Model the agent-runner passes to the SDK's `query()` call. Forwarded as
@@ -232,6 +361,21 @@ export interface ContainerInput {
    * `src/task-scheduler.ts` is the sole writer of `'maintenance'`.
    */
   sessionName?: string;
+  /**
+   * Continuation marker for self-resuming cycles. Set only on
+   * scheduled-task spawns whose `scheduled_tasks.continuation_cycle_id`
+   * column is non-NULL. When present the spawned container gets:
+   *   - `NANOCLAW_CONTINUATION=1`
+   *   - `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`
+   *
+   * Absence (undefined / empty) means "fresh invocation" — neither env
+   * var is set, and that absence is itself the signal the calling skill
+   * cross-checks against its prompt-prefix marker. Mismatch fails
+   * closed to fresh invocation; a scheduler that sets the env but
+   * mangles the prompt (or vice versa) therefore never silently
+   * bypasses whatever continuation/lock contract the chain depends on.
+   */
+  continuationCycleId?: string;
 }
 
 export interface ContainerOutput {
@@ -1107,6 +1251,14 @@ export function buildVolumeMounts(
   return mounts;
 }
 
+interface BuildContainerArgsResult {
+  args: string[];
+  // Always set — cleanup() is a no-op when no secret env-file was
+  // written, so callers can invoke it unconditionally on container
+  // exit without a null-check.
+  cleanup: () => void;
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -1114,7 +1266,8 @@ function buildContainerArgs(
   isMain: boolean,
   replyToMessageId?: string,
   chatJid?: string,
-): string[] {
+  continuationCycleId?: string,
+): BuildContainerArgsResult {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Resource limits and filesystem restrictions for untrusted containers
@@ -1156,8 +1309,12 @@ function buildContainerArgs(
   //
   // All other credentials (GITHUB_TOKEN, GOOGLE_*, OPENAI_*)
   // stay on the host. Scripts that need them run host-side via IPC.
-  // Previously forwarded COMPOSIO_API_KEY; removed since this deployment uses
-  // OneCLI for third-party app auth (see OneCLI proxy block above).
+  // Previously forwarded COMPOSIO_API_KEY; removed since this deployment
+  // uses OneCLI for third-party app auth (see OneCLI proxy block above).
+  // The env-file secret-passing infrastructure (SECRET_CONTAINER_VARS,
+  // buildSecretEnvFile) is preserved from upstream so future per-container
+  // secrets can use it without re-introducing the -e leak surface. We
+  // just have nothing to forward right now.
 
   // Select which model + effort the agent-runner's SDK query() uses.
   // The runner reads `process.env.AGENT_MODEL` and `process.env.AGENT_EFFORT`
@@ -1175,6 +1332,18 @@ function buildContainerArgs(
   // Pass reply-to message ID so the first IPC send_message appears as a Telegram reply
   if (replyToMessageId) {
     args.push('-e', `NANOCLAW_REPLY_TO_MESSAGE_ID=${replyToMessageId}`);
+  }
+
+  // Continuation marker for self-resuming cycles. Both env vars are
+  // emitted together when the scheduled-task row carried a non-NULL
+  // `continuation_cycle_id`; neither is emitted on a fresh invocation.
+  // The calling skill checks both signals (env vars + the prompt
+  // prefix it parses out of the task prompt) and fails closed to
+  // "fresh invocation" if they disagree, so the env presence is
+  // load-bearing — never paper over a missing value with a default.
+  if (continuationCycleId) {
+    args.push('-e', 'NANOCLAW_CONTINUATION=1');
+    args.push('-e', `NANOCLAW_CONTINUATION_CYCLE_ID=${continuationCycleId}`);
   }
 
   // Route API traffic through the credential proxy (containers never see real secrets)
@@ -1265,7 +1434,10 @@ function buildContainerArgs(
 
   args.push(CONTAINER_IMAGE);
 
-  return args;
+  return {
+    args,
+    cleanup: secretEnvFile ? secretEnvFile.cleanup : () => {},
+  };
 }
 
 export async function runContainerAgent(
@@ -1314,14 +1486,16 @@ export async function runContainerAgent(
   const sessionSuffix =
     sessionName === DEFAULT_SESSION_NAME ? '' : `-${sessionName}`;
   const containerName = `nanoclaw-${safeName}${sessionSuffix}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(
-    mounts,
-    containerName,
-    group,
-    input.isMain,
-    input.replyToMessageId,
-    input.chatJid,
-  );
+  const { args: containerArgs, cleanup: cleanupSecretEnvFile } =
+    buildContainerArgs(
+      mounts,
+      containerName,
+      group,
+      input.isMain,
+      input.replyToMessageId,
+      input.chatJid,
+      input.continuationCycleId,
+    );
 
   logger.debug(
     {
@@ -1495,6 +1669,12 @@ export async function runContainerAgent(
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      // Remove the secret env-file (if any) as soon as docker has
+      // exited — the file's only consumer is the docker daemon at
+      // spawn time, so the window of exposure ends with the close
+      // event. cleanup() is idempotent; the error handler below
+      // calls it too in case `close` is skipped (spawn ENOENT etc).
+      cleanupSecretEnvFile();
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -1700,6 +1880,11 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      // Spawn-error path: docker may never have read the env-file
+      // (e.g. ENOENT on the docker binary itself), but the file is
+      // still on disk. cleanup() is idempotent — safe to call here
+      // and again from `close` if both fire.
+      cleanupSecretEnvFile();
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',

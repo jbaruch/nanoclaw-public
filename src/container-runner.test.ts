@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 
@@ -255,43 +256,147 @@ describe('container-runner timeout behavior', () => {
 // --- Tile selection (security-critical) ---
 
 describe('selectTiles', () => {
-  it('main group gets core + trusted + admin', () => {
-    expect(selectTiles(true, false)).toEqual([
+  // Our fork returns `TileRef[]` (owner + name) for per-tile owner support;
+  // upstream returns plain `string[]`. The behavioral contract these tests
+  // pin is the same in either shape — same names in the same order. Helper
+  // peels the names so the assertions stay readable.
+  const names = (tiles: ReturnType<typeof selectTiles>): string[] =>
+    tiles.map((t) => t.name);
+
+  it('main group gets core + trusted + admin (+ flight-weather-watch fork-local)', () => {
+    expect(names(selectTiles(true, false))).toEqual([
       'nanoclaw-core',
       'nanoclaw-trusted',
       'nanoclaw-admin',
+      'flight-weather-watch',
     ]);
   });
 
   it('main group gets admin even if also marked trusted', () => {
-    expect(selectTiles(true, true)).toEqual([
+    expect(names(selectTiles(true, true))).toEqual([
       'nanoclaw-core',
       'nanoclaw-trusted',
       'nanoclaw-admin',
+      'flight-weather-watch',
     ]);
   });
 
-  it('trusted group gets core + trusted, NOT admin', () => {
-    const tiles = selectTiles(false, true);
-    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-trusted']);
-    expect(tiles).not.toContain('nanoclaw-admin');
+  it('trusted group gets core + trusted (+ flight-weather-watch), NOT admin', () => {
+    const tileNames = names(selectTiles(false, true));
+    expect(tileNames).toEqual([
+      'nanoclaw-core',
+      'nanoclaw-trusted',
+      'flight-weather-watch',
+    ]);
+    expect(tileNames).not.toContain('nanoclaw-admin');
   });
 
   it('untrusted group gets core + untrusted, NOT trusted or admin', () => {
-    const tiles = selectTiles(false, false);
-    expect(tiles).toEqual(['nanoclaw-core', 'nanoclaw-untrusted']);
-    expect(tiles).not.toContain('nanoclaw-trusted');
-    expect(tiles).not.toContain('nanoclaw-admin');
+    const tileNames = names(selectTiles(false, false));
+    expect(tileNames).toEqual(['nanoclaw-core', 'nanoclaw-untrusted']);
+    expect(tileNames).not.toContain('nanoclaw-trusted');
+    expect(tileNames).not.toContain('nanoclaw-admin');
   });
 
   it('all tiers include nanoclaw-core', () => {
-    expect(selectTiles(true, false)[0]).toBe('nanoclaw-core');
-    expect(selectTiles(false, true)[0]).toBe('nanoclaw-core');
-    expect(selectTiles(false, false)[0]).toBe('nanoclaw-core');
+    expect(selectTiles(true, false)[0].name).toBe('nanoclaw-core');
+    expect(selectTiles(false, true)[0].name).toBe('nanoclaw-core');
+    expect(selectTiles(false, false)[0].name).toBe('nanoclaw-core');
   });
 
   it('admin tile is NEVER in trusted or untrusted selections', () => {
-    expect(selectTiles(false, true)).not.toContain('nanoclaw-admin');
-    expect(selectTiles(false, false)).not.toContain('nanoclaw-admin');
+    expect(names(selectTiles(false, true))).not.toContain('nanoclaw-admin');
+    expect(names(selectTiles(false, false))).not.toContain('nanoclaw-admin');
+  });
+});
+
+// --- continuation env vars (self-resuming cycles) ---
+//
+// Self-resuming cycles depend on the container being able to tell
+// "this run is a continuation" from "this run is a fresh user
+// invocation". The mechanism is two paired env vars set by the
+// scheduler when the underlying scheduled_tasks row carried a non-NULL
+// `continuation_cycle_id`:
+//
+//   NANOCLAW_CONTINUATION=1
+//   NANOCLAW_CONTINUATION_CYCLE_ID=<value>
+//
+// Both must be set together, or neither — a partial signal is the bug
+// the calling skill's "fail closed to fresh invocation" branch is
+// designed to catch, but the orchestrator must never produce a partial
+// signal in the first place.
+
+describe('continuation env vars (self-resuming cycles)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('sets both NANOCLAW_CONTINUATION env vars when continuationCycleId is provided', async () => {
+    const promise = runContainerAgent(
+      testGroup,
+      { ...testInput, continuationCycleId: '2026-04-21' },
+      () => {},
+    );
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    // Both env vars must appear together. Asserting on the assembled
+    // `-e KEY=value` strings (matching the existing chat-jid / reply-to
+    // patterns) rather than parsing the args, since that's how the
+    // shell ultimately receives them.
+    expect(args).toContain('NANOCLAW_CONTINUATION=1');
+    expect(args).toContain('NANOCLAW_CONTINUATION_CYCLE_ID=2026-04-21');
+  });
+
+  it('omits both NANOCLAW_CONTINUATION env vars on a fresh invocation', async () => {
+    const promise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    // Absence is the "fresh invocation" signal — the calling skill
+    // distinguishes a continuation from a user-invoked run by env-var
+    // presence. If either var leaks in, a fresh user-triggered run
+    // could silently take a continuation/lock-skip branch and collide
+    // with the original maintenance run's lock.
+    expect(args.some((a) => a.startsWith('NANOCLAW_CONTINUATION='))).toBe(
+      false,
+    );
+    expect(
+      args.some((a) => a.startsWith('NANOCLAW_CONTINUATION_CYCLE_ID=')),
+    ).toBe(false);
+  });
+
+  it('omits both NANOCLAW_CONTINUATION env vars when continuationCycleId is empty string', async () => {
+    // `''` is a JS-falsy slot key — should be treated identically to
+    // undefined. The DB never persists an empty string (the IPC
+    // handler drops `data.continuation_cycle_id` of `''` before
+    // calling createTask), but defending in depth here keeps a future
+    // accidental empty-string from emitting a half-signal.
+    const promise = runContainerAgent(
+      testGroup,
+      { ...testInput, continuationCycleId: '' },
+      () => {},
+    );
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    expect(args.some((a) => a.startsWith('NANOCLAW_CONTINUATION='))).toBe(
+      false,
+    );
+    expect(
+      args.some((a) => a.startsWith('NANOCLAW_CONTINUATION_CYCLE_ID=')),
+    ).toBe(false);
   });
 });
