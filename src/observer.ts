@@ -237,9 +237,10 @@ export function onAgentLine(source: string, raw: string): void {
     // The agent-runner logs scheduled tasks with a `[SCHEDULED TASK -` or
     // `<untrusted-input source=…> [SCHEDULED TASK -` prefix in the
     // preview; match either form.
-    const isScheduledTask = /preview="(?:<untrusted-input source="[^"]*">\s*)?\[SCHEDULED TASK/.test(
-      line,
-    );
+    const isScheduledTask =
+      /preview="(?:<untrusted-input source="[^"]*">\s*)?\[SCHEDULED TASK/.test(
+        line,
+      );
     if (!isScheduledTask) {
       startWatchdog(source);
     }
