@@ -831,7 +831,12 @@ function parseContainerConfig(
   raw: string | null,
   jid: string,
 ): ContainerConfig | undefined {
-  if (!raw) return undefined;
+  // Distinguish SQL NULL from empty string: NULL is the documented
+  // "no config" state, while an empty string in a TEXT column is itself
+  // a corruption indicator (something wrote "" where it should have
+  // written NULL). Fall through into the parse path so SyntaxError
+  // surfaces it.
+  if (raw === null) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -848,7 +853,12 @@ function parseContainerConfig(
       {
         jid,
         len: raw.length,
-        parsedType: parsed === null ? 'null' : typeof parsed,
+        parsedType:
+          parsed === null
+            ? 'null'
+            : Array.isArray(parsed)
+              ? 'array'
+              : typeof parsed,
       },
       'registered_groups: container_config is not a JSON object, treating as undefined',
     );

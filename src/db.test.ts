@@ -717,4 +717,19 @@ describe('registered group malformed container_config', () => {
       expect(group?.containerConfig).toBeUndefined();
     }
   });
+
+  it('treats empty-string container_config as parse failure (corruption indicator), not "no config"', () => {
+    _writeRawRegisteredGroup({
+      jid: 'empty@g.us',
+      name: 'Empty Config Group',
+      folder: 'whatsapp_empty',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: '',
+    });
+    const group = getRegisteredGroup('empty@g.us');
+    expect(group).toBeDefined();
+    expect(group?.containerConfig).toBeUndefined();
+    expect(group?.name).toBe('Empty Config Group');
+  });
 });
