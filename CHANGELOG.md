@@ -6,6 +6,7 @@ For detailed release notes, see the [full changelog on the documentation site](h
 
 ## [Unreleased]
 
+- [BREAKING] Removed the `MAX_CONCURRENT_CONTAINERS` global concurrency cap (#157). With ~10 registered groups × 2 slots, the theoretical ceiling is ~20 and the cap was more likely to delay legitimate work (e.g. a heartbeat firing alongside an inbound user message on a different group) than to prevent runaway spawn. Hardware and Docker remain the only limits worth honouring; per-group rate limits are out of scope. The `MAX_CONCURRENT_CONTAINERS` env var is now ignored.
 - Pin `thinking.display: 'summarized'` on the agent-runner's `query()` call (#163). Opus 4.7 silently flipped the default to `'omitted'`, which would surface thinking blocks as empty content with an opaque encrypted signature — invisible today but a hard prerequisite for the upcoming lifecycle reaction state machine (#162) that triggers on the first thinking block with content.
 
 ## [1.2.36] - 2026-03-26

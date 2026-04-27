@@ -6,10 +6,9 @@ import {
   MAINTENANCE_SESSION_NAME,
 } from './group-queue.js';
 
-// Mock config to control concurrency limit
+// Mock config — concurrency is no longer gated, just stub DATA_DIR.
 vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
-  MAX_CONCURRENT_CONTAINERS: 2,
 }));
 
 // Mock fs operations used by sendMessage/closeStdin
@@ -66,9 +65,13 @@ describe('GroupQueue', () => {
     expect(maxConcurrent).toBe(1);
   });
 
-  // --- Global concurrency limit ---
+  // --- No global concurrency cap ---
 
-  it('respects global concurrency limit', async () => {
+  it('spawns a container per distinct group with no global cap', async () => {
+    // Burst N > old-cap (5) inbound messages across distinct groups; all
+    // must spawn immediately. The historical global concurrency cap
+    // would have queued the overflow — its removal is what this test
+    // guards against accidentally reintroducing.
     let activeCount = 0;
     let maxActive = 0;
     const completionCallbacks: Array<() => void> = [];
@@ -83,23 +86,19 @@ describe('GroupQueue', () => {
 
     queue.setProcessMessagesFn(processMessages);
 
-    // Enqueue 3 groups (limit is 2)
-    queue.enqueueMessageCheck('group1@g.us');
-    queue.enqueueMessageCheck('group2@g.us');
-    queue.enqueueMessageCheck('group3@g.us');
+    const N = 10;
+    for (let i = 0; i < N; i++) {
+      queue.enqueueMessageCheck(`group${i}@g.us`);
+    }
 
-    // Let promises settle
     await vi.advanceTimersByTimeAsync(10);
 
-    // Only 2 should be active (MAX_CONCURRENT_CONTAINERS = 2)
-    expect(maxActive).toBe(2);
-    expect(activeCount).toBe(2);
+    expect(maxActive).toBe(N);
+    expect(activeCount).toBe(N);
+    expect(processMessages).toHaveBeenCalledTimes(N);
 
-    // Complete one — third should start
-    completionCallbacks[0]();
+    for (const done of completionCallbacks) done();
     await vi.advanceTimersByTimeAsync(10);
-
-    expect(processMessages).toHaveBeenCalledTimes(3);
   });
 
   // --- Tasks prioritized over messages ---
@@ -213,38 +212,6 @@ describe('GroupQueue', () => {
     const countAfterMaxRetries = callCount;
     await vi.advanceTimersByTimeAsync(200000); // Wait a long time
     expect(callCount).toBe(countAfterMaxRetries);
-  });
-
-  // --- Waiting groups get drained when slots free up ---
-
-  it('drains waiting groups when active slots free up', async () => {
-    const processed: string[] = [];
-    const completionCallbacks: Array<() => void> = [];
-
-    const processMessages = vi.fn(async (groupJid: string) => {
-      processed.push(groupJid);
-      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
-      return true;
-    });
-
-    queue.setProcessMessagesFn(processMessages);
-
-    // Fill both slots
-    queue.enqueueMessageCheck('group1@g.us');
-    queue.enqueueMessageCheck('group2@g.us');
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Queue a third
-    queue.enqueueMessageCheck('group3@g.us');
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(processed).toEqual(['group1@g.us', 'group2@g.us']);
-
-    // Free up a slot
-    completionCallbacks[0]();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(processed).toContain('group3@g.us');
   });
 
   // --- Running task dedup (Issue #138) ---
@@ -571,73 +538,6 @@ describe('GroupQueue', () => {
     releaseDefault?.();
     releaseMaint?.();
     await vi.advanceTimersByTimeAsync(10);
-  });
-
-  it('drainWaiting under saturation prefers default slots over maintenance', async () => {
-    // MAX_CONCURRENT_CONTAINERS is mocked to 2. Fill both slots with
-    // blocking maintenance tasks, then queue BOTH a maintenance task AND a
-    // user message (for different groups). When ONE slot frees, the queue
-    // must drain the USER-FACING message ahead of the queued maintenance
-    // task — that's the whole point of parallel maintenance: scheduled
-    // work doesn't block user replies under contention.
-    const release: Array<() => void> = [];
-    const blockingTask = () =>
-      vi.fn(async () => {
-        await new Promise<void>((r) => release.push(r));
-      });
-
-    // Fill both concurrent slots.
-    queue.enqueueTask(
-      'a@g.us',
-      'block-a',
-      MAINTENANCE_SESSION_NAME,
-      blockingTask(),
-    );
-    queue.enqueueTask(
-      'b@g.us',
-      'block-b',
-      MAINTENANCE_SESSION_NAME,
-      blockingTask(),
-    );
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Queue maintenance FIRST (older entry), then user message — priority
-    // logic must override FIFO insertion order.
-    let maintRan = false;
-    let msgRan = false;
-    queue.enqueueTask(
-      'c@g.us',
-      'queued-maint',
-      MAINTENANCE_SESSION_NAME,
-      vi.fn(async () => {
-        maintRan = true;
-      }),
-    );
-    // processMessages must block so the freed slot stays occupied while we
-    // observe — otherwise the message finishes synchronously, frees the
-    // slot, and drainWaiting would pick up the maintenance task too.
-    let releaseMsg: (() => void) | undefined;
-    queue.setProcessMessagesFn(async () => {
-      msgRan = true;
-      await new Promise<void>((r) => {
-        releaseMsg = r;
-      });
-      return true;
-    });
-    queue.enqueueMessageCheck('d@g.us');
-
-    // Release ONE blocking slot — only the user message should be drained.
-    release[0]!();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(msgRan).toBe(true);
-    expect(maintRan).toBe(false);
-
-    // Release the message, then the second blocking task → maintenance runs.
-    releaseMsg!();
-    release[1]!();
-    await vi.advanceTimersByTimeAsync(10);
-    expect(maintRan).toBe(true);
   });
 
   it('two tasks on the same group with the same sessionName serialize', async () => {

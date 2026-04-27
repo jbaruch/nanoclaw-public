@@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { DATA_DIR } from './config.js';
 import {
   DEFAULT_SESSION_NAME,
   sessionInputDirName,
@@ -51,8 +51,12 @@ interface GroupState {
 /**
  * GroupQueue tracks in-flight containers per `(groupJid, sessionName)` pair.
  * Two sessions for the same group (`default` + `maintenance`) can run
- * concurrently — each occupies its own slot. Global concurrency is still
- * capped by `MAX_CONCURRENT_CONTAINERS` across all slots.
+ * concurrently — each occupies its own slot. There is no global cap on
+ * concurrent containers; with ~10 registered groups × 2 slots, the
+ * theoretical ceiling is ~20, and the only real limit worth honouring is
+ * the host's own (Docker, RAM, CPU). A global gate would just delay
+ * legitimate work — e.g. a heartbeat firing concurrently with an inbound
+ * user message on a different group.
  *
  * Method surface:
  * - `enqueueMessageCheck(groupJid)` and `sendMessage(groupJid, ...)` —
@@ -75,10 +79,9 @@ export class GroupQueue {
   // defence in depth: the storage structure forbids the collision by
   // construction.
   private groups = new Map<string, Map<string, GroupState>>();
+  // Telemetry only — incremented on each spawn, decremented on each exit,
+  // surfaced in debug logs and in the shutdown summary. Not gated against.
   private activeCount = 0;
-  // Waiting list as structured pairs, not serialised strings — same
-  // collision-proofing as the nested map.
-  private waitingKeys: Array<{ groupJid: string; sessionName: string }> = [];
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
@@ -126,23 +129,6 @@ export class GroupQueue {
     if (state.active) {
       state.pendingMessages = true;
       logger.debug({ groupJid }, 'Container active, message queued');
-      return;
-    }
-
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
-      state.pendingMessages = true;
-      if (
-        !this.waitingKeys.some(
-          (k) =>
-            k.groupJid === groupJid && k.sessionName === DEFAULT_SESSION_NAME,
-        )
-      ) {
-        this.waitingKeys.push({ groupJid, sessionName: DEFAULT_SESSION_NAME });
-      }
-      logger.debug(
-        { groupJid, activeCount: this.activeCount },
-        'At concurrency limit, message queued',
-      );
       return;
     }
 
@@ -195,22 +181,6 @@ export class GroupQueue {
       logger.debug(
         { groupJid, sessionName, taskId },
         'Container active, task queued',
-      );
-      return;
-    }
-
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
-      state.pendingTasks.push(task);
-      if (
-        !this.waitingKeys.some(
-          (k) => k.groupJid === groupJid && k.sessionName === sessionName,
-        )
-      ) {
-        this.waitingKeys.push({ groupJid, sessionName });
-      }
-      logger.debug(
-        { groupJid, sessionName, taskId, activeCount: this.activeCount },
-        'At concurrency limit, task queued',
       );
       return;
     }
@@ -455,59 +425,6 @@ export class GroupQueue {
         ),
       );
       return;
-    }
-
-    // Nothing pending for this slot; check if other slots are waiting.
-    this.drainWaiting();
-  }
-
-  private drainWaiting(): void {
-    while (
-      this.waitingKeys.length > 0 &&
-      this.activeCount < MAX_CONCURRENT_CONTAINERS
-    ) {
-      // Under saturation (global cap reached), user-facing work MUST
-      // preempt scheduled maintenance. The whole point of parallel
-      // maintenance is to keep user replies fast; letting a queued
-      // maintenance task take a freed slot ahead of a queued user
-      // message would invert that intent. Within each priority band we
-      // preserve FIFO order.
-      const defaultIdx = this.waitingKeys.findIndex(
-        (k) => k.sessionName === DEFAULT_SESSION_NAME,
-      );
-      const idx = defaultIdx >= 0 ? defaultIdx : 0;
-      const { groupJid: nextJid, sessionName: nextSessionName } =
-        this.waitingKeys.splice(idx, 1)[0]!;
-      const state = this.getGroup(nextJid, nextSessionName);
-
-      // Prioritize tasks over messages within the popped slot (tasks
-      // aren't re-discovered from SQLite on the next poll the way
-      // messages are — dropping a task here loses its runTask context).
-      if (state.pendingTasks.length > 0) {
-        const task = state.pendingTasks.shift()!;
-        this.runTask(nextJid, nextSessionName, task).catch((err) =>
-          logger.error(
-            {
-              groupJid: nextJid,
-              sessionName: nextSessionName,
-              taskId: task.id,
-              err,
-            },
-            'Unhandled error in runTask (waiting)',
-          ),
-        );
-      } else if (
-        nextSessionName === DEFAULT_SESSION_NAME &&
-        state.pendingMessages
-      ) {
-        this.runForGroup(nextJid, 'drain').catch((err) =>
-          logger.error(
-            { groupJid: nextJid, err },
-            'Unhandled error in runForGroup (waiting)',
-          ),
-        );
-      }
-      // If neither pending, skip this slot
     }
   }
 
