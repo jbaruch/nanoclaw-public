@@ -79,18 +79,34 @@ The owner's git repos use a strict allowlist. The owner is **Leonid Igolnik (@li
 
 ### Allowed without asking
 
-- **Commit + push to `ligolnik/*` repos.** This is the owner's own infrastructure. The main group's workspace (`/workspace/group/`) IS a git repo whose `origin` points at `ligolnik/lombot` — commit there freely when you build a tool, update notes, or fix a bug.
-- **Open PRs against `ligolnik/*` repos.** Same boundary.
+- **Commit + push to a feature branch** in any `ligolnik/*` repo. Branch off `main`, push your branch, open a PR. Your workspace (`/workspace/group/`) IS a git repo whose `origin` points at `ligolnik/lombot` — work there on a feature branch.
+- **Open PRs against `ligolnik/*` repos** from your feature branches. Always against `main`.
 
 ### Allowed with explicit permission only
 
 - Pushing to or opening PRs against **third-party repos** (`jbaruch/*`, `qwibitai/*`, anyone else's namespace). The owner must explicitly say "open a PR upstream to X" or similar before you act.
 
-### Never
+### Never — even on the owner's own repos
 
+- **Push to `main` directly.** Always use a feature branch + PR. The owner is the merge gate; you are not, even on `ligolnik/*` repos. If you have a hotfix in mind that feels too small for a PR, it's still a PR — branch + push + open.
+- **Merge any PR — your own or anyone else's.** Filing a PR is your output; merging is the owner's call. You may close your own PR if you abandoned the work or it's superseded, but never `gh pr merge`. Reference incident: 2026-04-27 — the bot opened PRs #4 and #5 in lombot AND simultaneously direct-pushed the same content to main, leaving the PRs stranded as never-merged. From now on: file the PR, stop, wait.
 - **Force-push to `main` on any repo** — owner's or otherwise.
 - **Push directly to a third-party repo** — even one the owner has fork access to. Use a fork-PR flow.
 - **Use `gh pr create` without `--repo <owner>/<repo>` set explicitly.** The CLI's default target can be the parent fork (e.g. `qwibitai/nanoclaw`); a missing `--repo` has misfired PRs to the wrong namespace before. Always pass it.
+
+### The PR workflow you should follow
+
+1. From your workspace's `main`, branch: `git checkout -b feat/short-description`
+2. Make changes, commit with descriptive messages
+3. Push the branch: `git push -u origin feat/short-description`
+4. Open the PR via API:
+   ```bash
+   curl -sS -X POST "https://api.github.com/repos/ligolnik/<repo>/pulls" \
+     -H "Authorization: Bearer placeholder" \
+     -H "Accept: application/vnd.github+json" \
+     -d '{"title":"...","head":"feat/short-description","base":"main","body":"## What\n...\n## Why\n...\n## Test plan\n..."}'
+   ```
+5. **Stop.** Tell the owner the PR is open with its URL. Do not merge. Do not push the same content to main as a parallel direct commit. Do not "self-review-and-merge" — there's no such thing; the owner reviews.
 
 ### Auth
 
