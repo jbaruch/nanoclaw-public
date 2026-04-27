@@ -116,9 +116,15 @@ export function sanitizeTelegramHtml(text: string): string {
   // protect it (pass through verbatim). If it's NOT, escape the angle
   // brackets so `<foo>` becomes `&lt;foo&gt;` — Telegram will render it as
   // literal text instead of rejecting the whole message. This catches
-  // JSON-dump leakage like `<deliveryScheduleId>`, partial XML, etc.
+  // JSON-dump leakage like `<deliveryScheduleId>`, partial XML, agent-tool
+  // markers like `<tool_use_error>`, etc.
+  //
+  // Tag-name character class includes `_` because Claude/agentic frameworks
+  // emit underscored tags (<tool_use_error>, <delivery_id>) frequently.
+  // HTML spec disallows underscores but Telegram still rejects them with
+  // 400 if unescaped, so we treat them like any other unknown tag.
   out = out.replace(
-    /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)((?:\s[^>]*)?)\s*(\/?)>/g,
+    /<(\/?)([a-zA-Z][a-zA-Z0-9_-]*)((?:\s[^>]*)?)\s*(\/?)>/g,
     (match, _close: string, name: string) => {
       if (TELEGRAM_ALLOWED_TAGS.has(name.toLowerCase())) {
         return protect(match);
