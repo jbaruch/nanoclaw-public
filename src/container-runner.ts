@@ -5,6 +5,7 @@
 import { ChildProcess, spawn } from 'child_process';
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -32,6 +33,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { onAgentLine } from './observer.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 import { readEnvFile } from './env.js';
@@ -41,10 +43,34 @@ import { readEnvFile } from './env.js';
  * Main: core + trusted + admin. Trusted: core + trusted. Untrusted: core + untrusted.
  * Admin loads last so it can override trusted skills.
  */
-export function selectTiles(isMain: boolean, isTrusted: boolean): string[] {
-  if (isMain) return ['nanoclaw-core', 'nanoclaw-trusted', 'nanoclaw-admin'];
-  if (isTrusted) return ['nanoclaw-core', 'nanoclaw-trusted'];
-  return ['nanoclaw-core', 'nanoclaw-untrusted'];
+export interface TileRef {
+  owner: string;
+  name: string;
+}
+
+/**
+ * Default owner for short-form tile names (kept for compat with historical
+ * plain-string tile lists). Resolves via TILE_OWNER env / .env / fallback.
+ */
+function t(name: string): TileRef {
+  return { owner: TILE_OWNER, name };
+}
+
+export function selectTiles(isMain: boolean, isTrusted: boolean): TileRef[] {
+  if (isMain)
+    return [
+      t('nanoclaw-core'),
+      t('nanoclaw-trusted'),
+      t('nanoclaw-admin'),
+      { owner: 'ligolnik', name: 'flight-weather-watch' },
+    ];
+  if (isTrusted)
+    return [
+      t('nanoclaw-core'),
+      t('nanoclaw-trusted'),
+      { owner: 'ligolnik', name: 'flight-weather-watch' },
+    ];
+  return [t('nanoclaw-core'), t('nanoclaw-untrusted')];
 }
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -69,7 +95,7 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
  * and does not support `effort: 'max'` well. The current runner is set up
  * for 4.7's expectations.
  */
-const AGENT_MODEL = 'claude-opus-4-7[1m]';
+const AGENT_MODEL = process.env.AGENT_MODEL || 'claude-sonnet-4-6[1m]';
 
 /**
  * Effort level the agent-runner passes to the SDK's `query()` call.
@@ -493,13 +519,16 @@ export function buildVolumeMounts(
 
   const tilesToInstall = selectTiles(isMain, !!group.containerConfig?.trusted);
 
-  const registryTiles = path.join(
+  // Tiles live under `tessl-workspace/.tessl/tiles/<owner>/<name>/`. Each
+  // tile brings its own owner now (tiles can come from different publishers),
+  // so we resolve per-tile rather than using one TILE_OWNER-rooted dir.
+  const registryRoot = path.join(
     process.cwd(),
     'tessl-workspace',
     '.tessl',
     'tiles',
-    TILE_OWNER,
   );
+  const tilePath = (t: TileRef) => path.join(registryRoot, t.owner, t.name);
 
   // Build the group's tile-managed scripts/ in a sibling tmp dir, then
   // publish it atomically via a symlink flip (see the swap block below).
@@ -522,12 +551,12 @@ export function buildVolumeMounts(
   // the registry mount glitched, a first-boot race. The per-tile
   // `fs.existsSync(tileSrc)` check inside the loop still handles partial
   // degradation (some tiles present, others missing).
-  const anyTileAvailable = tilesToInstall.some((tileName) =>
-    fs.existsSync(path.join(registryTiles, tileName)),
+  const anyTileAvailable = tilesToInstall.some((t) =>
+    fs.existsSync(tilePath(t)),
   );
   if (!anyTileAvailable) {
     logger.warn(
-      { registryTiles, tilesToInstall, groupScriptsDir },
+      { registryRoot, tilesToInstall, groupScriptsDir },
       'No tile sources available — keeping existing groupScriptsDir and .tessl/RULES.md intact. Investigate tessl install state.',
     );
   } else {
@@ -535,17 +564,18 @@ export function buildVolumeMounts(
     const tmpScriptsDir = `${groupScriptsDir}.new.${scriptsTmpSuffix}`;
     fs.mkdirSync(tmpScriptsDir, { recursive: true });
 
-    for (const tileName of tilesToInstall) {
-      const tileSrc = path.join(registryTiles, tileName);
+    for (const tileRef of tilesToInstall) {
+      const tileName = tileRef.name;
+      const tileSrc = tilePath(tileRef);
       if (!fs.existsSync(tileSrc)) {
         logger.warn(
-          { tileName, path: tileSrc },
+          { tile: `${tileRef.owner}/${tileRef.name}`, path: tileSrc },
           'Tile not found — run tessl install in orchestrator',
         );
         continue;
       }
 
-      const dstTileDir = path.join(dstTessl, 'tiles', TILE_OWNER, tileName);
+      const dstTileDir = path.join(dstTessl, 'tiles', tileRef.owner, tileName);
 
       // Copy rules
       const rulesDir = path.join(tileSrc, 'rules');
@@ -737,8 +767,12 @@ export function buildVolumeMounts(
 
   // Built-in container skills (agent-browser, status, etc.)
   const builtinSkillsDir = path.join(process.cwd(), 'container', 'skills');
+  // Skills only for trusted containers (main or trusted=true in containerConfig).
+  const trustedOnlySkills = new Set(['google-calendar']);
+  const isTrustedContainer = isMain || group.containerConfig?.trusted === true;
   if (fs.existsSync(builtinSkillsDir)) {
     for (const skillDir of fs.readdirSync(builtinSkillsDir)) {
+      if (!isTrustedContainer && trustedOnlySkills.has(skillDir)) continue;
       const srcDir = path.join(builtinSkillsDir, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       fs.cpSync(srcDir, path.join(skillsDst, skillDir), { recursive: true });
@@ -1074,19 +1108,8 @@ function buildContainerArgs(
   //
   // All other credentials (GITHUB_TOKEN, GOOGLE_*, OPENAI_*)
   // stay on the host. Scripts that need them run host-side via IPC.
-  const isTrusted = group.containerConfig?.trusted === true;
-
-  const CONTAINER_VARS = ['COMPOSIO_API_KEY'];
-
-  const varsToForward = isMain || isTrusted ? CONTAINER_VARS : [];
-
-  const envFromFile = readEnvFile(CONTAINER_VARS);
-  for (const varName of varsToForward) {
-    const value = process.env[varName] || envFromFile[varName];
-    if (value) {
-      args.push('-e', `${varName}=${value}`);
-    }
-  }
+  // Previously forwarded COMPOSIO_API_KEY; removed since this deployment uses
+  // OneCLI for third-party app auth (see OneCLI proxy block above).
 
   // Select which model + effort the agent-runner's SDK query() uses.
   // The runner reads `process.env.AGENT_MODEL` and `process.env.AGENT_EFFORT`
@@ -1121,6 +1144,43 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // OneCLI gateway access for main + trusted containers (Google Calendar, Gmail, etc.)
+  // Untrusted groups must not reach the user's OAuth-backed apps.
+  const oneCliEnv = readEnvFile(['ONECLI_AGENT_TOKEN']);
+  const oneCliAgentToken =
+    process.env.ONECLI_AGENT_TOKEN || oneCliEnv.ONECLI_AGENT_TOKEN;
+  const oneCliCa = `${process.env.HOME || os.homedir()}/.onecli/gateway-ca.pem`;
+  const oneCliEligible = isMain || group.containerConfig?.trusted === true;
+  if (oneCliEligible && oneCliAgentToken && fs.existsSync(oneCliCa)) {
+    const proxyUrl = `http://x:${oneCliAgentToken}@${CONTAINER_HOST_GATEWAY}:10255`;
+    args.push('-e', `HTTPS_PROXY=${proxyUrl}`);
+    args.push('-e', `HTTP_PROXY=${proxyUrl}`);
+    args.push('-e', `https_proxy=${proxyUrl}`);
+    args.push('-e', `http_proxy=${proxyUrl}`);
+    // Skip proxy for the local credential proxy (Anthropic) and any localhost.
+    // Hostname-only entries; port-suffix forms aren't reliably honored by
+    // Node's undici EnvHttpProxyAgent. api.anthropic.com is INTENTIONALLY
+    // NOT excluded: tools that use the anthropic SDK directly (e.g.
+    // flightweather.py) can then route through OneCLI, which injects the
+    // real Anthropic key via its stored secret. The Claude Agent SDK is
+    // unaffected because it uses ANTHROPIC_BASE_URL=localhost:3001 (the
+    // credential proxy) and goes through its own OAuth path.
+    args.push('-e', `NO_PROXY=${CONTAINER_HOST_GATEWAY},127.0.0.1,localhost`);
+    args.push('-e', `no_proxy=${CONTAINER_HOST_GATEWAY},127.0.0.1,localhost`);
+    // NOTE: ANTHROPIC_API_KEY is intentionally NOT set at container scope.
+    // Setting it would make the Claude Agent SDK choose api-key mode over
+    // OAuth, breaking Claude Code's auth (it expects to do OAuth via the
+    // credential proxy at localhost:3001). 3rd-party tools that need a
+    // dummy key value to start (e.g. flightweather.py) should set it
+    // locally in their own invocation — see flightweather-via-onecli.sh.
+    args.push('-e', 'NODE_USE_ENV_PROXY=1');
+    args.push('-e', 'NODE_EXTRA_CA_CERTS=/etc/onecli/ca.pem');
+    args.push('-e', 'SSL_CERT_FILE=/etc/onecli/ca.pem');
+    args.push('-e', 'CURL_CA_BUNDLE=/etc/onecli/ca.pem');
+    args.push('-e', 'REQUESTS_CA_BUNDLE=/etc/onecli/ca.pem');
+    args.push('-v', `${oneCliCa}:/etc/onecli/ca.pem:ro`);
   }
 
   // Runtime-specific args for host gateway resolution
@@ -1306,7 +1366,10 @@ export async function runContainerAgent(
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
-        if (line) logger.debug({ container: group.folder }, line);
+        if (line) {
+          logger.debug({ container: group.folder }, line);
+          onAgentLine(group.folder, line);
+        }
       }
       // Don't reset timeout on stderr — SDK writes debug logs continuously.
       // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
@@ -1339,9 +1402,18 @@ export async function runContainerAgent(
 
     const killOnTimeout = () => {
       timedOut = true;
-      logger.error(
-        { group: group.name, containerName },
-        'Container timeout, stopping gracefully',
+      // If the container has already produced output, the timeout is the
+      // idle-cleanup branch — the turn finished, the container sat waiting
+      // for more IPC, the idle window expired. That's normal lifecycle, not
+      // an error. Only timeouts WITHOUT output indicate the agent hung.
+      const isIdleCleanup = hadStreamingOutput;
+      const logFn = isIdleCleanup ? logger.info : logger.error;
+      logFn.call(
+        logger,
+        { group: group.name, containerName, idleCleanup: isIdleCleanup },
+        isIdleCleanup
+          ? 'Container idle-timeout cleanup, stopping gracefully'
+          : 'Container timeout with no output, stopping gracefully',
       );
       try {
         stopContainer(containerName);

@@ -49,6 +49,12 @@ export interface IpcDeps {
     caption?: string,
     replyToMessageId?: string,
   ) => Promise<void>;
+  sendVoice?: (
+    jid: string,
+    text: string,
+    voice: string,
+    replyToMessageId?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -269,7 +275,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 ) {
                   // Translate container path to host path
                   const containerPath: string = data.filePath;
-                  let hostPath: string;
+                  let hostPath: string | undefined;
                   if (containerPath.startsWith('/workspace/group/')) {
                     hostPath = path.join(
                       GROUPS_DIR,
@@ -282,7 +288,47 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       'trusted',
                       containerPath.replace('/workspace/trusted/', ''),
                     );
-                  } else {
+                  } else if (containerPath.startsWith('/workspace/extra/')) {
+                    // additionalMounts land at /workspace/extra/<containerPath>.
+                    // Resolve via the source group's mount config and verify
+                    // the file falls inside that mount root (no path
+                    // traversal — even though the host has the read, the
+                    // chat couldn't have asked for it through normal flow).
+                    const sourceJid = Object.keys(registeredGroups).find(
+                      (j) => registeredGroups[j].folder === sourceGroup,
+                    );
+                    const mounts =
+                      (sourceJid &&
+                        registeredGroups[sourceJid]?.containerConfig
+                          ?.additionalMounts) ||
+                      [];
+                    const rest = containerPath.replace('/workspace/extra/', '');
+                    const slash = rest.indexOf('/');
+                    const mountName =
+                      slash === -1 ? rest : rest.slice(0, slash);
+                    const tail = slash === -1 ? '' : rest.slice(slash + 1);
+                    const mount = mounts.find((m) => {
+                      const cp =
+                        m.containerPath ||
+                        path.basename(m.hostPath.replace(/\/+$/, ''));
+                      return cp === mountName;
+                    });
+                    if (mount) {
+                      const expandedHost = mount.hostPath.replace(
+                        /^~(?=\/|$)/,
+                        process.env.HOME || '',
+                      );
+                      const candidate = path.resolve(expandedHost, tail);
+                      const root = path.resolve(expandedHost) + path.sep;
+                      if (
+                        candidate === path.resolve(expandedHost) ||
+                        candidate.startsWith(root)
+                      ) {
+                        hostPath = candidate;
+                      }
+                    }
+                  }
+                  if (!hostPath) {
                     logger.warn(
                       { containerPath, sourceGroup },
                       'send_file: path outside allowed mounts',
@@ -339,6 +385,59 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       { hostPath, containerPath, sourceGroup },
                       'send_file: file not found on host',
                     );
+                  }
+                }
+              } else if (
+                data.type === 'send_voice' &&
+                data.chatJid &&
+                data.text &&
+                deps.sendVoice
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  // Strip <internal> tags from text — voice can't render
+                  // them and they shouldn't end up in db accounting either.
+                  const cleanText = stripInternalTags(data.text || '');
+                  if (cleanText) {
+                    try {
+                      await deps.sendVoice(
+                        data.chatJid,
+                        cleanText,
+                        (data.voice as string) || 'alloy',
+                        data.replyToMessageId,
+                      );
+                      // Store the spoken text in the DB so heartbeat /
+                      // unanswered-checks see this as a real reply (same
+                      // as send_file caption + send_message).
+                      storeMessage({
+                        id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                        chat_jid: data.chatJid,
+                        sender: ASSISTANT_NAME,
+                        sender_name: ASSISTANT_NAME,
+                        content: `[Voice: ${cleanText}]`,
+                        timestamp: new Date().toISOString(),
+                        is_from_me: true,
+                        is_bot_message: true,
+                        reply_to_message_id: data.replyToMessageId,
+                      });
+                      logger.info(
+                        {
+                          chatJid: data.chatJid,
+                          chars: cleanText.length,
+                          voice: data.voice,
+                          sourceGroup,
+                        },
+                        'IPC voice sent',
+                      );
+                    } catch (err) {
+                      logger.error(
+                        { err, chatJid: data.chatJid },
+                        'send_voice failed',
+                      );
+                    }
                   }
                 }
               } else if (data.type === 'message' && data.chatJid && data.text) {
@@ -1023,11 +1122,12 @@ export async function processTaskIpc(
               // Schedule tessl update + session clear after GHA completes (~5 min)
               setTimeout(() => {
                 logger.info('Running post-promote tessl update');
+                const tesslDir = path.resolve(process.cwd(), 'tessl-workspace');
                 execFile(
                   'bash',
                   [
                     '-c',
-                    'cd /app/tessl-workspace && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1',
+                    `cd "${tesslDir}" && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1`,
                   ],
                   { timeout: 120_000 },
                   (updateErr, updateStdout) => {

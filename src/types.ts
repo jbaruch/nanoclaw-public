@@ -106,6 +106,13 @@ export interface Channel {
   reactToLatestMessage?(jid: string, emoji: string): Promise<void>;
   // Optional: pin a message in the chat.
   pinMessage?(jid: string, messageId: string): Promise<void>;
+  // Optional: synthesize text to speech and send as a voice note.
+  sendVoice?(
+    jid: string,
+    text: string,
+    voice: string,
+    replyToMessageId?: string,
+  ): Promise<void>;
   // Optional: send a file to the chat.
   sendFile?(
     jid: string,

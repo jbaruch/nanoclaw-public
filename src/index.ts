@@ -16,6 +16,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { initObserver } from './observer.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -896,6 +897,15 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Observer: if OBSERVER_CHAT_JID is set, container-runner's stderr
+  // parser will forward per-query summaries + live error alerts there.
+  // Also drives progress reactions on user messages (👀 → 🤔 → 🔧 → ✍).
+  initObserver(channels, () => registeredGroups);
+
+  // Main group bypasses the concurrency cap so user-facing replies are
+  // never queued behind background heartbeats or other groups.
+  queue.setIsMainGroupResolver((jid) => !!registeredGroups[jid]?.isMain);
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
@@ -1073,6 +1083,12 @@ async function main(): Promise<void> {
       if (!channel) return;
       await channel.sendFile?.(jid, filePath, caption, replyToMessageId);
     },
+    sendVoice: async (jid, text, voice, replyToMessageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.sendVoice)
+        throw new Error('channel does not support voice');
+      await channel.sendVoice(jid, text, voice, replyToMessageId);
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {
@@ -1168,17 +1184,17 @@ async function main(): Promise<void> {
     }
   }
 
-
   // Periodic tile update from registry (every 15 min)
   // Heartbeat runs in the container and can't call tessl update.
   // This catches publishes that the post-promote timer missed.
   const { execFile: execTesslUpdate } = await import('child_process');
+  const tesslWorkspaceDir = path.resolve(process.cwd(), 'tessl-workspace');
   setInterval(() => {
     execTesslUpdate(
       'bash',
       [
         '-c',
-        'cd /app/tessl-workspace && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1',
+        `cd "${tesslWorkspaceDir}" && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1`,
       ],
       { timeout: 120_000 },
       (err, stdout) => {

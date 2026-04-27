@@ -1,13 +1,23 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import https from 'https';
+import os from 'os';
 import path from 'path';
+import { promisify } from 'util';
 import { Api, Bot, InputFile } from 'grammy';
-import OpenAI from 'openai';
 
-import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
+import {
+  ASSISTANT_NAME,
+  GROUPS_DIR,
+  TRIGGER_PATTERN,
+  getTriggerPattern,
+} from '../config.js';
 import { createDraftStream, DraftStream } from '../draft-stream.js';
 import { getLatestMessage, getMessageById, storeReaction } from '../db.js';
+import { noteLatestUserMessage } from '../observer.js';
 import { readEnvFile } from '../env.js';
+
+const execFileAsync = promisify(execFile);
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import { sanitizeTelegramHtml } from './telegram-sanitize.js';
@@ -303,28 +313,65 @@ async function saveDocument(
 }
 
 /**
- * Transcribe a voice message using OpenAI Whisper API.
- * Returns the transcript text, or null on failure.
+ * Transcribe a voice message using OpenAI Whisper, routed via OneCLI.
+ *
+ * No API key in .env: the request is wrapped in `onecli run`, which sets
+ * HTTPS_PROXY to the OneCLI gateway. OneCLI matches the request against
+ * the user's stored generic secret for `api.openai.com` and injects
+ * `Authorization: Bearer <key>` transparently. If OneCLI has no matching
+ * credential or the host has no `onecli` binary, transcription returns
+ * null and the rest of the message flow continues normally.
+ *
+ * The audio is written to a temp file because Whisper's endpoint is
+ * multipart/form-data — easiest to do with `curl -F file=@...`.
  */
 async function transcribeVoice(audioBuffer: Buffer): Promise<string | null> {
-  const envVars = readEnvFile(['OPENAI_API_KEY']);
-  const apiKey = process.env.OPENAI_API_KEY || envVars.OPENAI_API_KEY;
-  if (!apiKey) {
-    logger.warn('OPENAI_API_KEY not set, cannot transcribe voice');
-    return null;
-  }
-
+  const tmpFile = path.join(os.tmpdir(), `voice-${Date.now()}.ogg`);
   try {
-    const openai = new OpenAI({ apiKey });
-    const file = new File([audioBuffer], 'voice.ogg', { type: 'audio/ogg' });
-    const transcription = await openai.audio.transcriptions.create({
-      model: 'whisper-1',
-      file,
-    });
-    return transcription.text;
+    fs.writeFileSync(tmpFile, audioBuffer);
+    const { stdout, stderr } = await execFileAsync(
+      'onecli',
+      [
+        'run',
+        '--',
+        'curl',
+        '-sS',
+        '-X',
+        'POST',
+        'https://api.openai.com/v1/audio/transcriptions',
+        '-F',
+        `file=@${tmpFile}`,
+        '-F',
+        'model=whisper-1',
+        '-F',
+        'response_format=json',
+      ],
+      { timeout: 30_000 },
+    );
+    // Strip OneCLI's stderr-prefix line ("onecli: gateway connected. ...").
+    let body = stdout.trim();
+    // OneCLI prints status to stderr; in practice some installs send it to
+    // stdout. Be defensive — find the JSON object.
+    const jsonStart = body.indexOf('{');
+    if (jsonStart > 0) body = body.slice(jsonStart);
+    const parsed = JSON.parse(body);
+    if (parsed.error) {
+      logger.error(
+        { err: parsed.error, stderr: stderr?.slice(0, 200) },
+        'Whisper transcription returned error',
+      );
+      return null;
+    }
+    return typeof parsed.text === 'string' ? parsed.text : null;
   } catch (err) {
-    logger.error({ err }, 'OpenAI transcription failed');
+    logger.error({ err }, 'OneCLI/Whisper transcription failed');
     return null;
+  } finally {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -598,6 +645,30 @@ export class TelegramChannel implements Channel {
         { chatJid, chatName, sender: senderName },
         'Telegram message stored',
       );
+
+      // Host-side auto-ack: react 👀 immediately so the user sees the
+      // message was received. The observer then updates this reaction as
+      // the agent progresses (🤔 thinking → ⚡ tools → ✍ replying).
+      // setMessageReaction is single-emoji per bot per message, so each
+      // update replaces the prior one.
+      //
+      // Gating: only react when the message will actually be routed to
+      // the agent. For main and trigger-not-required chats that's every
+      // message; for trigger-required groups the message must contain the
+      // trigger (or be a reply to a bot message — same logic as in the
+      // routing path in src/index.ts). Otherwise we'd ack messages that
+      // weren't directed at the bot, confusing the chat.
+      const requiresTrigger = group.requiresTrigger !== false && !group.isMain;
+      const triggerHit =
+        !requiresTrigger ||
+        getTriggerPattern(group.trigger).test(content.trim()) ||
+        !!ctx.message.reply_to_message?.from?.is_bot;
+      if ((group.isMain || group.containerConfig?.trusted) && triggerHit) {
+        this.sendReaction(chatJid, msgId, '👀').catch(() => {
+          /* already logged */
+        });
+        noteLatestUserMessage(chatJid, msgId);
+      }
     });
 
     // Handle non-text messages with placeholders so the agent knows something was sent
@@ -712,6 +783,23 @@ export class TelegramChannel implements Channel {
             { chatJid, senderName, chars: transcript.length },
             'Transcribed voice message',
           );
+          // Voice messages can't carry an @mention. In trigger-required
+          // groups, infer intent: if the user said the bot's name OR the
+          // assistant's name in the transcript, prepend the trigger so the
+          // routing layer treats the voice as addressed to the bot.
+          // Mirrors the `@limlombot` → `@${ASSISTANT_NAME}` rewrite that
+          // text messages already get.
+          const botUsername = ctx.me?.username?.toLowerCase();
+          const lowered = transcript.toLowerCase();
+          const named =
+            (botUsername && lowered.includes(botUsername)) ||
+            lowered.includes(ASSISTANT_NAME.toLowerCase()) ||
+            lowered.includes('lom bot') ||
+            lowered.includes('lim lom') ||
+            lowered.includes('lim-lom');
+          if (named && !TRIGGER_PATTERN.test(content)) {
+            content = `@${ASSISTANT_NAME} ${content}`;
+          }
         }
       } catch (err) {
         logger.error({ err }, 'Failed to process voice message');
@@ -1010,6 +1098,73 @@ export class TelegramChannel implements Channel {
       logger.info({ jid, filePath, caption }, 'Telegram file sent');
     } catch (err) {
       logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
+    }
+  }
+
+  /**
+   * Synthesize text → speech via OpenAI TTS (routed through OneCLI proxy
+   * so no API key sits in the bot env), then upload to Telegram as a
+   * voice note via `sendVoice`. Audio is OGG/Opus, the Telegram-native
+   * format for voice — Telegram displays it as a real voice message
+   * (waveform + scrubber + play speed), not a generic audio attachment.
+   */
+  async sendVoice(
+    jid: string,
+    text: string,
+    voice: string,
+    replyToMessageId?: string,
+  ): Promise<void> {
+    if (!this.bot) return;
+    const tmpFile = path.join(os.tmpdir(), `tts-${Date.now()}.ogg`);
+    try {
+      // OpenAI TTS endpoint, called through OneCLI which injects
+      // Authorization: Bearer <openai-key>. response_format=opus produces
+      // the codec Telegram expects in a .ogg container. -o writes the
+      // raw audio bytes directly to disk.
+      const body = JSON.stringify({
+        model: 'tts-1',
+        voice,
+        input: text,
+        response_format: 'opus',
+      });
+      await execFileAsync(
+        'onecli',
+        [
+          'run',
+          '--',
+          'curl',
+          '-sS',
+          '-X',
+          'POST',
+          'https://api.openai.com/v1/audio/speech',
+          '-H',
+          'Content-Type: application/json',
+          '-d',
+          body,
+          '-o',
+          tmpFile,
+        ],
+        { timeout: 60_000 },
+      );
+      if (!fs.existsSync(tmpFile) || fs.statSync(tmpFile).size === 0) {
+        throw new Error('TTS produced no audio');
+      }
+      const numericId = jid.replace(/^tg:/, '');
+      const opts: { reply_parameters?: { message_id: number } } = {};
+      if (replyToMessageId) {
+        opts.reply_parameters = { message_id: parseInt(replyToMessageId, 10) };
+      }
+      await this.bot.api.sendVoice(numericId, new InputFile(tmpFile), opts);
+      logger.info({ jid, chars: text.length, voice }, 'Telegram voice sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram voice');
+      throw err;
+    } finally {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {
+        /* ignore */
+      }
     }
   }
 

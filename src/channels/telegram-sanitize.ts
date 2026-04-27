@@ -54,6 +54,32 @@ const PROTECTED_SPAN_TAGS = [
   'tg-spoiler',
 ];
 
+/**
+ * Telegram Bot API HTML allowlist. Any tag outside this set is not recognized
+ * by Telegram's parser — stray occurrences (e.g. agent-emitted
+ * `<deliveryScheduleId>` from a JSON blob) cause a 400 Bad Request. Unknown
+ * tags are escaped to &lt;...&gt; at sanitize time so messages still send.
+ */
+const TELEGRAM_ALLOWED_TAGS = new Set([
+  'b',
+  'strong',
+  'i',
+  'em',
+  'u',
+  'ins',
+  's',
+  'strike',
+  'del',
+  'code',
+  'pre',
+  'a',
+  'blockquote',
+  'tg-spoiler',
+  'span',
+  'tg-emoji',
+  'br',
+]);
+
 export function sanitizeTelegramHtml(text: string): string {
   if (!text) return text;
 
@@ -86,10 +112,20 @@ export function sanitizeTelegramHtml(text: string): string {
     out = out.replace(re, protect);
   }
 
-  // Phase 1b: protect stray tag tokens (self-closing, mismatched, or tags
-  // we don't recognise as span-ful). This keeps any remaining raw HTML from
-  // being touched, even if we can't pair it.
-  out = out.replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^>]*)?\s*\/?>/g, protect);
+  // Phase 1b: handle stray tag tokens. If the tag is on Telegram's allowlist,
+  // protect it (pass through verbatim). If it's NOT, escape the angle
+  // brackets so `<foo>` becomes `&lt;foo&gt;` — Telegram will render it as
+  // literal text instead of rejecting the whole message. This catches
+  // JSON-dump leakage like `<deliveryScheduleId>`, partial XML, etc.
+  out = out.replace(
+    /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)((?:\s[^>]*)?)\s*(\/?)>/g,
+    (match, _close: string, name: string) => {
+      if (TELEGRAM_ALLOWED_TAGS.has(name.toLowerCase())) {
+        return protect(match);
+      }
+      return htmlEscape(match);
+    },
+  );
 
   // Phase 1c: protect URLs and email addresses so their underscores/dots
   // don't get mistaken for Markdown formatting.
