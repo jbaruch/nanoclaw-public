@@ -195,9 +195,10 @@ export function buildSecretEnvFile(
  *
  * NOTE: changing the model family may require matching changes in
  * agent-runner's `query()` call. Opus 4.7 specifically needs
- * `thinking: { type: 'adaptive' }` (manual `type: 'enabled'` is rejected)
- * and does not support `effort: 'max'` well. The current runner is set up
- * for 4.7's expectations.
+ * `thinking: { type: 'adaptive', display: 'summarized' }` (manual
+ * `type: 'enabled'` is rejected; `display` defaults to `'omitted'` on 4.7
+ * which would silently empty out thinking content) and does not support
+ * `effort: 'max'` well. The current runner is set up for 4.7's expectations.
  */
 const AGENT_MODEL = 'claude-opus-4-7[1m]';
 

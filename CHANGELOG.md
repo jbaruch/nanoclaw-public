@@ -4,6 +4,10 @@ All notable changes to NanoClaw will be documented in this file.
 
 For detailed release notes, see the [full changelog on the documentation site](https://docs.nanoclaw.dev/changelog).
 
+## [Unreleased]
+
+- Pin `thinking.display: 'summarized'` on the agent-runner's `query()` call (#163). Opus 4.7 silently flipped the default to `'omitted'`, which would surface thinking blocks as empty content with an opaque encrypted signature — invisible today but a hard prerequisite for the upcoming lifecycle reaction state machine (#162) that triggers on the first thinking block with content.
+
 ## [1.2.36] - 2026-03-26
 
 - [BREAKING] Replaced pino logger with built-in logger. WhatsApp users must re-merge the WhatsApp fork to pick up the Baileys logger compatibility fix: `git fetch whatsapp main && git merge whatsapp/main`. If the `whatsapp` remote is not configured: `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git`.
