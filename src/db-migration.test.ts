@@ -117,9 +117,8 @@ describe('database migrations', () => {
       legacyDb.close();
 
       vi.resetModules();
-      const { initDatabase, getTaskById, _closeDatabase } = await import(
-        './db.js'
-      );
+      const { initDatabase, getTaskById, _closeDatabase } =
+        await import('./db.js');
 
       // Must not throw — every column-add migration must be PRAGMA-gated
       // so a re-run on an already-upgraded DB is a no-op (idempotent).
