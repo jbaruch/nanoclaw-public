@@ -24,14 +24,19 @@ import {
   getTaskById,
   pruneCompletedTasks,
   setSession,
+  updateTask,
   updateTaskAfterRun,
 } from './db.js';
 import {
   COMPLETED_TASK_TTL_MS,
+  DORMANT_CRON_THRESHOLD_MS,
+  PRUNE_INTERVAL_MS,
   _resetSchedulerLoopForTests,
   computeNextRun,
+  getCompletedTaskTtlMs,
   startSchedulerLoop,
 } from './task-scheduler.js';
+import { logger } from './logger.js';
 import type { ContainerOutput } from './container-runner.js';
 import { MAINTENANCE_SESSION_NAME } from './group-queue.js';
 
@@ -365,4 +370,224 @@ describe('task scheduler', () => {
     expect(removed).toBe(0);
     expect(getTaskById('stale-active')).toBeDefined();
   });
+  it('pruneCompletedTasks removes completed once-task with NULL last_run when created_at is past TTL', () => {
+    // Reproduces task-1777292573285-gvr365: status=completed, schedule_type=once,
+    // last_run=NULL. Pre-fix the `last_run IS NOT NULL` guard left this row
+    // lingering forever; the COALESCE(last_run, created_at) version uses the
+    // creation timestamp as the fallback age signal.
+    const t0 = Date.parse('2026-01-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+
+    createTask({
+      id: 'orphan-completed',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'never ran',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '2026-01-01T00:00:00.000Z',
+      status: 'active',
+      // Backdate creation past the TTL boundary.
+      created_at: new Date(t0 - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
+    });
+    // Mark completed WITHOUT going through updateTaskAfterRun — that's the
+    // dispatch-failure shape the bug describes. last_run stays NULL.
+    updateTask('orphan-completed', { status: 'completed' });
+
+    const before = getTaskById('orphan-completed');
+    expect(before?.status).toBe('completed');
+    expect(before?.last_run ?? null).toBeNull();
+
+    const removed = pruneCompletedTasks(COMPLETED_TASK_TTL_MS);
+    expect(removed).toBe(1);
+    expect(getTaskById('orphan-completed')).toBeUndefined();
+  });
+
+  it('getCompletedTaskTtlMs honours NANOCLAW_COMPLETED_TASK_TTL_MS env override', () => {
+    // Default — no env var.
+    vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', '');
+    expect(getCompletedTaskTtlMs()).toBe(COMPLETED_TASK_TTL_MS);
+
+    // Valid override.
+    vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', '60000');
+    expect(getCompletedTaskTtlMs()).toBe(60_000);
+
+    // Invalid override falls back to the default, doesn't throw.
+    vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', 'not-a-number');
+    expect(getCompletedTaskTtlMs()).toBe(COMPLETED_TASK_TTL_MS);
+    vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', '-1');
+    expect(getCompletedTaskTtlMs()).toBe(COMPLETED_TASK_TTL_MS);
+
+    // End-to-end: with the env override active, prune deletes a row that
+    // would NOT have matched the 24h default.
+    const t0 = Date.parse('2026-02-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+    createTask({
+      id: 'env-ttl-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'env',
+      schedule_type: 'once',
+      schedule_value: '2026-02-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(t0).toISOString(),
+      status: 'active',
+      created_at: new Date(t0).toISOString(),
+    });
+    updateTaskAfterRun('env-ttl-task', null, 'ok');
+
+    // 5 minutes later — well within the 24h default, well past a 60s override.
+    vi.setSystemTime(t0 + 5 * 60_000);
+    vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', '60000');
+    expect(pruneCompletedTasks(getCompletedTaskTtlMs())).toBe(1);
+
+    vi.unstubAllEnvs();
+  });
+
+  it('scheduler loop runs prune at most once per PRUNE_INTERVAL_MS even on many ticks', async () => {
+    // Spy on pruneCompletedTasks via the scheduler's call-site by counting
+    // INFO logs of "Pruned completed once-tasks" — the scheduler only logs
+    // when count > 0. To make the count > 0 every gated entry, seed two
+    // expired completed once-tasks; each gated call deletes one of them.
+    const t0 = Date.parse('2026-03-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+
+    for (const id of ['p1', 'p2']) {
+      createTask({
+        id,
+        group_folder: 'main',
+        chat_jid: 'main@g.us',
+        prompt: id,
+        schedule_type: 'once',
+        schedule_value: new Date(t0).toISOString(),
+        context_mode: 'isolated',
+        next_run: new Date(t0).toISOString(),
+        status: 'active',
+        created_at: new Date(
+          t0 - COMPLETED_TASK_TTL_MS - 60_000,
+        ).toISOString(),
+      });
+      updateTask(id, { status: 'completed' });
+    }
+
+    const infoSpy = vi.spyOn(logger, 'info');
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    // SCHEDULER_POLL_INTERVAL is 60s — advance in poll-sized steps so
+    // each iteration fires a real loop tick. 30 ticks = 30 minutes,
+    // still well below the 1h PRUNE_INTERVAL_MS gate. Only the first
+    // tick (lastPruneAt=0) should pass the gate.
+    for (let i = 0; i < 30; i += 1) {
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+
+    const prunedLogCalls = infoSpy.mock.calls.filter(
+      (call) =>
+        typeof call[1] === 'string' && call[1] === 'Pruned completed once-tasks',
+    );
+    // 30 ticks covered ~30s of wall-clock time, well under PRUNE_INTERVAL_MS.
+    // Even though both seeded rows are eligible, the throttle means at most
+    // ONE prune call across all ticks → exactly one "Pruned" log line.
+    expect(prunedLogCalls.length).toBe(1);
+    // Both seeded rows were eligible at the first gated tick, so a single
+    // prune transaction took both out.
+    expect(getTaskById('p1')).toBeUndefined();
+    expect(getTaskById('p2')).toBeUndefined();
+
+    // Seed another expired completed once-task so the next gated entry has
+    // something to log, then cross the PRUNE_INTERVAL_MS boundary.
+    const tNow = Date.now();
+    createTask({
+      id: 'p3',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'p3',
+      schedule_type: 'once',
+      schedule_value: new Date(tNow).toISOString(),
+      context_mode: 'isolated',
+      next_run: new Date(tNow).toISOString(),
+      status: 'active',
+      created_at: new Date(
+        tNow - COMPLETED_TASK_TTL_MS - 60_000,
+      ).toISOString(),
+    });
+    updateTask('p3', { status: 'completed' });
+
+    await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS);
+
+    const prunedAfterBoundary = infoSpy.mock.calls.filter(
+      (call) =>
+        typeof call[1] === 'string' && call[1] === 'Pruned completed once-tasks',
+    );
+    expect(prunedAfterBoundary.length).toBeGreaterThanOrEqual(2);
+    expect(getTaskById('p3')).toBeUndefined();
+
+    infoSpy.mockRestore();
+  });
+
+  it('dormant recurring task (last_run > threshold, status=active) emits a warn log without deletion', async () => {
+    // A cron task that hasn't fired in 8 days while still status=active
+    // points at a dispatch problem. The scheduler should log a warning so
+    // a human notices, but must NOT auto-delete the row — that would
+    // silently lose the schedule.
+    const t0 = Date.parse('2026-04-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+
+    createTask({
+      id: 'dormant-cron',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'morning brief',
+      schedule_type: 'cron',
+      schedule_value: '0 8 * * *',
+      context_mode: 'group',
+      next_run: new Date(t0 + 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    // Stamp last_run > DORMANT_CRON_THRESHOLD_MS in the past.
+    updateTaskAfterRun(
+      'dormant-cron',
+      new Date(t0 + 60_000).toISOString(),
+      'ok',
+    );
+    // updateTaskAfterRun stamps last_run to "now". Roll the clock forward
+    // past the dormant threshold so the row qualifies on the next tick.
+    vi.setSystemTime(t0 + DORMANT_CRON_THRESHOLD_MS + 60 * 60_000);
+
+    const warnSpy = vi.spyOn(logger, 'warn');
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const dormantWarnCall = warnSpy.mock.calls.find(
+      (call) =>
+        typeof call[1] === 'string' &&
+        call[1].startsWith('Dormant recurring task'),
+    );
+    expect(dormantWarnCall).toBeDefined();
+    expect((dormantWarnCall![0] as { taskId: string }).taskId).toBe(
+      'dormant-cron',
+    );
+
+    // The row is still in the database — visibility-only, no delete.
+    expect(getTaskById('dormant-cron')).toBeDefined();
+    warnSpy.mockRestore();
+  });
+
 });
