@@ -141,7 +141,14 @@ describe('database migrations', () => {
 
       _closeDatabase();
     } finally {
+      // Restore CWD before removing the tempDir — `fs.rmSync(tempDir,
+      // { recursive: true })` would refuse if the process was still
+      // chdir'd inside the tree on some filesystems. Clean-up is in
+      // `finally` so the artifact never lingers on CI workers across
+      // runs (per `jbaruch/coding-policy: testing-standards` —
+      // "Clean up after yourself").
       process.chdir(repoRoot);
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });
