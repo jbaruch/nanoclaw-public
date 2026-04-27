@@ -16,6 +16,7 @@ import {
   getTaskById,
   logTaskRun,
   pruneCompletedTasks,
+  resurrectZombieTasks,
   setSession,
   updateTask,
   updateTaskAfterRun,
@@ -412,6 +413,21 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   }
   schedulerRunning = true;
   logger.info('Scheduler loop started');
+
+  // Recover once-tasks that were pre-advanced to status='completed' but
+  // whose dispatch never landed (host crash between the pre-advance write
+  // and queue.enqueueTask, or queue dropped the run during shutdown). The
+  // periodic pruneCompletedTasks pass would eventually GC these on age,
+  // but that loses the schedule. Resurrecting puts them back in front of
+  // getDueTasks so they actually run, even if late. Runs once per process
+  // start, before the first loop tick.
+  const resurrected = resurrectZombieTasks();
+  if (resurrected.length > 0) {
+    logger.warn(
+      { count: resurrected.length, taskIds: resurrected },
+      'Resurrected zombie once-tasks (status=completed, last_run=NULL) to active',
+    );
+  }
 
   const loop = async () => {
     try {

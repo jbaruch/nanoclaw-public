@@ -24,6 +24,7 @@ import {
   getSession,
   getTaskById,
   pruneCompletedTasks,
+  resurrectZombieTasks,
   setSession,
   updateTask,
   updateTaskAfterRun,
@@ -607,8 +608,14 @@ describe('task scheduler', () => {
         status: 'active',
         created_at: new Date(t0 - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
       });
-      updateTask(id, { status: 'completed' });
+      // Stamp last_run in the past so resurrectZombieTasks() at startup
+      // skips this row (its predicate requires last_run IS NULL). The
+      // COALESCE(last_run, created_at) prune predicate still matches via
+      // the past last_run, preserving the test's prune-throttle intent.
+      vi.setSystemTime(t0 - COMPLETED_TASK_TTL_MS - 60_000);
+      updateTaskAfterRun(id, null, 'ok');
     }
+    vi.setSystemTime(t0);
 
     const infoSpy = vi.spyOn(logger, 'info');
 
@@ -658,7 +665,11 @@ describe('task scheduler', () => {
       status: 'active',
       created_at: new Date(tNow - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
     });
-    updateTask('p3', { status: 'completed' });
+    // See comment above on p1/p2: past last_run keeps resurrect away
+    // while still letting prune match via COALESCE(last_run, created_at).
+    vi.setSystemTime(tNow - COMPLETED_TASK_TTL_MS - 60_000);
+    updateTaskAfterRun('p3', null, 'ok');
+    vi.setSystemTime(tNow);
 
     await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS);
 
@@ -944,5 +955,89 @@ describe('task scheduler', () => {
     expect(dormantWarnsAfter.length).toBe(1);
 
     warnSpy.mockRestore();
+  });
+
+  it('resurrectZombieTasks flips pre-advanced once-tasks back to active so getDueTasks can pick them up', () => {
+    // Pre-advance shape: status='completed', last_run=NULL, next_run set,
+    // schedule_type='once'. This is what the scheduler writes between the
+    // pre-advance UPDATE and the queue.enqueueTask call. If dispatch is
+    // dropped (host crash, queue shut down mid-tick), the row sits here
+    // forever — pruneCompletedTasks would eventually GC it but the
+    // schedule is lost. resurrect puts it back in front of the loop.
+    createTask({
+      id: 'zombie-once',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'should have run',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '2026-01-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    // Reproduce the pre-advance write without the matching updateTaskAfterRun.
+    updateTask('zombie-once', { status: 'completed' });
+    expect(getTaskById('zombie-once')?.status).toBe('completed');
+    expect(getTaskById('zombie-once')?.last_run ?? null).toBeNull();
+
+    const resurrected = resurrectZombieTasks();
+    expect(resurrected).toEqual(['zombie-once']);
+    expect(getTaskById('zombie-once')?.status).toBe('active');
+    expect(getTaskById('zombie-once')?.next_run).toBe(
+      '2026-01-01T00:00:00.000Z',
+    );
+  });
+
+  it('resurrectZombieTasks leaves genuinely-completed once-tasks alone (last_run is set)', () => {
+    // A task that ran successfully has both last_run set and status='completed'
+    // (updateTaskAfterRun stamps both). The resurrect query specifically
+    // requires last_run IS NULL, so this row must NOT be resurrected.
+    createTask({
+      id: 'ran-properly',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'ran ok',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '2026-01-01T00:00:00.000Z',
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    // updateTaskAfterRun: stamps last_run AND flips to completed for once-tasks.
+    updateTaskAfterRun('ran-properly', null, 'ok');
+    expect(getTaskById('ran-properly')?.status).toBe('completed');
+    expect(getTaskById('ran-properly')?.last_run).toBeTruthy();
+
+    const resurrected = resurrectZombieTasks();
+    expect(resurrected).toEqual([]);
+    expect(getTaskById('ran-properly')?.status).toBe('completed');
+  });
+
+  it('resurrectZombieTasks ignores recurring tasks even if they somehow reach status=completed', () => {
+    // computeNextRun never returns null for cron/interval tasks, so they
+    // can't legitimately reach status='completed' through the scheduler.
+    // The schedule_type='once' clause is defensive — verify it holds even
+    // if a recurring row is force-set to completed via direct updateTask
+    // (e.g. operator action, db migration mishap).
+    createTask({
+      id: 'cron-frozen',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'daily',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'group',
+      next_run: '2026-01-02T17:00:00.000Z',
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    updateTask('cron-frozen', { status: 'completed' });
+
+    const resurrected = resurrectZombieTasks();
+    expect(resurrected).toEqual([]);
+    // Recurring row stays where the operator put it.
+    expect(getTaskById('cron-frozen')?.status).toBe('completed');
   });
 });
