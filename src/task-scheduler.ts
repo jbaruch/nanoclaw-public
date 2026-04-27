@@ -124,6 +124,24 @@ export const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
  */
 export const DORMANT_CRON_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * Per-task cooldown between consecutive dormant warnings. Without this,
+ * every prune cycle (`PRUNE_INTERVAL_MS`, currently 1h) re-emits a warn
+ * for the same dormant cron — 24 noisy logs/day per stuck task. One per
+ * day per dormant task is enough to surface the problem without drowning
+ * the log. After a process restart `lastDormantWarnAt` is empty, so the
+ * first cycle warns once for every dormant task — that's the desired
+ * behaviour: a fresh operator deserves to see the current state.
+ */
+export const DORMANT_WARN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Tracks the last time we logged a dormant warning per task id. Pruned
+ * each cycle to drop ids that no longer exist in `scheduled_tasks` so
+ * the map can't grow unbounded across the lifetime of the process.
+ */
+const lastDormantWarnAt = new Map<string, number>();
+
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   /**
@@ -401,8 +419,17 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         // stuck cron task points at a dispatch problem (next_run not
         // advancing, queue wedged) — surfacing it as a warn lets a
         // human decide; auto-deleting would silently lose the schedule.
+        // Each task is warned at most once per DORMANT_WARN_COOLDOWN_MS
+        // so a long-stuck cron doesn't spam the log on every cycle.
         const dormant = getDormantRecurringTasks(DORMANT_CRON_THRESHOLD_MS);
+        const dormantIds = new Set<string>();
         for (const task of dormant) {
+          dormantIds.add(task.id);
+          const lastWarnedAt = lastDormantWarnAt.get(task.id) ?? 0;
+          if (nowMs - lastWarnedAt < DORMANT_WARN_COOLDOWN_MS) {
+            continue;
+          }
+          lastDormantWarnAt.set(task.id, nowMs);
           logger.warn(
             {
               taskId: task.id,
@@ -414,6 +441,13 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
             },
             'Dormant recurring task — last_run older than threshold',
           );
+        }
+        // Drop bookkeeping for tasks that are no longer dormant (or no
+        // longer exist) so the map can't grow without bound.
+        for (const id of lastDormantWarnAt.keys()) {
+          if (!dormantIds.has(id)) {
+            lastDormantWarnAt.delete(id);
+          }
         }
       }
 
@@ -459,4 +493,5 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
   lastPruneAt = 0;
+  lastDormantWarnAt.clear();
 }

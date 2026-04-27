@@ -20,6 +20,7 @@ vi.mock('./container-runner.js', () => ({
 import {
   _initTestDatabase,
   createTask,
+  deleteTask,
   getSession,
   getTaskById,
   pruneCompletedTasks,
@@ -30,6 +31,7 @@ import {
 import {
   COMPLETED_TASK_TTL_MS,
   DORMANT_CRON_THRESHOLD_MS,
+  DORMANT_WARN_COOLDOWN_MS,
   PRUNE_INTERVAL_MS,
   _resetSchedulerLoopForTests,
   computeNextRun,
@@ -418,6 +420,10 @@ describe('task scheduler', () => {
     expect(getCompletedTaskTtlMs()).toBe(COMPLETED_TASK_TTL_MS);
     vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', '-1');
     expect(getCompletedTaskTtlMs()).toBe(COMPLETED_TASK_TTL_MS);
+    // 0 is rejected too — "prune everything immediately" is never what
+    // the operator meant, and silently honouring it complicates triage.
+    vi.stubEnv('NANOCLAW_COMPLETED_TASK_TTL_MS', '0');
+    expect(getCompletedTaskTtlMs()).toBe(COMPLETED_TASK_TTL_MS);
 
     // End-to-end: with the env override active, prune deletes a row that
     // would NOT have matched the 24h default.
@@ -464,9 +470,7 @@ describe('task scheduler', () => {
         context_mode: 'isolated',
         next_run: new Date(t0).toISOString(),
         status: 'active',
-        created_at: new Date(
-          t0 - COMPLETED_TASK_TTL_MS - 60_000,
-        ).toISOString(),
+        created_at: new Date(t0 - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
       });
       updateTask(id, { status: 'completed' });
     }
@@ -491,7 +495,8 @@ describe('task scheduler', () => {
 
     const prunedLogCalls = infoSpy.mock.calls.filter(
       (call) =>
-        typeof call[1] === 'string' && call[1] === 'Pruned completed once-tasks',
+        typeof call[1] === 'string' &&
+        call[1] === 'Pruned completed once-tasks',
     );
     // 30 ticks covered ~30s of wall-clock time, well under PRUNE_INTERVAL_MS.
     // Even though both seeded rows are eligible, the throttle means at most
@@ -515,9 +520,7 @@ describe('task scheduler', () => {
       context_mode: 'isolated',
       next_run: new Date(tNow).toISOString(),
       status: 'active',
-      created_at: new Date(
-        tNow - COMPLETED_TASK_TTL_MS - 60_000,
-      ).toISOString(),
+      created_at: new Date(tNow - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
     });
     updateTask('p3', { status: 'completed' });
 
@@ -525,7 +528,8 @@ describe('task scheduler', () => {
 
     const prunedAfterBoundary = infoSpy.mock.calls.filter(
       (call) =>
-        typeof call[1] === 'string' && call[1] === 'Pruned completed once-tasks',
+        typeof call[1] === 'string' &&
+        call[1] === 'Pruned completed once-tasks',
     );
     expect(prunedAfterBoundary.length).toBeGreaterThanOrEqual(2);
     expect(getTaskById('p3')).toBeUndefined();
@@ -590,4 +594,154 @@ describe('task scheduler', () => {
     warnSpy.mockRestore();
   });
 
+  it('dormant warn is rate-limited per task to once per DORMANT_WARN_COOLDOWN_MS', async () => {
+    // Without per-task dedup the prune sweep (PRUNE_INTERVAL_MS = 1h)
+    // would re-warn the same dormant task 24 times a day. Assert that
+    // back-to-back prune cycles only emit one warn for the same id, and
+    // that the warn fires again once the cooldown elapses.
+    const t0 = Date.parse('2026-04-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+
+    createTask({
+      id: 'dormant-dedup',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'morning brief',
+      schedule_type: 'cron',
+      schedule_value: '0 8 * * *',
+      context_mode: 'group',
+      next_run: new Date(t0 + 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    updateTaskAfterRun(
+      'dormant-dedup',
+      new Date(t0 + 60_000).toISOString(),
+      'ok',
+    );
+    // Move past the dormancy threshold so the task qualifies.
+    vi.setSystemTime(t0 + DORMANT_CRON_THRESHOLD_MS + 60 * 60_000);
+
+    const warnSpy = vi.spyOn(logger, 'warn');
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    const matches = () =>
+      warnSpy.mock.calls.filter(
+        (call) =>
+          typeof call[1] === 'string' &&
+          call[1].startsWith('Dormant recurring task') &&
+          (call[0] as { taskId: string }).taskId === 'dormant-dedup',
+      ).length;
+
+    expect(matches()).toBe(1);
+
+    // A second prune cycle inside the cooldown window must NOT warn again.
+    await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS + 10);
+    expect(matches()).toBe(1);
+
+    // After the cooldown elapses, the next prune cycle warns once more.
+    await vi.advanceTimersByTimeAsync(DORMANT_WARN_COOLDOWN_MS);
+    expect(matches()).toBe(2);
+
+    warnSpy.mockRestore();
+  });
+
+  it('dormant warn map drops entries for tasks that no longer exist', async () => {
+    // The dedup map is keyed by task id; if a task is deleted between
+    // prune cycles, its entry must be cleaned up so the map can't grow
+    // unbounded over the lifetime of the process. We can't poke at the
+    // map directly, so we assert the externally-visible behaviour: a
+    // re-created task with the same id (after deletion) gets a fresh
+    // warn even inside the cooldown window.
+    const t0 = Date.parse('2026-04-01T00:00:00.000Z');
+    vi.setSystemTime(t0);
+
+    createTask({
+      id: 'dormant-vanish',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'will be deleted',
+      schedule_type: 'cron',
+      schedule_value: '0 8 * * *',
+      context_mode: 'group',
+      next_run: new Date(t0 + 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    updateTaskAfterRun(
+      'dormant-vanish',
+      new Date(t0 + 60_000).toISOString(),
+      'ok',
+    );
+    vi.setSystemTime(t0 + DORMANT_CRON_THRESHOLD_MS + 60 * 60_000);
+
+    const warnSpy = vi.spyOn(logger, 'warn');
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    const matches = () =>
+      warnSpy.mock.calls.filter(
+        (call) =>
+          typeof call[1] === 'string' &&
+          call[1].startsWith('Dormant recurring task') &&
+          (call[0] as { taskId: string }).taskId === 'dormant-vanish',
+      ).length;
+
+    expect(matches()).toBe(1);
+
+    // Delete the task and run another prune cycle — this triggers the
+    // stale-id cleanup path inside the dormant-warn loop.
+    deleteTask('dormant-vanish');
+    await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS + 10);
+    expect(matches()).toBe(1);
+
+    // Re-create the task with the same id, still inside the original
+    // cooldown window. If the map entry was correctly pruned the new
+    // dormant task warns; if the map leaked, this would stay at 1.
+    //
+    // updateTaskAfterRun stamps `last_run = Date.now()` unconditionally,
+    // so to seed a dormant `last_run` we briefly roll the system clock
+    // back to `t0`, call updateTaskAfterRun (which records that as
+    // last_run), then restore the clock to where the prune-cycle test
+    // expects it. The 2nd argument is `nextRun`, not last_run.
+    const restoreTime = Date.now();
+    createTask({
+      id: 'dormant-vanish',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'reborn',
+      schedule_type: 'cron',
+      schedule_value: '0 8 * * *',
+      context_mode: 'group',
+      next_run: new Date(restoreTime + 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    vi.setSystemTime(t0);
+    updateTaskAfterRun(
+      'dormant-vanish',
+      new Date(restoreTime + 60_000).toISOString(),
+      'ok',
+    );
+    vi.setSystemTime(restoreTime);
+    await vi.advanceTimersByTimeAsync(PRUNE_INTERVAL_MS + 10);
+    expect(matches()).toBe(2);
+
+    warnSpy.mockRestore();
+  });
 });
