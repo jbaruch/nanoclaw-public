@@ -114,9 +114,12 @@ describe('normalizeReactionEmoji — unmapped input', () => {
     // Indexing a plain object with `toString`, `__proto__`, etc.
     // returns inherited values from Object.prototype unless guarded.
     // The own-property check must keep these falling through to the
-    // input-unchanged path. Without the guard `__proto__` would
-    // return `[object Object]` and `toString` would return a
-    // function reference — both violations of the string return.
+    // input-unchanged path. Without the guard, `__proto__` would
+    // return Object.prototype itself, `toString` would return a
+    // function reference, and `constructor` would return the Object
+    // constructor — all violations of the string-or-input return
+    // contract that would later get logged or stringified into
+    // diagnostics in confusing ways.
     expect(normalizeReactionEmoji('toString')).toBe('toString');
     expect(normalizeReactionEmoji('__proto__')).toBe('__proto__');
     expect(normalizeReactionEmoji('hasOwnProperty')).toBe('hasOwnProperty');

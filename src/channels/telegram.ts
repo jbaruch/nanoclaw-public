@@ -229,11 +229,10 @@ const EMOJI_SHORTCODE_TO_UNICODE: Record<string, string> = {
  *     Slack-style colon delimiters are common in agent output.
  */
 export function normalizeReactionEmoji(input: string): string {
-  // Use ️ (variation selector 16) explicitly rather than an
-  // invisible literal char in the regex — invisible chars are easy
-  // to accidentally alter via editor/formatter and impossible to
-  // audit.
-  const noVS16 = input.replace(/️/g, '');
+  // Strip U+FE0F (VARIATION SELECTOR-16). Written as the explicit
+  // `\uFE0F` escape — an invisible literal in the regex source is
+  // hard to audit and trivially altered by editor reformatting.
+  const noVS16 = input.replace(/\uFE0F/g, '');
   if (TELEGRAM_ALLOWED_REACTIONS.has(noVS16)) return noVS16;
   const stripped = noVS16.replace(/^:|:$/g, '');
   // Guard against prototype pollution: indexing a plain object with
