@@ -164,6 +164,44 @@ describe('buildSecretEnvFile', () => {
   });
 });
 
+describe('buildSecretEnvFile — write-failure cleanup', () => {
+  it('removes the tempfile when the write fails (no orphaned partial-secret file)', () => {
+    // Pin randomBytes so we know exactly which path will be created.
+    const fixedSuffix = Buffer.from('cafebabecafebabecafebabe', 'hex');
+    vi.mocked(crypto.randomBytes).mockReturnValueOnce(
+      fixedSuffix as unknown as ReturnType<typeof crypto.randomBytes>,
+    );
+    const expectedPath = path.join(
+      os.tmpdir(),
+      `nanoclaw-env-cafebabecafebabecafebabe`,
+    );
+
+    // Force writeFileSync to throw AFTER the open (so the file is
+    // already created on disk). Spy is restored in afterEach guard
+    // below — failing this test must not leak a global mock.
+    const writeSpy = vi
+      .spyOn(fs, 'writeFileSync')
+      .mockImplementationOnce(() => {
+        throw new Error('simulated EIO');
+      });
+
+    expect(() =>
+      buildSecretEnvFile({ COMPOSIO_API_KEY: 'sk-write-fail' }),
+    ).toThrow(/simulated EIO/);
+
+    // The write failed; the tempfile must NOT remain on disk. Without
+    // the cleanup, the file would persist with whatever bytes (if any)
+    // had been flushed before the failure — including potentially the
+    // full secret if writeFileSync got partway through.
+    expect(fs.existsSync(expectedPath)).toBe(false);
+
+    writeSpy.mockRestore();
+    // Defensive: if cleanup somehow missed the file, afterEach will
+    // catch it.
+    tempFilesToCleanup.push(expectedPath);
+  });
+});
+
 describe('buildSecretEnvFile — symlink-race defense', () => {
   it('throws and leaves a pre-existing path untouched (O_EXCL behavior)', () => {
     // Pin randomBytes to a known suffix, pre-create the exact path
