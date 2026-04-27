@@ -4,6 +4,10 @@
   "dependencies": {
     "jbaruch/nanoclaw-host": {
       "version": "0.1.15"
+    },
+    "jbaruch/nanoclaw-telegram": {
+      "version": "7b815a47d2fe9d2e392d3497e725076344b79730",
+      "source": "https://github.com/jbaruch/nanoclaw-telegram"
     }
   }
 }

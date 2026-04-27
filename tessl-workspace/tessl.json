@@ -3,16 +3,19 @@
   "mode": "managed",
   "dependencies": {
     "jbaruch/nanoclaw-core": {
-      "version": "0.1.60"
+      "version": "0.1.80"
     },
     "jbaruch/nanoclaw-untrusted": {
-      "version": "0.1.15"
+      "version": "0.1.26"
     },
     "jbaruch/nanoclaw-trusted": {
-      "version": "0.1.30"
+      "version": "0.1.44"
     },
     "jbaruch/nanoclaw-host": {
-      "version": "0.1.2"
+      "version": "0.1.23"
+    },
+    "ligolnik/flight-weather-watch": {
+      "version": "0.10.0"
     }
   }
 }
