@@ -454,8 +454,10 @@ describe('task scheduler', () => {
   it('scheduler loop runs prune at most once per PRUNE_INTERVAL_MS even on many ticks', async () => {
     // Spy on pruneCompletedTasks via the scheduler's call-site by counting
     // INFO logs of "Pruned completed once-tasks" — the scheduler only logs
-    // when count > 0. To make the count > 0 every gated entry, seed two
-    // expired completed once-tasks; each gated call deletes one of them.
+    // when count > 0. Seed two expired completed once-tasks; the first
+    // gated call removes both in a single transaction (count=2, one log
+    // line). To get a SECOND log line we then seed another expired row
+    // and cross the PRUNE_INTERVAL_MS boundary.
     const t0 = Date.parse('2026-03-01T00:00:00.000Z');
     vi.setSystemTime(t0);
 
@@ -498,9 +500,10 @@ describe('task scheduler', () => {
         typeof call[1] === 'string' &&
         call[1] === 'Pruned completed once-tasks',
     );
-    // 30 ticks covered ~30s of wall-clock time, well under PRUNE_INTERVAL_MS.
-    // Even though both seeded rows are eligible, the throttle means at most
-    // ONE prune call across all ticks → exactly one "Pruned" log line.
+    // 30 ticks at 60s stride covered ~30 minutes of mocked time, well
+    // under PRUNE_INTERVAL_MS (1h). The throttle means only the very
+    // first tick (lastPruneAt=0) passes the gate → exactly one
+    // "Pruned" log line, even though both seeded rows are eligible.
     expect(prunedLogCalls.length).toBe(1);
     // Both seeded rows were eligible at the first gated tick, so a single
     // prune transaction took both out.

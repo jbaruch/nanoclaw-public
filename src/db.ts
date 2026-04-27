@@ -685,9 +685,24 @@ export function deleteTask(id: string): void {
  * NULL forever — the original `last_run < cutoff` filter would never
  * match, and the orphan row would linger indefinitely. Falling back to
  * `created_at` guarantees these rows are eventually pruned by their
- * own age. Recurring tasks never reach status='completed'
- * (computeNextRun only returns null for once-tasks), so the
- * schedule_type='once' clause is defensive. Returns row count removed.
+ * own age.
+ *
+ * Trade-off: a once-task scheduled far in advance and only just now
+ * marked completed (with `last_run` NULL because dispatch failed) is
+ * pruned earlier than the user-facing "TTL after completion" intent —
+ * the row could disappear immediately if `created_at` is already past
+ * the cutoff. This is acceptable because (a) such rows were never
+ * visible to the user as completed during normal operation, so there's
+ * no observable regression vs. the case where the task ran and stamped
+ * last_run; (b) the alternative of letting NULL-last_run rows linger
+ * indefinitely (the bug we're fixing) is strictly worse. A future
+ * `completed_at` column would let us preserve the grace window even for
+ * orphans; until then COALESCE is the closest approximation that
+ * doesn't require a schema migration.
+ *
+ * Recurring tasks never reach status='completed' (computeNextRun only
+ * returns null for once-tasks), so the schedule_type='once' clause is
+ * defensive. Returns row count removed.
  */
 export function pruneCompletedTasks(maxAgeMs: number): number {
   const cutoff = new Date(Date.now() - maxAgeMs).toISOString();

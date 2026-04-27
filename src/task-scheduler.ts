@@ -407,10 +407,13 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       // Run prune + dormant-cron sweep at most once per PRUNE_INTERVAL_MS.
       // The first tick after process start always passes this gate
       // (lastPruneAt initialised to 0), so a restart immediately runs
-      // cleanup rather than waiting an hour.
+      // cleanup rather than waiting an hour. `lastPruneAt` is updated
+      // AFTER the housekeeping calls succeed — if pruneCompletedTasks
+      // or getDormantRecurringTasks throws, the next 60s tick retries
+      // rather than gating the whole housekeeping cycle for an hour
+      // on a transient DB error.
       const nowMs = Date.now();
       if (nowMs - lastPruneAt >= PRUNE_INTERVAL_MS) {
-        lastPruneAt = nowMs;
         const pruned = pruneCompletedTasks(getCompletedTaskTtlMs());
         if (pruned > 0) {
           logger.info({ count: pruned }, 'Pruned completed once-tasks');
@@ -449,6 +452,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
             lastDormantWarnAt.delete(id);
           }
         }
+        lastPruneAt = nowMs;
       }
 
       const dueTasks = getDueTasks();
