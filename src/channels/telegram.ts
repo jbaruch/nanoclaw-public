@@ -62,6 +62,212 @@ async function sendTelegramMessage(
 
 const MAX_LENGTH = 4096;
 
+// Slack-style shortcode → Unicode mapping for the 73 Telegram-supported
+// reactions (Bot API 7.x). Covers every entry in
+// TELEGRAM_ALLOWED_REACTIONS below. Agents and skills emit shortcodes
+// like `thumbs_up` or `:thumbs_up:` because that's the lingua franca
+// across Slack/GitHub/GitLab/Mattermost; without normalization those
+// shortcodes failed `TELEGRAM_ALLOWED_REACTIONS.has(...)` and fell
+// back silently to 👍 — see #161 for the production sighting where
+// only ~16 emoji worked via shortcode while ~57 silently failed.
+//
+// Multiple shortcodes can map to the same Unicode char where common
+// aliases exist (e.g. both `+1` and `thumbs_up` → 👍).
+//
+// IMPORTANT: every value in this map MUST also exist in
+// TELEGRAM_ALLOWED_REACTIONS. Drift between the two means a
+// successfully-mapped shortcode would still fall back to 👍 at the
+// allowed-reactions gate; the test suite enforces this invariant.
+const EMOJI_SHORTCODE_TO_UNICODE: Record<string, string> = {
+  // — affirmation & engagement
+  thumbs_up: '👍',
+  '+1': '👍',
+  thumbsup: '👍',
+  thumbs_down: '👎',
+  '-1': '👎',
+  thumbsdown: '👎',
+  heart: '❤',
+  red_heart: '❤',
+  fire: '🔥',
+  smiling_face_with_hearts: '🥰',
+  smiling_face_with_3_hearts: '🥰',
+  clap: '👏',
+  beaming_face_with_smiling_eyes: '😁',
+  grin: '😁',
+  thinking_face: '🤔',
+  thinking: '🤔',
+  exploding_head: '🤯',
+  shocked_face: '😱',
+  scream: '😱',
+  face_with_symbols_on_mouth: '🤬',
+  cursing_face: '🤬',
+  crying_face: '😢',
+  cry: '😢',
+  party_popper: '🎉',
+  tada: '🎉',
+  smiling_face_with_starry_eyes: '🤩',
+  star_struck: '🤩',
+  face_vomiting: '🤮',
+  vomit: '🤮',
+  pile_of_poo: '💩',
+  poop: '💩',
+  hankey: '💩',
+  shit: '💩',
+  folded_hands: '🙏',
+  pray: '🙏',
+  ok_hand: '👌',
+  dove: '🕊',
+  dove_of_peace: '🕊',
+  clown_face: '🤡',
+  clown: '🤡',
+  yawning_face: '🥱',
+  yawn: '🥱',
+  woozy_face: '🥴',
+  smiling_face_with_heart_eyes: '😍',
+  heart_eyes: '😍',
+  whale: '🐳',
+  heart_on_fire: '❤‍🔥',
+  new_moon_face: '🌚',
+  new_moon_with_face: '🌚',
+  hot_dog: '🌭',
+  hotdog: '🌭',
+  hundred_points: '💯',
+  hundred: '💯',
+  '100': '💯',
+  rolling_on_the_floor_laughing: '🤣',
+  rofl: '🤣',
+  high_voltage: '⚡',
+  zap: '⚡',
+  banana: '🍌',
+  trophy: '🏆',
+  broken_heart: '💔',
+  face_with_raised_eyebrow: '🤨',
+  raised_eyebrow: '🤨',
+  neutral_face: '😐',
+  strawberry: '🍓',
+  bottle_with_popping_cork: '🍾',
+  champagne: '🍾',
+  kiss_mark: '💋',
+  kiss: '💋',
+  middle_finger: '🖕',
+  fu: '🖕',
+  smiling_face_with_horns: '😈',
+  smiling_imp: '😈',
+  sleeping_face: '😴',
+  sleeping: '😴',
+  loudly_crying_face: '😭',
+  sob: '😭',
+  nerd_face: '🤓',
+  nerd: '🤓',
+  ghost: '👻',
+  technologist: '👨‍💻',
+  man_technologist: '👨‍💻',
+  eyes: '👀',
+  jack_o_lantern: '🎃',
+  see_no_evil: '🙈',
+  see_no_evil_monkey: '🙈',
+  smiling_face_with_halo: '😇',
+  innocent: '😇',
+  fearful_face: '😨',
+  fearful: '😨',
+  handshake: '🤝',
+  writing_hand: '✍',
+  pencil: '✍',
+  smiling_face_with_open_hands: '🤗',
+  hugs: '🤗',
+  saluting_face: '🫡',
+  salute: '🫡',
+  santa_claus: '🎅',
+  santa: '🎅',
+  christmas_tree: '🎄',
+  snowman: '☃',
+  nail_polish: '💅',
+  zany_face: '🤪',
+  zany: '🤪',
+  moai: '🗿',
+  cool: '🆒',
+  heart_with_arrow: '💘',
+  cupid: '💘',
+  hear_no_evil: '🙉',
+  hear_no_evil_monkey: '🙉',
+  unicorn: '🦄',
+  unicorn_face: '🦄',
+  face_blowing_a_kiss: '😘',
+  kissing_heart: '😘',
+  pill: '💊',
+  speak_no_evil: '🙊',
+  speak_no_evil_monkey: '🙊',
+  smiling_face_with_sunglasses: '😎',
+  sunglasses: '😎',
+  alien_monster: '👾',
+  space_invader: '👾',
+  man_shrugging: '🤷‍♂',
+  shrug: '🤷',
+  person_shrugging: '🤷',
+  woman_shrugging: '🤷‍♀',
+  pouting_face: '😡',
+  enraged: '😡',
+  rage: '😡',
+};
+
+/**
+ * Normalize a reaction emoji input to a Telegram-supported Unicode
+ * character, accepting both shortcodes (`thumbs_up`, `:thumbs_up:`)
+ * and raw Unicode (`👍`, `❤️`). Returns the input unchanged if it
+ * can't be mapped; the caller (`sendReaction`) then runs the
+ * TELEGRAM_ALLOWED_REACTIONS gate, which falls back to 👍 with a
+ * warn log so unmapped inputs are visible rather than silently
+ * accepted.
+ *
+ * Strips:
+ *   - U+FE0F (variation selector 16) so emoji-presentation forms
+ *     like `❤️`, `☃️`, `✍️`, `🤷‍♂️` match the no-VS16 entries in
+ *     TELEGRAM_ALLOWED_REACTIONS. Telegram's reaction set uses the
+ *     bare codepoints; agents and clients commonly emit the
+ *     VS16-suffixed form.
+ *   - Surrounding `:` so both `thumbs_up` and `:thumbs_up:` map —
+ *     Slack-style colon delimiters are common in agent output.
+ */
+export function normalizeReactionEmoji(input: string): string {
+  // Use ️ (variation selector 16) explicitly rather than an
+  // invisible literal char in the regex — invisible chars are easy
+  // to accidentally alter via editor/formatter and impossible to
+  // audit.
+  const noVS16 = input.replace(/️/g, '');
+  if (TELEGRAM_ALLOWED_REACTIONS.has(noVS16)) return noVS16;
+  const stripped = noVS16.replace(/^:|:$/g, '');
+  // Guard against prototype pollution: indexing a plain object with
+  // a string like `toString` / `__proto__` returns an inherited
+  // value (function / object) from Object.prototype, not undefined.
+  // Object.hasOwn restricts the lookup to own properties so the
+  // function's string-or-input contract holds for any input.
+  const fromShortcode = Object.hasOwn(EMOJI_SHORTCODE_TO_UNICODE, stripped)
+    ? EMOJI_SHORTCODE_TO_UNICODE[stripped]
+    : undefined;
+  return fromShortcode ?? input;
+}
+
+/**
+ * Predicate exposed for tests so the drift invariant between
+ * EMOJI_SHORTCODE_TO_UNICODE and TELEGRAM_ALLOWED_REACTIONS can be
+ * asserted without exporting the Set itself. Returns true iff the
+ * given Unicode emoji is in Telegram's accepted reaction set.
+ *
+ * @internal
+ */
+export function _isAllowedReaction(emoji: string): boolean {
+  return TELEGRAM_ALLOWED_REACTIONS.has(emoji);
+}
+
+/**
+ * The shortcode → Unicode map exposed for tests so the drift
+ * invariant (every value is in TELEGRAM_ALLOWED_REACTIONS) can be
+ * asserted exhaustively rather than against a hardcoded list.
+ *
+ * @internal
+ */
+export const _EMOJI_SHORTCODE_TO_UNICODE = EMOJI_SHORTCODE_TO_UNICODE;
+
 // Telegram's allowed reaction emoji (as of Bot API 7.x)
 const TELEGRAM_ALLOWED_REACTIONS = new Set([
   '👍',
@@ -1058,12 +1264,34 @@ export class TelegramChannel implements Channel {
     if (!this.bot) return;
     const numericId = jid.replace(/^tg:/, '');
     const msgId = parseInt(messageId, 10);
-    // Telegram only allows specific emoji as reactions
-    const validEmoji = TELEGRAM_ALLOWED_REACTIONS.has(emoji) ? emoji : '👍';
-    if (validEmoji !== emoji) {
+    // Telegram only allows specific emoji as reactions. Normalize
+    // shortcodes (`thumbs_up`, `:thumbs_up:`) to Unicode first so
+    // agents that emit Slack-style names don't silently fall back
+    // to 👍 — see #161.
+    const normalized = normalizeReactionEmoji(emoji);
+    const reactionAllowed = TELEGRAM_ALLOWED_REACTIONS.has(normalized);
+    const validEmoji = reactionAllowed ? normalized : '👍';
+    if (!reactionAllowed) {
+      // Real recoverable issue — caller asked for an emoji Telegram
+      // doesn't support, we're substituting 👍 silently from the
+      // user's perspective. Operators want to see this.
       logger.warn(
-        { jid, messageId, requested: emoji, using: validEmoji },
+        {
+          jid,
+          messageId,
+          requested: emoji,
+          normalized,
+          using: validEmoji,
+        },
         'Invalid Telegram reaction emoji, falling back to 👍',
+      );
+    } else if (normalized !== emoji) {
+      // Successful normalization (shortcode → Unicode, or VS16
+      // strip). Not a problem — log at debug so production logs
+      // aren't flooded when agents commonly emit shortcodes.
+      logger.debug(
+        { jid, messageId, requested: emoji, normalized },
+        'Telegram reaction emoji normalized to Unicode',
       );
     }
     try {
