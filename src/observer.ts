@@ -120,10 +120,24 @@ function updateReaction(folder: string, emoji: string): void {
   if (!channelsRef) return;
   const chatJid = folderToChatJid(folder);
   if (!chatJid) return;
-  const msgId = latestUserMessage.get(chatJid);
+  // Prefer the message ID this query is processing (parsed from
+  // the Query input prompt) over the chat's most-recent inbound.
+  // When messages arrive faster than the agent processes them,
+  // `latestUserMessage` races ahead and the agent's tool_use
+  // (still working on the older prompt) lands its reaction on
+  // the wrong message. The state-bound id is stable across the
+  // turn. Fall back to latestUserMessage when state has none —
+  // covers scheduled-task and raw-prompt paths.
+  const state = states.get(folder);
+  const msgId = state?.targetMessageId ?? latestUserMessage.get(chatJid);
   if (!msgId) return;
-  if (lastReactionEmoji.get(chatJid) === emoji) return; // dedupe
-  lastReactionEmoji.set(chatJid, emoji);
+  // Dedupe on (chat, msg) — using chat alone collapses across
+  // different in-flight messages and would re-fire emojis on
+  // each one even when the same emoji was just set on another
+  // message in the same chat.
+  const dedupeKey = `${chatJid}:${msgId}`;
+  if (lastReactionEmoji.get(dedupeKey) === emoji) return;
+  lastReactionEmoji.set(dedupeKey, emoji);
   const channel = channelsRef.find(
     (c) => c.ownsJid(chatJid) && c.isConnected() && c.sendReaction,
   );
@@ -206,7 +220,13 @@ function startWatchdog(source: string): void {
       if (nextThreshold && elapsedSec >= nextThreshold) {
         w.pingsSent++;
         const chatJid = folderToChatJid(source);
-        const msgId = chatJid ? latestUserMessage.get(chatJid) : undefined;
+        // Same per-state target as updateReaction — pin the ping
+        // to the message this query is actually processing, not
+        // whatever's the latest inbound.
+        const stateForPing = states.get(source);
+        const msgId =
+          stateForPing?.targetMessageId ??
+          (chatJid ? latestUserMessage.get(chatJid) : undefined);
         const groups = registeredGroupsRef?.();
         const isMainChat = chatJid && groups?.[chatJid]?.isMain === true;
         if (chatJid && msgId && isMainChat) {
@@ -288,6 +308,14 @@ interface QueryState {
   // Once committed, every state transition through the rest of the
   // turn fires reactions normally.
   committed: boolean;
+  // The message ID this query is processing, parsed from the
+  // `<message id="N">` tag in the Query input prompt. Reactions
+  // fire on THIS message, not on the most-recent inbound — a fast-
+  // arriving newer message in the same chat would otherwise become
+  // `latestUserMessage` mid-turn and the agent's tool_use (still
+  // about the older prompt) would land its 🤔/⚡/✍ on the wrong
+  // message.
+  targetMessageId?: string;
 }
 
 // Keyed by container/group folder; one slot per concurrent query.
@@ -367,7 +395,20 @@ export function onAgentLine(source: string, raw: string): void {
   // Query boundaries
   if (line.startsWith('Query input:')) {
     sawAnyQueryInput = true;
-    states.set(source, newState());
+    const fresh = newState();
+    // Parse the message ID this query is responding to from the
+    // prompt preview. Format: `<message id="N" sender=...>`. The
+    // last id-tagged message in the prompt is the one the agent is
+    // actively processing (when multiple messages are bundled, the
+    // agent sees them in chronological order; the *latest* in the
+    // prompt is the one it's deciding on right now). Falls back
+    // to undefined if the prompt has no id tag (e.g. scheduled
+    // tasks, raw prompts) — updateReaction handles that path.
+    const idMatches = [...line.matchAll(/<message id="(\d+)"/g)];
+    if (idMatches.length > 0) {
+      fresh.targetMessageId = idMatches[idMatches.length - 1][1];
+    }
+    states.set(source, fresh);
     // Defuse any watchdog left over from a prior query that crashed
     // before emitting `Query done.` (SDK exception, agent-runner kill,
     // container OOM). Without this, the second query would see
