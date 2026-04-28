@@ -140,6 +140,21 @@ export class GroupQueue {
     // channel and must never wait behind background heartbeats or other
     // groups. The cap is a politeness limit on parallel agents, not a
     // safety limit; main is special by definition (one chat, one user).
+    //
+    // Scope: bypass applies ONLY to this method (user-facing inbound
+    // messages → DEFAULT_SESSION_NAME). Scheduled-task containers on
+    // main run through `enqueueTask` and respect the cap normally —
+    // that path stays untouched, so the worst-case ceiling under
+    // bypass is `cap + 1` (one extra default-session container for
+    // main), not `cap + 2`. Maintenance work on main waits its turn.
+    //
+    // Cold-start race: before the orchestrator hydrates
+    // `registeredGroups` from SQLite on startup, the resolver returns
+    // false for *every* JID — main included. A message landing in the
+    // saturation window between service start and registry load will
+    // queue normally. This is fail-closed by design: better to delay
+    // a main message by ~1 second on boot than to bypass the cap on a
+    // JID we can't yet verify is actually main.
     const bypassCap = this.isMainGroup(groupJid);
     if (!bypassCap && this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingMessages = true;
@@ -159,11 +174,23 @@ export class GroupQueue {
     }
 
     if (bypassCap && this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+      // Snapshot the (groupJid, sessionName) pairs currently holding
+      // active slots so post-mortem you can tell *who* the bypass
+      // overran. Without this, the log only says "main bypassed" and
+      // you can't tell whether a runaway heartbeat was hogging slots
+      // or a legitimate burst was in flight.
+      const holders: Array<{ groupJid: string; sessionName: string }> = [];
+      for (const [holderJid, sessions] of this.groups) {
+        for (const [sessionName, st] of sessions) {
+          if (st.active) holders.push({ groupJid: holderJid, sessionName });
+        }
+      }
       logger.info(
         {
           groupJid,
           activeCount: this.activeCount,
           cap: MAX_CONCURRENT_CONTAINERS,
+          holders,
         },
         'Main group bypassing concurrency cap',
       );

@@ -102,6 +102,76 @@ describe('GroupQueue', () => {
     expect(processMessages).toHaveBeenCalledTimes(3);
   });
 
+  it('main DM bypasses the concurrency cap', async () => {
+    let activeCount = 0;
+    let maxActive = 0;
+    const completionCallbacks: Array<() => void> = [];
+    const seenGroups: string[] = [];
+
+    const processMessages = vi.fn(async (groupJid: string) => {
+      activeCount++;
+      maxActive = Math.max(maxActive, activeCount);
+      seenGroups.push(groupJid);
+      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+      activeCount--;
+      return true;
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+    // Treat tg:main as the main group; everything else is non-main.
+    queue.setIsMainGroupResolver((jid) => jid === 'tg:main');
+
+    // Saturate the cap (= 2) with two non-main groups.
+    queue.enqueueMessageCheck('group1@g.us');
+    queue.enqueueMessageCheck('group2@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(activeCount).toBe(2);
+
+    // Now send to main while the cap is fully held — it should run
+    // immediately and push activeCount above the cap.
+    queue.enqueueMessageCheck('tg:main');
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(maxActive).toBe(3);
+    expect(seenGroups).toContain('tg:main');
+    expect(processMessages).toHaveBeenCalledTimes(3);
+
+    // Non-main during saturation still queues — verify the bypass
+    // didn't accidentally lift the cap for everyone.
+    queue.enqueueMessageCheck('group3@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(processMessages).toHaveBeenCalledTimes(3);
+    expect(seenGroups).not.toContain('group3@g.us');
+  });
+
+  it('without resolver, main bypass is fail-closed (cold-start safety)', async () => {
+    // No setIsMainGroupResolver call — mimics the window between
+    // service start and registry hydration. The default resolver
+    // returns false for everything; even a "main" JID queues normally.
+    let activeCount = 0;
+    let maxActive = 0;
+    const completionCallbacks: Array<() => void> = [];
+
+    const processMessages = vi.fn(async (_groupJid: string) => {
+      activeCount++;
+      maxActive = Math.max(maxActive, activeCount);
+      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+      activeCount--;
+      return true;
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('group1@g.us');
+    queue.enqueueMessageCheck('group2@g.us');
+    queue.enqueueMessageCheck('tg:main'); // would-be main, but resolver missing
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Cap holds — main JID didn't get a free pass.
+    expect(maxActive).toBe(2);
+    expect(processMessages).toHaveBeenCalledTimes(2);
+  });
+
   // --- Tasks prioritized over messages ---
 
   it('drains tasks before messages for same group', async () => {
