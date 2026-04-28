@@ -75,10 +75,7 @@ export async function initObserver(
     );
   }
   observerEnabledFlag = true;
-  logger.info(
-    { jid: OBSERVER_CHAT_JID, isPrivate },
-    'Observer chat enabled',
-  );
+  logger.info({ jid: OBSERVER_CHAT_JID, isPrivate }, 'Observer chat enabled');
   armSelfTest();
 }
 
@@ -188,13 +185,24 @@ function startWatchdog(source: string): void {
         w.lastBlinkEmoji === BLINK_PAIR[0] ? BLINK_PAIR[1] : BLINK_PAIR[0];
       w.lastBlinkEmoji = next;
       updateReaction(source, next);
-      // Threshold pings — once each
+      // Threshold pings — once each. Restricted to the main chat:
+      // posting "Still working — 60s in" into a shared trusted /
+      // untrusted group is conversational noise for everyone *else*
+      // in the chat (the people who didn't ask the bot anything),
+      // and in untrusted contexts it also leaks "I'm grinding on
+      // your prompt" before the agent's bad-actor-disengage rule
+      // had a say. The blink reaction above stays for ALL chats
+      // (it's just a reaction on the user's own message — no
+      // broadcast surface). Threshold pings broadcast a new
+      // message, so they go only where conversation is owner-only.
       const nextThreshold = PING_AT_SECONDS[w.pingsSent];
       if (nextThreshold && elapsedSec >= nextThreshold) {
         w.pingsSent++;
         const chatJid = folderToChatJid(source);
         const msgId = chatJid ? latestUserMessage.get(chatJid) : undefined;
-        if (chatJid && msgId) {
+        const groups = registeredGroupsRef?.();
+        const isMainChat = chatJid && groups?.[chatJid]?.isMain === true;
+        if (chatJid && msgId && isMainChat) {
           const ch = chatChannel(chatJid);
           const state = states.get(source);
           const toolCount = state?.toolCalls.length ?? 0;
