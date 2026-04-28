@@ -15,6 +15,16 @@ jobs:
           cache: npm
       - run: npm ci
 
+      # Install agent-runner deps so its src/**/*.test.ts files (which
+      # vitest now picks up — see vitest.config.ts) can import their
+      # transitive deps (e.g. nodemailer for MIME encoding, @anthropic-ai
+      # SDK types). The agent-runner has its own package.json because
+      # it's also installed standalone inside the container image at
+      # build time; root doesn't carry those deps.
+      - name: Install agent-runner deps
+        run: npm ci
+        working-directory: container/agent-runner
+
       - name: Format check
         run: npm run format:check
 
