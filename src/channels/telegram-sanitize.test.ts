@@ -223,3 +223,61 @@ describe('sanitizeTelegramHtml — contract with parseTextStyles', () => {
     expect(sanitizeTelegramHtml('say *foo* now')).toBe('say <i>foo</i> now');
   });
 });
+
+// --- Phase 1b allowlist: unknown / disallowed tags get HTML-escaped
+//     so Telegram doesn't 400 the entire send. Allowed tags still pass
+//     through verbatim (the existing behavior). The tag-name regex
+//     accepts underscores so framework-internal markers like
+//     `<tool_use_error>` (HTML-spec-illegal but agent-emitted) match.
+describe('sanitizeTelegramHtml — unknown tag escape (Phase 1b allowlist)', () => {
+  it('agent-internal <tool_use_error> is escaped, not passed through', () => {
+    const input = '⚠️ <tool_use_error>Blocked: sleep 30</tool_use_error> end';
+    expect(sanitizeTelegramHtml(input)).toBe(
+      '⚠️ &lt;tool_use_error&gt;Blocked: sleep 30&lt;/tool_use_error&gt; end',
+    );
+  });
+
+  it('JSON-shaped <deliveryScheduleId> is escaped', () => {
+    const input = '<deliveryScheduleId>abc123</deliveryScheduleId>';
+    expect(sanitizeTelegramHtml(input)).toBe(
+      '&lt;deliveryScheduleId&gt;abc123&lt;/deliveryScheduleId&gt;',
+    );
+  });
+
+  it('allowed <b> passes through verbatim alongside escaped unknown tag', () => {
+    const input = '<b>real bold</b> and <unknown_tag>fake</unknown_tag>';
+    expect(sanitizeTelegramHtml(input)).toBe(
+      '<b>real bold</b> and &lt;unknown_tag&gt;fake&lt;/unknown_tag&gt;',
+    );
+  });
+
+  it('underscored tag name (HTML-spec-illegal but agent-emitted) is escaped', () => {
+    expect(sanitizeTelegramHtml('<some_field>x</some_field>')).toBe(
+      '&lt;some_field&gt;x&lt;/some_field&gt;',
+    );
+  });
+
+  it('self-closing unknown tag is escaped', () => {
+    expect(sanitizeTelegramHtml('before <foo/> after')).toBe(
+      'before &lt;foo/&gt; after',
+    );
+  });
+
+  it('attribute-bearing unknown tag is escaped', () => {
+    expect(sanitizeTelegramHtml('<foo bar="x">y</foo>')).toBe(
+      '&lt;foo bar=&quot;x&quot;&gt;y&lt;/foo&gt;',
+    );
+  });
+
+  it('mixed-case allowed tag passes through (case-insensitive allowlist)', () => {
+    const input = '<B>bold</B>';
+    expect(sanitizeTelegramHtml(input)).toBe(input);
+  });
+
+  it('unknown tag inside fenced code block is preserved verbatim, not escaped', () => {
+    const input = '```\n<tool_use_error>blocked</tool_use_error>\n```';
+    expect(sanitizeTelegramHtml(input)).toBe(
+      '<pre>&lt;tool_use_error&gt;blocked&lt;/tool_use_error&gt;</pre>',
+    );
+  });
+});

@@ -54,6 +54,33 @@ const PROTECTED_SPAN_TAGS = [
   'tg-spoiler',
 ];
 
+/**
+ * Telegram's allowed HTML tags for `parse_mode=HTML`. Bot API 7.x.
+ * Anything outside this set causes Telegram to return 400 Bad Request
+ * — agent output that contains JSON blobs (`<deliveryScheduleId>`),
+ * partial XML, or framework-internal markers like `<tool_use_error>`
+ * causes production sends to fail. Phase 1b uses this to gate which
+ * stray tags pass through verbatim vs. get HTML-entity-escaped.
+ */
+const TELEGRAM_ALLOWED_TAGS = new Set<string>([
+  'b',
+  'strong',
+  'i',
+  'em',
+  'u',
+  'ins',
+  's',
+  'strike',
+  'del',
+  'code',
+  'pre',
+  'a',
+  'blockquote',
+  'tg-spoiler',
+  'span',
+  'tg-emoji',
+]);
+
 export function sanitizeTelegramHtml(text: string): string {
   if (!text) return text;
 
@@ -86,10 +113,28 @@ export function sanitizeTelegramHtml(text: string): string {
     out = out.replace(re, protect);
   }
 
-  // Phase 1b: protect stray tag tokens (self-closing, mismatched, or tags
-  // we don't recognise as span-ful). This keeps any remaining raw HTML from
-  // being touched, even if we can't pair it.
-  out = out.replace(/<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^>]*)?\s*\/?>/g, protect);
+  // Phase 1b: handle stray tag tokens (self-closing, mismatched, or tags
+  // we don't recognise as span-ful). If the tag is on Telegram's
+  // allowlist, protect it (pass through verbatim). If it's NOT, escape
+  // the angle brackets so `<foo>` becomes `&lt;foo&gt;` — Telegram will
+  // render it as literal text instead of rejecting the whole message.
+  // This catches JSON-dump leakage like `<deliveryScheduleId>`, partial
+  // XML, agent-tool markers like `<tool_use_error>`, etc.
+  //
+  // Tag-name character class includes `_` because Claude/agentic
+  // frameworks emit underscored tags (`<tool_use_error>`,
+  // `<delivery_id>`) frequently. HTML spec disallows underscores in tag
+  // names but Telegram still rejects them with 400 if unescaped, so
+  // they need the same treatment as any other unknown tag.
+  out = out.replace(
+    /<(\/?)([a-zA-Z][a-zA-Z0-9_-]*)((?:\s[^>]*)?)\s*(\/?)>/g,
+    (match, _close: string, name: string) => {
+      if (TELEGRAM_ALLOWED_TAGS.has(name.toLowerCase())) {
+        return protect(match);
+      }
+      return htmlEscape(match);
+    },
+  );
 
   // Phase 1c: protect URLs and email addresses so their underscores/dots
   // don't get mistaken for Markdown formatting.
