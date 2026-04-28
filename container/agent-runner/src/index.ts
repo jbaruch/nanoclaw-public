@@ -95,6 +95,31 @@ const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
 /**
+ * Did the latest assistant turn consist of only thinking blocks and
+ * end with `stop_reason: end_turn`? That's the SDK-internal "model
+ * decided to say nothing" pseudo-turn — recording its uuid as the
+ * resume point makes the next query land on a turn the API can't
+ * continue from, and the session locks up ("stuck-session").
+ *
+ * Pure function of `(stopReason, blockTypes)` — no side effects,
+ * tested directly in src/index.thinking-only.test.ts.
+ *
+ * The `length > 0` clause matters: a turn with NO content blocks
+ * (occasional SDK shape during certain error paths) is not the
+ * pseudo-turn we're targeting and should NOT trigger fallback.
+ */
+export function isThinkingOnlyEndTurn(
+  stopReason: string | undefined,
+  blockTypes: readonly string[],
+): boolean {
+  return (
+    stopReason === 'end_turn' &&
+    blockTypes.length > 0 &&
+    blockTypes.every((t) => t === 'thinking' || t === 'redacted_thinking')
+  );
+}
+
+/**
  * Effort levels the SDK's `query()` accepts (as of
  * `@anthropic-ai/claude-agent-sdk` 0.2.112). Kept here as a runtime
  * whitelist so a typo in `AGENT_EFFORT` doesn't propagate to the API
@@ -791,6 +816,14 @@ async function runQuery(
       message.type === 'system'
         ? `system/${(message as { subtype?: string }).subtype}`
         : message.type;
+    // LOG-FORMAT CONTRACT: the `[msg #N] ...` lines emitted from this
+    // loop and the `Query input: ...` / `Query done. ...` lines around
+    // it are the parsing surface for the optional observer module
+    // (src/observer.ts on the host). Don't change the prefix shape,
+    // field separators, or key names without updating the regexes
+    // there in the same change. New keys may be appended at the end
+    // of a line; renames or reorderings are breaking changes for the
+    // observer's parsers.
     log(`[msg #${messageCount}] type=${msgType}`);
 
     if (message.type === 'assistant' && 'uuid' in message) {
@@ -993,18 +1026,34 @@ async function runQuery(
   // Now that the turn has fully landed, finalize the resume point. If the
   // latest assistant turn was thinking-only + end_turn (a pseudo-turn the
   // API can't continue from), fall back to the previous substantive turn.
+  // Cascade-safety: if the *previous* turn was also thinking-only, falling
+  // back to it would just slip into another bad resume point. In that case
+  // we leave lastAssistantUuid undefined so the outer loop starts fresh
+  // (no resume) rather than chase a bad chain.
   if (currentAssistant) {
-    const isThinkingOnlyEndTurn =
-      currentAssistant.stopReason === 'end_turn' &&
-      currentAssistant.blockTypes.length > 0 &&
-      currentAssistant.blockTypes.every(
-        (t) => t === 'thinking' || t === 'redacted_thinking',
-      );
-    if (isThinkingOnlyEndTurn) {
-      log(
-        `Skipping promotion of thinking-only end_turn turn (uuid=${currentAssistant.uuid}) — using previous ${previousAssistant?.uuid || 'none'} as resume point`,
-      );
-      lastAssistantUuid = previousAssistant?.uuid;
+    if (
+      isThinkingOnlyEndTurn(
+        currentAssistant.stopReason,
+        currentAssistant.blockTypes,
+      )
+    ) {
+      const prevAlsoBad =
+        previousAssistant !== undefined &&
+        isThinkingOnlyEndTurn(
+          previousAssistant.stopReason,
+          previousAssistant.blockTypes,
+        );
+      if (prevAlsoBad || !previousAssistant) {
+        log(
+          `Skipping thinking-only end_turn (uuid=${currentAssistant.uuid}); previous turn ${previousAssistant ? `also thinking-only (uuid=${previousAssistant.uuid})` : 'absent'} — clearing resume point so next query starts fresh`,
+        );
+        lastAssistantUuid = undefined;
+      } else {
+        log(
+          `Skipping thinking-only end_turn (uuid=${currentAssistant.uuid}) — using previous ${previousAssistant.uuid} as resume point`,
+        );
+        lastAssistantUuid = previousAssistant.uuid;
+      }
     } else {
       lastAssistantUuid = currentAssistant.uuid;
     }
@@ -1020,6 +1069,15 @@ async function runQuery(
   // any progress (zero tokens, no new assistant uuid). The outer loop uses
   // this to clear resumeAt before retrying, avoiding an infinite loop on a
   // bad resume point.
+  //
+  // `messageCount <= 2` bounds the detection to the very early SDK
+  // message stream — typically `system/init` plus an immediate error
+  // result before any assistant turn lands. A larger count means the
+  // model started producing output (assistant chunks, tool_use, etc.)
+  // and a later failure isn't a bad-resume issue. If the SDK's message
+  // shape ever changes the early-error sequence, this constant needs
+  // to move with it — encoded as a comment because there's no shared
+  // SDK constant to reference.
   const erroredWithoutProgress =
     !lastAssistantUuid && totalOutputTokens === 0 && messageCount <= 2;
   log(
@@ -1321,6 +1379,16 @@ async function main(): Promise<void> {
         resumeAt = undefined;
         recoveredThisTurn = true;
         continue; // skip the IPC wait — retry the same query immediately
+      }
+      // Retry-also-failed path. Loud error so a runaway pattern in
+      // production is detectable in logs / observer rather than silently
+      // falling through to "wait for next IPC message". `recoveredThisTurn`
+      // gates the retry attempt; if we're past it AND still seeing
+      // erroredWithoutProgress, neither resume nor cleared-resume worked.
+      if (queryResult.erroredWithoutProgress && recoveredThisTurn) {
+        log(
+          `Recovery exhausted: retried this turn with cleared resumeAt and still got no progress. Falling through to IPC wait. If this fires repeatedly the SDK is likely failing for a non-resume reason (rate limit, auth, network).`,
+        );
       }
 
       // If _close was consumed during the query, exit immediately.
