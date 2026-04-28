@@ -201,10 +201,40 @@ export function buildSecretEnvFile(
  */
 // Operators can override at deploy time without editing source — handy for
 // running a fork on a cheaper model (Sonnet) without forking just to change
-// this one constant. If unset, the default below is what jbaruch's main runs
-// against and what the runner is tuned for. AGENT_EFFORT (alongside this) is
-// already env-overridable in the agent-runner via VALID_AGENT_EFFORTS.
-const AGENT_MODEL = process.env.AGENT_MODEL || 'claude-opus-4-7[1m]';
+// this one constant. If unset, the default below is what the upstream
+// runner is tuned for. AGENT_EFFORT (alongside this) is already env-
+// overridable in the agent-runner via VALID_AGENT_EFFORTS.
+//
+// The `[1m]` suffix on the default model selects the 1M-token extended-
+// context tier. Long conversations and large per-turn payloads (transcript
+// archives, multi-message digests) rely on it; if you override AGENT_MODEL
+// to a different model that supports extended context, include `[1m]` to
+// match. Models without the suffix run the standard context window and
+// will surface as truncation / earlier compaction in long sessions.
+//
+// Light validation: trim whitespace (so `AGENT_MODEL="  "` falls back to
+// the default rather than passing two spaces to the SDK) and warn on
+// values that don't look like a Claude model ID. We don't enumerate a
+// whitelist because the SDK accepts both aliases (`opus`, `sonnet[1m]`)
+// and full IDs (`claude-opus-4-7[1m]`), the set churns with each model
+// release, and a missed model would block legit upgrades. The warn
+// surfaces typos at startup instead of at first `query()` call deep in
+// runtime — a typo like `claud-opus-4-7` is operator-error territory but
+// cheap to flag.
+const KNOWN_MODEL_PREFIX_RE = /^(claude|opus|sonnet|haiku)/i;
+function resolveAgentModel(raw: string | undefined): string {
+  const fallback = 'claude-opus-4-7[1m]';
+  const trimmed = raw?.trim();
+  if (!trimmed) return fallback;
+  if (!KNOWN_MODEL_PREFIX_RE.test(trimmed)) {
+    logger.warn(
+      { agentModel: trimmed, fallback },
+      'AGENT_MODEL does not look like a Claude model ID — will pass to SDK as-is, but check for a typo. Expected forms: full ID like "claude-opus-4-7[1m]" or alias like "opus" / "sonnet[1m]".',
+    );
+  }
+  return trimmed;
+}
+const AGENT_MODEL = resolveAgentModel(process.env.AGENT_MODEL);
 
 /**
  * Effort level the agent-runner passes to the SDK's `query()` call.
