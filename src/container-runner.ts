@@ -258,6 +258,36 @@ export function createFilteredDb(
       `CREATE TABLE messages AS SELECT * FROM src.messages WHERE chat_jid = '${chatJid.replace(/'/g, "''")}'`,
     );
     dst.exec('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)');
+    // Reactions scoped to this chat only. check-unanswered.py joins on this
+    // table to skip messages the bot already 👀-reacted to; without it, the
+    // join hits "no such table: reactions" and the whole script aborts.
+    // Created unconditionally so untrusted containers don't depend on
+    // whether the host happens to have any reactions yet — even an empty
+    // table satisfies the join. CTAS can't run if src.reactions doesn't
+    // exist (fresh install before migrations), so fall back to an empty
+    // table with the known schema in that case.
+    try {
+      dst.exec(`
+        CREATE TABLE reactions AS
+          SELECT r.* FROM src.reactions r
+          WHERE r.message_chat_jid = '${chatJid.replace(/'/g, "''")}'
+      `);
+    } catch {
+      dst.exec(`
+        CREATE TABLE reactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id TEXT NOT NULL,
+          message_chat_jid TEXT NOT NULL,
+          reactor_jid TEXT NOT NULL,
+          reactor_name TEXT NOT NULL,
+          emoji TEXT NOT NULL,
+          timestamp TEXT NOT NULL
+        )
+      `);
+    }
+    dst.exec(
+      'CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid)',
+    );
     dst.exec('DETACH src');
   } finally {
     dst.close();
@@ -1107,6 +1137,24 @@ export function buildVolumeMounts(
   const isTrustedIpc = isMain || !!group.containerConfig?.trusted;
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(sessionInputDir, { recursive: true });
+
+  // Wipe stale sentinel files from previous container lifecycles. A `_close`
+  // left over from a graceful shutdown will be consumed by a fresh
+  // container's first IPC poll and end its input stream prematurely — the
+  // SDK still finishes the in-flight prompt, but the container exits
+  // immediately after, so the next user message takes the cost of a fresh
+  // spawn. Clean here, where we know we're about to start a new container.
+  const staleClose = path.join(sessionInputDir, '_close');
+  if (fs.existsSync(staleClose)) {
+    try {
+      fs.unlinkSync(staleClose);
+    } catch (err) {
+      logger.warn(
+        { folder: group.folder, sessionName, err },
+        'Failed to clear stale _close sentinel before container spawn',
+      );
+    }
+  }
   if (isTrustedIpc) {
     fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   }
