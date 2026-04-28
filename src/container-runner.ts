@@ -295,6 +295,15 @@ export function createFilteredDb(
 
   // Use ATTACH to copy schema-agnostically — picks up new columns automatically
   const dst = new Database(filteredPath);
+  // busy_timeout must be set on every connection — it is a per-connection
+  // setting, not a database-level property. Without it the ATTACH + CTAS
+  // reads below would return SQLITE_BUSY immediately if the orchestrator is
+  // mid-write, which can cause a transient "malformed image" failure.
+  // journal_mode and synchronous are already WAL-persistent for the src DB;
+  // we set them on dst too so the filtered copy is also WAL from birth.
+  dst.pragma('journal_mode = WAL');
+  dst.pragma('synchronous = NORMAL');
+  dst.pragma('busy_timeout = 5000');
   try {
     dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
     dst.exec(

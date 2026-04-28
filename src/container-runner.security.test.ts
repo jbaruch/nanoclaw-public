@@ -201,6 +201,29 @@ describe('createFilteredDb (untrusted DB isolation)', () => {
       db.close();
     }
   });
+  // Regression guard for #13 — busy_timeout must be set on the filtered DB
+  // connection (per-connection setting, not persisted like journal_mode). Without
+  // it the ATTACH + CTAS reads in createFilteredDb return SQLITE_BUSY immediately
+  // if the orchestrator is mid-write, which can surface a false "malformed image".
+  it('filtered DB has WAL journal mode and busy_timeout set', () => {
+    seedMessagesDb();
+    const filtered = createFilteredDb('chatA@g.us', 'folder-wal-check');
+    expect(filtered).not.toBe(null);
+    const db = new Database(filtered!);
+    try {
+      const journalMode = (
+        db.pragma('journal_mode') as Array<{ journal_mode: string }>
+      )[0].journal_mode;
+      expect(journalMode).toBe('wal');
+
+      const busyTimeout = (
+        db.pragma('busy_timeout') as Array<{ timeout: number }>
+      )[0].timeout;
+      expect(busyTimeout).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
 });
 
 // -----------------------------------------------------------------------------
