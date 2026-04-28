@@ -19,6 +19,17 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
   . "$NVM_DIR/nvm.sh"
 fi
 
+# gh is required for the PR-based promote flow. Fail fast with a
+# clear install pointer rather than hitting a cryptic "gh: command
+# not found" deep inside the script after we've already cloned the
+# tile repo.
+if ! command -v gh >/dev/null; then
+  echo "ERROR: promote flow requires the GitHub CLI (gh)." >&2
+  echo "Install: https://cli.github.com/manual/installation" >&2
+  echo "In the orchestrator container image, add gh to Dockerfile.orchestrator." >&2
+  exit 1
+fi
+
 STAGING_DIR="${1:?staging directory required}"
 TILE_NAME="${2:?tile name required}"
 MODE="${3:-all}"
@@ -33,124 +44,26 @@ RULES_SRC="$STAGING_DIR/rules"
 # Cross-tile duplicate check: look at registry-installed tiles
 TESSL_TILES_DIR="${TESSL_TILES_DIR:-}"
 
-# Read a single frontmatter field from a SKILL.md. Returns the normalised
-# value on stdout (or empty if unset or no frontmatter block). Frontmatter
-# is the block between the first two `---` markers at the top of the file.
-#
-# Robust against common YAML-ish variants:
-# - `field: true`   (space after colon)
-# - `field:true`    (no space after colon)
-# - `field: true  ` (trailing whitespace)
-# - `field: true # comment` (inline comment stripped)
-# - `field: "true"` / `field: 'true'` (surrounding quotes stripped)
-#
-# Silent-fail would be dangerous here — an author who writes `skip-optimize:true`
-# thinking the flag is set and then sees their skill still being auto-trimmed
-# has no way to diagnose the mismatch. Normalise defensively.
-read_frontmatter_field() {
-  local file="$1"
-  local field="$2"
-  # Match is buffered and only emitted if we saw both opening AND closing
-  # `---` markers. Without the closing check, a malformed SKILL.md that
-  # opens with `---` but never closes it would let body-level `field:`
-  # occurrences be parsed as frontmatter — which would let an attacker
-  # smuggle `placement-admin-content-ok: true` into the body and bypass
-  # validation.
-  awk -v f="$field" '
-    NR == 1 && $0 != "---" { exit }
-    NR == 1 { in_fm = 1; next }
-    in_fm && $0 == "---" { closed = 1; exit }
-    in_fm && !found {
-      prefix_re = "^[[:space:]]*" f "[[:space:]]*:"
-      if ($0 !~ prefix_re) next
-      line = $0
-      sub(prefix_re, "", line)
-      sub("^[[:space:]]+", "", line)   # strip leading ws after colon
-      # Value begins with `#` after trimming — the entire line after the
-      # colon is a comment, so the field has no value.
-      if (substr(line, 1, 1) == "#") { matched = ""; found = 1; next }
-      # Quoted values must be parsed BEFORE stripping `#` comments, because
-      # in YAML `#` inside quotes is literal, not a comment.
-      if (length(line) >= 2) {
-        first = substr(line, 1, 1)
-        if (first == "\"" || first == "\047") {
-          # Find the rightmost matching quote (naive — does not handle
-          # escaped quotes, but frontmatter boolean flags never need that).
-          rest = substr(line, 2)
-          for (i = length(rest); i >= 1; i--) {
-            if (substr(rest, i, 1) == first) {
-              matched = substr(rest, 1, i - 1)
-              found = 1
-              next
-            }
-          }
-          # No closing quote — fall through to unquoted handling.
-        }
-      }
-      # Unquoted value: strip `#` comments (must be preceded by whitespace,
-      # per YAML), then strip trailing whitespace.
-      sub("[[:space:]]+#.*$", "", line)
-      sub("[[:space:]]+$", "", line)
-      matched = line
-      found = 1
-    }
-    END {
-      if (closed && found) print matched
-    }
-  ' "$file"
-}
-
-# --- Tile placement validation ---
-validate_placement() {
-  local skill_file="$1"
-  local tile="$2"
-  local canonical="$3"
-
-  if [ "$tile" = "nanoclaw-admin" ]; then return 0; fi
-
-  # Explicit opt-in bypass for skills that legitimately document admin-level
-  # names as reference content (e.g. scrub-list entries in `ship-code`).
-  # Scope: this flag ONLY skips the admin-content regex checks — tile-
-  # specific structural rules (like nanoclaw-core's trusted-workspace
-  # reference block) still apply. The admin-content regex can't distinguish
-  # "uses these handlers" from "warns you to scrub these handlers"; the
-  # flag is the author's assertion that the mentions are intentional
-  # reference material. Auditable — `grep -r 'placement-admin-content-ok: true' tiles/`
-  # lists every skill that opts out.
-  local skip_admin_regex=false
-  if [ "$(read_frontmatter_field "$skill_file" 'placement-admin-content-ok')" = "true" ]; then
-    echo "  placement check: admin-content regex bypassed by frontmatter flag for $canonical"
-    skip_admin_regex=true
-  fi
-
-  if [ "$tile" = "nanoclaw-untrusted" ]; then
-    if ! $skip_admin_regex && grep -qiE 'composio|gmail|calendar|tasks|schedule_task|promote|host_script' "$skill_file" 2>/dev/null; then
-      echo "BLOCKED: $canonical has admin-level content but target is $tile"
-      return 1
-    fi
-    return 0
-  fi
-
-  if ! $skip_admin_regex && grep -qiE 'composio|gmail|googlecalendar|googletasks|promote_staging|github_backup|register_group' "$skill_file" 2>/dev/null; then
-    echo "BLOCKED: $canonical has admin-level content but target is $tile"
-    return 1
-  fi
-
-  # nanoclaw-core's trusted-workspace check runs regardless of the
-  # admin-content bypass — these are orthogonal concerns.
-  if [ "$tile" = "nanoclaw-core" ]; then
-    if grep -qiE '/workspace/trusted/|trusted.memory|cross.group' "$skill_file" 2>/dev/null; then
-      echo "BLOCKED: $canonical references trusted workspace but target is core"
-      return 1
-    fi
-  fi
-
-  return 0
-}
+# Shared frontmatter + placement helpers. Kept in a separate file so the
+# fixup-pushing script (push-staged-to-branch.sh) applies the same
+# placement rules as a fresh promote — if they diverged, Copilot review
+# comments could get re-pushed into the wrong tile.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./tile-repo-lib.sh
+source "$SCRIPT_DIR/tile-repo-lib.sh"
 
 # --- Clone tile repo ---
 TILE_REPO_URL="https://x-access-token:${TOKEN}@github.com/${TILE_OWNER}/${TILE_NAME}.git"
 TILE_REPO_DIR="/tmp/promote-${TILE_NAME}-$$"
+
+# Clean up the temp clone on any exit path — success, failure, or
+# partial-success mid-flow (e.g. PR created but Copilot summon
+# failed). Without this, orphan /tmp/promote-*/ dirs pile up on the
+# orchestrator. `-rf` is intentional: the dir is ours, single-purpose.
+cleanup_temp() {
+  rm -rf "$TILE_REPO_DIR"
+}
+trap cleanup_temp EXIT
 
 echo "Cloning ${TILE_OWNER}/${TILE_NAME}..."
 rm -rf "$TILE_REPO_DIR"
@@ -163,7 +76,11 @@ PROMOTED_SKILLS=""
 # --- Pull skills into clone ---
 if [ "$MODE" != "--rules-only" ]; then
   if [ "$MODE" = "all" ]; then
-    SKILLS=$(ls "$SKILLS_SRC" 2>/dev/null || true)
+    if [ -d "$SKILLS_SRC" ]; then
+      SKILLS=$(ls "$SKILLS_SRC")
+    else
+      SKILLS=""
+    fi
   else
     SKILLS="$MODE"
   fi
@@ -176,10 +93,35 @@ if [ "$MODE" != "--rules-only" ]; then
 
     canonical="${skill_dir#tessl__}"
 
-    if ! validate_placement "$src/SKILL.md" "$TILE_NAME" "$canonical"; then
-      BLOCKED=$((BLOCKED + 1))
-      continue
-    fi
+    # Guard (mirrors push-staged-to-branch.sh): restrict canonical to
+    # `[A-Za-z0-9][A-Za-z0-9_-]*` — same character set tessl tile/skill
+    # names actually use. Rejects empty (flat cp clobbers siblings),
+    # `.`/`..` (escape out of skills/), `/` (arbitrary subpath), and
+    # leading `-` (argv confusion with flags). The push script's `rm
+    # -rf` makes this load-bearing; the promote script's `cp` has the
+    # same footgun without a delete so we reject up front in both.
+    case "$canonical" in
+      ''|'.'|'..'|*/*|*[!A-Za-z0-9_-]*|[!A-Za-z0-9]*)
+        echo "ERROR: refusing to operate on unsafe canonical '$canonical' (from staging dir '$skill_dir'). Expected [A-Za-z0-9][A-Za-z0-9_-]*." >&2
+        exit 2
+        ;;
+    esac
+
+    # Distinguish policy block (rc 1 → BLOCKED, continue) from hard failure
+    # (rc ≥ 2 → grep read error, unreadable SKILL.md, etc. → abort). The
+    # naive `if ! validate_placement ...` pattern collapses both into
+    # "continue", which would silently skip a skill whose file we can't
+    # read instead of failing the promote loudly.
+    validate_rc=0
+    validate_placement "$src/SKILL.md" "$TILE_NAME" "$canonical" || validate_rc=$?
+    case $validate_rc in
+      0) ;;
+      1) BLOCKED=$((BLOCKED + 1)); continue ;;
+      *)
+        echo "ERROR: validate_placement returned rc=$validate_rc for $canonical — aborting" >&2
+        exit "$validate_rc"
+        ;;
+    esac
 
     # Cross-tile duplicate check
     if [ -n "$TESSL_TILES_DIR" ]; then
@@ -200,21 +142,24 @@ if [ "$MODE" != "--rules-only" ]; then
     echo "pulled: $canonical"
     PROMOTED_SKILLS="$PROMOTED_SKILLS $canonical"
 
-    # Update tile.json (add entry if new)
-    python3 -c "
+    # Update tile.json (add entry if new). Values pass through argv to
+    # Python — never interpolate skill names into the script body (a
+    # directory with a quote would break the snippet or enable injection).
+    python3 - "$TILE_REPO_DIR/tile.json" "$canonical" <<'PY'
 import json, sys
-with open('$TILE_REPO_DIR/tile.json') as f:
+tile_path, canonical = sys.argv[1], sys.argv[2]
+with open(tile_path) as f:
     tile = json.load(f)
 skills = tile.setdefault('skills', {})
-if '$canonical' not in skills:
-    skills['$canonical'] = {'path': 'skills/$canonical/SKILL.md'}
-    print('  added: $canonical')
+if canonical not in skills:
+    skills[canonical] = {'path': f'skills/{canonical}/SKILL.md'}
+    print(f'  added: {canonical}')
 else:
-    print('  exists: $canonical')
-with open('$TILE_REPO_DIR/tile.json', 'w') as f:
+    print(f'  exists: {canonical}')
+with open(tile_path, 'w') as f:
     json.dump(tile, f, indent=2)
     f.write('\n')
-"
+PY
     PROMOTED=$((PROMOTED + 1))
   done
 fi
@@ -229,20 +174,21 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "--rules-only" ]; then
       cp "$rule_file" "$TILE_REPO_DIR/rules/$name.md"
       echo "pulled rule: $name"
 
-      python3 -c "
-import json
-with open('$TILE_REPO_DIR/tile.json') as f:
+      python3 - "$TILE_REPO_DIR/tile.json" "$name" <<'PY'
+import json, sys
+tile_path, name = sys.argv[1], sys.argv[2]
+with open(tile_path) as f:
     tile = json.load(f)
 rules = tile.setdefault('rules', {})
-if '$name' not in rules:
-    rules['$name'] = {'rules': 'rules/$name.md'}
-    print('  added: $name')
+if name not in rules:
+    rules[name] = {'rules': f'rules/{name}.md'}
+    print(f'  added: {name}')
 else:
-    print('  exists: $name')
-with open('$TILE_REPO_DIR/tile.json', 'w') as f:
+    print(f'  exists: {name}')
+with open(tile_path, 'w') as f:
     json.dump(tile, f, indent=2)
     f.write('\n')
-"
+PY
       PROMOTED=$((PROMOTED + 1))
     done
   fi
@@ -255,42 +201,129 @@ fi
 
 if [ "$PROMOTED" -eq 0 ]; then
   echo "Nothing to promote."
-  rm -rf "$TILE_REPO_DIR"
   exit 0
 fi
 
-# --- Skill review + optimize (shift-left: fix before CI) ---
-# Skills can opt out of the auto-optimize pass with `skip-optimize: true` in
-# frontmatter — useful when the skill is intentionally verbose (concrete
-# examples, step-by-step narration) and auto-trimming would lose meaning.
-# The review itself still runs remotely via GHA; this flag only skips the
-# local auto-apply.
-if [ -n "$PROMOTED_SKILLS" ] && command -v tessl >/dev/null 2>&1; then
+# --- Local skill review (read-only; never mutates content) ---
+# Runs `tessl skill review` on each promoted skill before opening the
+# PR. Reports the score so an obviously-broken skill surfaces locally
+# instead of waiting for the post-merge GHA gate at threshold 85.
+#
+# `--optimize` is intentionally NOT used here. Observed 2026-04-27 on
+# nanoclaw-admin#64 (closed): `--optimize --yes` rewrote check-cfps's
+# SKILL.md from 212 → 126 lines, dropped its score 85% → 65%, and
+# removed substantive content the agent author had deliberately kept.
+# We are promoting the *agent's authored content*; rewriting it in
+# transit defeats that contract. If a skill needs prose tightening,
+# do it in source (NAS staging or container side) where the change is
+# visible, reviewable, and survives the next promote.
+#
+# tessl may not be installed in every execution context. Fall back
+# with a warning instead of blocking — Copilot on the PR + GHA at
+# merge time are the actual gates.
+if command -v tessl >/dev/null 2>&1; then
   for skill_name in $PROMOTED_SKILLS; do
-    skill_md="$TILE_REPO_DIR/skills/$skill_name/SKILL.md"
-    if [ "$(read_frontmatter_field "$skill_md" 'skip-optimize')" = "true" ]; then
-      echo "skipping optimize: $skill_name (frontmatter flag)"
-      continue
-    fi
     echo "reviewing: $skill_name"
-    tessl skill review --optimize --yes "$TILE_REPO_DIR/skills/$skill_name"
+    tessl skill review "$TILE_REPO_DIR/skills/$skill_name"
   done
-elif [ -n "$PROMOTED_SKILLS" ]; then
-  echo "WARN: tessl not found, skipping local skill review"
+else
+  echo "WARN: tessl not found, skipping local skill review (Copilot + GHA will review)"
 fi
 
-# --- Commit and push ---
+# --- Commit, push branch, open PR, request Copilot review ---
 cd "$TILE_REPO_DIR"
 git config user.email "nanoclaw@bot.local"
 git config user.name "$ASSISTANT_NAME"
 git add -A
 if git diff --cached --quiet; then
   echo "Tile repo already up to date."
-else
-  git commit -m "feat: promote $PROMOTED item(s) from $ASSISTANT_NAME staging"
-  git push origin main
-  echo "Pushed to ${TILE_OWNER}/${TILE_NAME} — GHA will review, lint, and publish."
+  echo "Done! $PROMOTED promoted, $BLOCKED blocked."
+  exit 0
 fi
 
-rm -rf "$TILE_REPO_DIR"
+# Branch named with UTC timestamp + tile + 4-hex-char random suffix so
+# two promotes targeting the same tile within the same second can't
+# collide at `git checkout -b` / `git push`. Short enough to scan in
+# the GitHub UI.
+BRANCH="promote/$(date -u +%Y%m%dT%H%M%SZ)-${TILE_NAME}-$(printf '%04x' $((RANDOM * RANDOM & 0xffff)))"
+git checkout -b "$BRANCH"
+COMMIT_MSG="feat: promote $PROMOTED item(s) from $ASSISTANT_NAME staging"
+git commit -m "$COMMIT_MSG"
+
+# Push branch. `--` before the refspec guards against a pathological
+# branch name starting with `-` getting reparsed as a git-push option.
+# Not currently possible because BRANCH is constructed above, but future
+# refactors should inherit the safety without thinking.
+git push -u origin -- "$BRANCH"
+
+# Print the branch name on its own line so the agent can parse it out of
+# stdout and feed it back to the `push_staged_to_branch` MCP tool for
+# fixup commits.
+echo "Branch: $BRANCH"
+
+PR_BODY="Promoted by nanoclaw's promote-to-tile-repo.sh. $PROMOTED item(s) staged by $ASSISTANT_NAME.
+
+## Review gate
+Copilot review requested below. Merge after the review is clean and any findings are addressed. GHA (tessl publish, lint) runs at merge time on main.
+
+## Iteration
+Fixups land on THIS branch via the \`push_staged_to_branch\` MCP tool: read PR comments → fix in staging → call the tool with branch \`$BRANCH\`. Restage-and-re-promote is the fallback; it opens a new PR."
+
+# --repo pinned explicitly per repo-chain.md: gh otherwise defaults to
+# the upstream fork in some environments and would leak tile updates
+# to the wrong repo.
+GH_TOKEN="$TOKEN" gh pr create \
+  --repo "$TILE_OWNER/$TILE_NAME" \
+  --base main \
+  --head "$BRANCH" \
+  --title "$COMMIT_MSG" \
+  --body "$PR_BODY" \
+  >/dev/null
+
+# Look up URL + number via structured JSON rather than parsing `gh pr
+# create`'s stdout. The create command prints a bare URL today, but if
+# its human-output format ever drifts (extra status lines, color codes,
+# whatever) the previous `${PR_URL##*/}` parse would quietly break and
+# we'd silently skip the Copilot summon. Querying by head ref via gh's
+# own --jq is stable and needs no external parser (no jq binary in the
+# orchestrator image).
+#
+# Retry for GitHub's eventual consistency between `gh pr create`
+# completing and `gh pr list --head` reflecting it — usually instant,
+# but we've observed ~5s lags. jq's `// ""` turns an empty array into
+# an empty string, so the `-z` check is a single condition.
+PR_URL=""
+for _ in 1 2 3 4 5; do
+  PR_URL=$(GH_TOKEN="$TOKEN" gh pr list \
+    --repo "$TILE_OWNER/$TILE_NAME" \
+    --head "$BRANCH" \
+    --state open \
+    --json url \
+    --jq '.[0].url // ""')
+  [ -n "$PR_URL" ] && break
+  sleep 2
+done
+if [ -z "$PR_URL" ]; then
+  echo "ERROR: branch $BRANCH was pushed but no matching open PR is visible on $TILE_OWNER/$TILE_NAME after 5 retries." >&2
+  echo "Check https://github.com/$TILE_OWNER/$TILE_NAME/pulls and open/summon manually." >&2
+  exit 1
+fi
+PR_NUMBER=$(GH_TOKEN="$TOKEN" gh pr list \
+  --repo "$TILE_OWNER/$TILE_NAME" \
+  --head "$BRANCH" \
+  --state open \
+  --json number \
+  --jq '.[0].number // ""')
+if [ -z "$PR_NUMBER" ]; then
+  echo "ERROR: PR URL $PR_URL found but PR number lookup returned empty — giving up on Copilot summon." >&2
+  exit 1
+fi
+
+echo "PR opened: $PR_URL"
+
+# Summon Copilot. `summon_copilot_or_warn` lives in tile-repo-lib.sh so
+# the fixup-push script can call the same code — consistency here matters
+# because every branch update should get the same reviewer treatment.
+GH_TOKEN="$TOKEN" summon_copilot_or_warn "$TILE_OWNER" "$TILE_NAME" "$PR_NUMBER"
+
 echo "Done! $PROMOTED promoted, $BLOCKED blocked."

@@ -65,6 +65,7 @@ import {
   buildVolumeMounts,
   SECRET_FILES,
 } from './container-runner.js';
+import { validateAdditionalMounts } from './mount-security.js';
 import type { RegisteredGroup } from './types.js';
 
 const { TEST_ROOT, STORE_DIR, DATA_DIR, GROUPS_DIR, PROJECT_DIR } = paths;
@@ -294,6 +295,215 @@ describe('SECRET_FILES and main-group shadow mounts', () => {
 });
 
 // -----------------------------------------------------------------------------
+// Test 2b — SECRET_FILES shadow propagates across additionalMounts.
+// The main-group `/workspace/project/<relPath>` shadow above only covers the
+// canonical project mount. When a group registers an `additionalMount` that
+// re-exposes the nanoclaw tree at a different container path (e.g. a group
+// config requesting `hostPath: ~/nanoclaw` lands it at
+// `/workspace/extra/projects/nanoclaw/`), the secret files under that path
+// need their own shadow. Without it, a trusted agent could read the real
+// `.env` via the extra mount even though the canonical `.env` is `/dev/null`.
+// -----------------------------------------------------------------------------
+describe('SECRET_FILES shadow across additionalMounts', () => {
+  function makeTrustedGroup(): RegisteredGroup {
+    return {
+      name: 'Trusted',
+      folder: 'trusted-group',
+      trigger: '@T',
+      added_at: new Date().toISOString(),
+      containerConfig: {
+        trusted: true,
+        additionalMounts: [
+          {
+            hostPath: '~/nanoclaw',
+            readonly: false,
+          },
+        ],
+      },
+    };
+  }
+
+  beforeEach(() => {
+    seedMessagesDb();
+    fs.mkdirSync(path.join(GROUPS_DIR, 'trusted-group'), { recursive: true });
+  });
+
+  it('shadows every reachable SECRET_FILES entry at the additionalMount container path', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      for (const rel of SECRET_FILES) {
+        const abs = path.join(PROJECT_DIR, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, 'SECRET=xyz');
+      }
+
+      // Mock returns a validated mount whose host path is the project
+      // root itself — the exact shape that exposes every SECRET_FILES
+      // entry at `/workspace/extra/projects/nanoclaw/<relPath>`.
+      vi.mocked(validateAdditionalMounts).mockReturnValueOnce([
+        {
+          hostPath: PROJECT_DIR,
+          containerPath: '/workspace/extra/projects/nanoclaw',
+          readonly: false,
+        },
+      ]);
+
+      const mounts = buildVolumeMounts(
+        makeTrustedGroup(),
+        false,
+        'trusted@g.us',
+      );
+
+      const extraShadows = mounts.filter(
+        (m) =>
+          m.hostPath === '/dev/null' &&
+          m.containerPath.startsWith('/workspace/extra/projects/nanoclaw/'),
+      );
+      expect(extraShadows.length).toBe(SECRET_FILES.length);
+      const extraPaths = extraShadows.map((m) => m.containerPath).sort();
+      const expected = SECRET_FILES.map(
+        (rel) => `/workspace/extra/projects/nanoclaw/${rel}`,
+      ).sort();
+      expect(extraPaths).toEqual(expected);
+      expect(extraShadows.every((m) => m.readonly === true)).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it('shadows only files that exist on the host (missing files skipped)', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      // Only create .env — every other SECRET_FILES entry is missing
+      const envAbs = path.join(PROJECT_DIR, '.env');
+      fs.writeFileSync(envAbs, 'SECRET=xyz');
+
+      vi.mocked(validateAdditionalMounts).mockReturnValueOnce([
+        {
+          hostPath: PROJECT_DIR,
+          containerPath: '/workspace/extra/projects/nanoclaw',
+          readonly: false,
+        },
+      ]);
+
+      const mounts = buildVolumeMounts(
+        makeTrustedGroup(),
+        false,
+        'trusted@g.us',
+      );
+
+      const extraShadows = mounts.filter(
+        (m) =>
+          m.hostPath === '/dev/null' &&
+          m.containerPath.startsWith('/workspace/extra/projects/nanoclaw/'),
+      );
+      // Only `.env` exists → exactly one extra shadow
+      expect(extraShadows.length).toBe(1);
+      expect(extraShadows[0].containerPath).toBe(
+        '/workspace/extra/projects/nanoclaw/.env',
+      );
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it('does NOT shadow when the additionalMount host path is unrelated to the project', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      for (const rel of SECRET_FILES) {
+        const abs = path.join(PROJECT_DIR, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, 'SECRET=xyz');
+      }
+
+      // Mount an unrelated host directory that contains no SECRET_FILES.
+      // Nothing should be shadowed under this container path (false
+      // positives here would be loud — every extra mount the user
+      // registers would gain spurious `/dev/null` mounts).
+      //
+      // Host path lives under `TEST_ROOT` (which is already unique per
+      // test process: see the `vi.hoisted` block at the top of this
+      // file that derives TEST_ROOT from pid + timestamp). Using a
+      // fixed `/tmp/...` path here would collide across concurrent
+      // vitest workers.
+      const unrelatedDir = path.join(TEST_ROOT, 'unrelated');
+      fs.mkdirSync(unrelatedDir, { recursive: true });
+      vi.mocked(validateAdditionalMounts).mockReturnValueOnce([
+        {
+          hostPath: unrelatedDir,
+          containerPath: '/workspace/extra/unrelated',
+          readonly: false,
+        },
+      ]);
+
+      const mounts = buildVolumeMounts(
+        makeTrustedGroup(),
+        false,
+        'trusted@g.us',
+      );
+
+      const extraShadows = mounts.filter(
+        (m) =>
+          m.hostPath === '/dev/null' &&
+          m.containerPath.startsWith('/workspace/extra/unrelated/'),
+      );
+      expect(extraShadows.length).toBe(0);
+    } finally {
+      process.chdir(originalCwd);
+      // TEST_ROOT cleanup happens in the file-level `afterAll` — no
+      // per-test rmSync needed now that we're inside TEST_ROOT.
+    }
+  });
+
+  it('shadows the right sub-path when the additionalMount is a parent of the project', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      for (const rel of SECRET_FILES) {
+        const abs = path.join(PROJECT_DIR, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, 'SECRET=xyz');
+      }
+
+      // Mount the PARENT of PROJECT_DIR — the secrets still live inside
+      // it, just one level deeper. Relative path under the mount is
+      // `<projectBasename>/<relPath>`; container path prefixes `extra/`.
+      const parentDir = path.dirname(PROJECT_DIR);
+      const projectBasename = path.basename(PROJECT_DIR);
+      vi.mocked(validateAdditionalMounts).mockReturnValueOnce([
+        {
+          hostPath: parentDir,
+          containerPath: '/workspace/extra/parent',
+          readonly: false,
+        },
+      ]);
+
+      const mounts = buildVolumeMounts(
+        makeTrustedGroup(),
+        false,
+        'trusted@g.us',
+      );
+
+      const extraShadows = mounts.filter(
+        (m) =>
+          m.hostPath === '/dev/null' &&
+          m.containerPath.startsWith('/workspace/extra/parent/'),
+      );
+      expect(extraShadows.length).toBe(SECRET_FILES.length);
+      const expected = SECRET_FILES.map(
+        (rel) => `/workspace/extra/parent/${projectBasename}/${rel}`,
+      ).sort();
+      expect(extraShadows.map((m) => m.containerPath).sort()).toEqual(expected);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+});
+
+// -----------------------------------------------------------------------------
 // Test 3 — untrusted group gets read-only group mount + filtered-DB store mount.
 // Two invariants in one test: disk-exhaustion protection (:ro on /workspace/group)
 // and DB isolation (filtered-db path, not the full store/).
@@ -320,6 +530,16 @@ describe('buildVolumeMounts — untrusted group isolation', () => {
     fs.writeFileSync(
       path.join(globalDir, 'SOUL-untrusted.md'),
       '# Untrusted SOUL',
+    );
+    // Seed thin CLAUDE.md trust-tier templates so the mount layer's
+    // existsSync gate passes (per #153).
+    fs.writeFileSync(
+      path.join(globalDir, 'CLAUDE.md'),
+      '**THIS IS A TRUSTED GROUP.**\n',
+    );
+    fs.writeFileSync(
+      path.join(globalDir, 'CLAUDE-untrusted.md'),
+      '**THIS IS AN UNTRUSTED GROUP.**\n',
     );
   });
 
@@ -392,6 +612,34 @@ describe('buildVolumeMounts — untrusted group isolation', () => {
     }
   });
 
+  it('/workspace/group/CLAUDE.md mounts the untrusted template, readonly (fixes #153 for untrusted)', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      const mounts = buildVolumeMounts(
+        makeUntrustedGroup(),
+        false,
+        'chatA@g.us',
+      );
+      const claudeMdMount = mounts.find(
+        (m) => m.containerPath === '/workspace/group/CLAUDE.md',
+      );
+      expect(claudeMdMount).toBeDefined();
+      expect(claudeMdMount!.hostPath).toBe(
+        path.join(GROUPS_DIR, 'global', 'CLAUDE-untrusted.md'),
+      );
+      expect(claudeMdMount!.readonly).toBe(true);
+      // Critically: NOT the per-group CLAUDE.md (which is the bug source
+      // — that copy was made once at registration and never reconciled
+      // on trust flips).
+      expect(claudeMdMount!.hostPath).not.toBe(
+        path.join(GROUPS_DIR, 'untrusted-group', 'CLAUDE.md'),
+      );
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
   it('untrusted groups get SOUL-untrusted.md, not the full global dir', () => {
     const originalCwd = process.cwd();
     process.chdir(PROJECT_DIR);
@@ -414,6 +662,94 @@ describe('buildVolumeMounts — untrusted group isolation', () => {
         (m) => m.containerPath === '/workspace/global',
       );
       expect(globalDirMount).toBeUndefined();
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Test 4 — trusted (non-main) group gets the trusted CLAUDE.md template
+// mounted readonly over the writable group folder. Same #153 fix as the
+// untrusted case, different source file. The mount layering means the
+// agent can write anywhere in /workspace/group EXCEPT CLAUDE.md.
+// -----------------------------------------------------------------------------
+describe('buildVolumeMounts — trusted group CLAUDE.md mount', () => {
+  function makeTrustedGroup(): RegisteredGroup {
+    return {
+      name: 'Trusted',
+      folder: 'trusted-group',
+      trigger: '@T',
+      added_at: new Date().toISOString(),
+      containerConfig: { trusted: true },
+    };
+  }
+
+  beforeEach(() => {
+    seedMessagesDb();
+    fs.mkdirSync(path.join(GROUPS_DIR, 'trusted-group'), { recursive: true });
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    fs.mkdirSync(globalDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(globalDir, 'CLAUDE.md'),
+      '**THIS IS A TRUSTED GROUP.**\n',
+    );
+    fs.writeFileSync(
+      path.join(globalDir, 'CLAUDE-untrusted.md'),
+      '**THIS IS AN UNTRUSTED GROUP.**\n',
+    );
+  });
+
+  it('/workspace/group/CLAUDE.md mounts the trusted template, readonly', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      const mounts = buildVolumeMounts(makeTrustedGroup(), false, 'chatT@g.us');
+      const claudeMdMount = mounts.find(
+        (m) => m.containerPath === '/workspace/group/CLAUDE.md',
+      );
+      expect(claudeMdMount).toBeDefined();
+      expect(claudeMdMount!.hostPath).toBe(
+        path.join(GROUPS_DIR, 'global', 'CLAUDE.md'),
+      );
+      expect(claudeMdMount!.readonly).toBe(true);
+      expect(claudeMdMount!.hostPath).not.toBe(
+        path.join(GROUPS_DIR, 'global', 'CLAUDE-untrusted.md'),
+      );
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it('/workspace/group folder mount stays writable for trusted (CLAUDE.md is the only readonly file)', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      const mounts = buildVolumeMounts(makeTrustedGroup(), false, 'chatT@g.us');
+      const groupFolderMount = mounts.find(
+        (m) => m.containerPath === '/workspace/group',
+      );
+      expect(groupFolderMount).toBeDefined();
+      expect(groupFolderMount!.readonly).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it('CLAUDE.md mount is positioned AFTER the group folder mount so the file shadow takes effect', () => {
+    const originalCwd = process.cwd();
+    process.chdir(PROJECT_DIR);
+    try {
+      const mounts = buildVolumeMounts(makeTrustedGroup(), false, 'chatT@g.us');
+      const folderIdx = mounts.findIndex(
+        (m) => m.containerPath === '/workspace/group',
+      );
+      const fileIdx = mounts.findIndex(
+        (m) => m.containerPath === '/workspace/group/CLAUDE.md',
+      );
+      expect(folderIdx).toBeGreaterThanOrEqual(0);
+      expect(fileIdx).toBeGreaterThanOrEqual(0);
+      expect(fileIdx).toBeGreaterThan(folderIdx);
     } finally {
       process.chdir(originalCwd);
     }

@@ -3,7 +3,10 @@
   "mode": "vendored",
   "dependencies": {
     "jbaruch/nanoclaw-host": {
-      "version": "0.1.15"
+      "version": "0.1.17"
+    },
+    "jbaruch/coding-policy": {
+      "version": "0.2.3"
     }
   }
 }

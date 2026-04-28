@@ -3,16 +3,16 @@
   "mode": "managed",
   "dependencies": {
     "jbaruch/nanoclaw-core": {
-      "version": "0.1.60"
+      "version": "latest"
     },
     "jbaruch/nanoclaw-untrusted": {
-      "version": "0.1.15"
+      "version": "latest"
     },
     "jbaruch/nanoclaw-trusted": {
-      "version": "0.1.30"
+      "version": "latest"
     },
     "jbaruch/nanoclaw-host": {
-      "version": "0.1.2"
+      "version": "latest"
     }
   }
 }

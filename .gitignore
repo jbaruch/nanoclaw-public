@@ -16,9 +16,13 @@ groups/*
 groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
+!groups/main/ADMIN.md
 !groups/global/CLAUDE.md
 !groups/global/CLAUDE-untrusted.md
+!groups/global/SOUL.md
 !groups/global/SOUL-untrusted.md
+!groups/global/FORMATTING.md
+!groups/global/MEMORY.md
 
 # Secrets
 *.keys.json

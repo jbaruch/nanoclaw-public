@@ -1,12 +1,14 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 import {
   _initTestDatabase,
   _writeRawRegisteredGroup,
   createTask,
+  deleteRegisteredGroup,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getBotMessageByTelegramId,
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
@@ -221,6 +223,110 @@ describe('reply context', () => {
     expect(messages).toHaveLength(1);
     expect(messages[0].reply_to_message_id).toBe('99');
     expect(messages[0].reply_to_sender_name).toBe('Dave');
+  });
+});
+
+// --- telegram_message_id persistence ---
+
+describe('telegram_message_id', () => {
+  it('stores and retrieves the telegram_message_id on a bot send', () => {
+    storeChatMetadata('tg:-100123', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'bot-1776570796407-k6ie5',
+      chat_jid: 'tg:-100123',
+      sender: 'Andy',
+      sender_name: 'Andy',
+      content: 'hello',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      is_from_me: true,
+      is_bot_message: true,
+      telegram_message_id: '4976',
+    });
+
+    const found = getBotMessageByTelegramId('tg:-100123', '4976');
+    expect(found).not.toBeNull();
+    expect(found?.id).toBe('bot-1776570796407-k6ie5');
+    expect(found?.telegram_message_id).toBe('4976');
+    expect(found?.content).toBe('hello');
+    expect(found?.is_bot_message).toBe(true);
+  });
+
+  it('returns null when no bot message has that telegram id', () => {
+    storeChatMetadata('tg:-100123', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'bot-a',
+      chat_jid: 'tg:-100123',
+      sender: 'Andy',
+      sender_name: 'Andy',
+      content: 'x',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      is_from_me: true,
+      is_bot_message: true,
+      telegram_message_id: '4976',
+    });
+
+    expect(getBotMessageByTelegramId('tg:-100123', '9999')).toBeNull();
+  });
+
+  it('scopes lookup to chat_jid so the same telegram id in a different chat is ignored', () => {
+    // Telegram IDs reset per chat — id 500 in chat A and chat B are different
+    // messages. The getter is (chat_jid, telegram_message_id)-scoped so a
+    // caller asking about chat A doesn't accidentally get chat B's row.
+    storeChatMetadata('tg:-100aaa', '2024-01-01T00:00:00.000Z');
+    storeChatMetadata('tg:-100bbb', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'bot-a',
+      chat_jid: 'tg:-100aaa',
+      sender: 'Andy',
+      sender_name: 'Andy',
+      content: 'in chat A',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      is_from_me: true,
+      is_bot_message: true,
+      telegram_message_id: '500',
+    });
+    storeMessage({
+      id: 'bot-b',
+      chat_jid: 'tg:-100bbb',
+      sender: 'Andy',
+      sender_name: 'Andy',
+      content: 'in chat B',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      is_from_me: true,
+      is_bot_message: true,
+      telegram_message_id: '500',
+    });
+
+    expect(getBotMessageByTelegramId('tg:-100aaa', '500')?.content).toBe(
+      'in chat A',
+    );
+    expect(getBotMessageByTelegramId('tg:-100bbb', '500')?.content).toBe(
+      'in chat B',
+    );
+  });
+
+  it('leaves telegram_message_id unset when the caller omits it', () => {
+    // Inbound user messages and other-channel sends never populate this
+    // column — and a lookup by the telegram id those messages DO have as
+    // their `id` should NOT resolve through this getter either (the query
+    // checks telegram_message_id, not id).
+    storeChatMetadata('tg:-100123', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: '4975', // simulate inbound user message — id IS the telegram id
+      chat_jid: 'tg:-100123',
+      sender: 'user@test',
+      sender_name: 'User',
+      content: 'hi bot',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+
+    // Looking up by the same string returns null because
+    // telegram_message_id column is NULL for this row.
+    expect(getBotMessageByTelegramId('tg:-100123', '4975')).toBeNull();
   });
 });
 
@@ -516,6 +622,7 @@ describe('task CRUD', () => {
       next_run: '2024-06-01T00:00:00.000Z',
       status: 'active',
       created_at: '2024-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     const task = getTaskById('task-1');
@@ -536,6 +643,7 @@ describe('task CRUD', () => {
       next_run: null,
       status: 'active',
       created_at: '2024-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     updateTask('task-2', { status: 'paused' });
@@ -554,32 +662,34 @@ describe('task CRUD', () => {
       next_run: null,
       status: 'active',
       created_at: '2024-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     deleteTask('task-3');
     expect(getTaskById('task-3')).toBeUndefined();
   });
 
-  // --- continuation_cycle_id ---
+  // --- continuation_cycle_id (#93/#130) ---
   //
   // The column is opt-in: ordinary tasks omit it (DB stores NULL) and
-  // a continuation-aware caller supplies the slot key. The
-  // task-scheduler reads the value verbatim and threads it through
-  // ContainerInput so the spawned container gets the matching env
-  // vars; persistence round-tripping is the part the DB layer must
-  // guarantee.
+  // the helper skill that drives self-resuming cycles supplies the slot
+  // key (UTC date / ISO week per the proposal). The task-scheduler
+  // reads the value verbatim and threads it through ContainerInput so
+  // the spawned container gets the matching env vars; persistence
+  // round-tripping is therefore the part the DB layer must guarantee.
   it('persists continuation_cycle_id when supplied', () => {
     createTask({
       id: 'task-cont-1',
       group_folder: 'main',
       chat_jid: 'group@g.us',
-      prompt: 'continue chain',
+      prompt: 'continue nightly chain',
       schedule_type: 'once',
       schedule_value: '2026-04-21T00:00:30.000Z',
       context_mode: 'isolated',
       next_run: '2026-04-21T00:00:30.000Z',
       status: 'active',
       created_at: '2026-04-21T00:00:00.000Z',
+      created_by_role: 'owner' as const,
       continuation_cycle_id: '2026-04-21',
     });
 
@@ -600,6 +710,7 @@ describe('task CRUD', () => {
       next_run: null,
       status: 'active',
       created_at: '2026-04-21T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     const task = getTaskById('task-cont-2');
@@ -705,6 +816,61 @@ describe('registered group isMain', () => {
   });
 });
 
+// --- deleteRegisteredGroup (#159) ---
+
+describe('deleteRegisteredGroup', () => {
+  it('removes a registered row and returns true', () => {
+    setRegisteredGroup('purge@g.us', {
+      name: 'Purge Me',
+      folder: 'purge-group',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    expect(getRegisteredGroup('purge@g.us')).toBeDefined();
+
+    const removed = deleteRegisteredGroup('purge@g.us');
+
+    expect(removed).toBe(true);
+    expect(getRegisteredGroup('purge@g.us')).toBeUndefined();
+  });
+
+  it('is idempotent — repeat calls report false after first delete', () => {
+    setRegisteredGroup('once@g.us', {
+      name: 'Once',
+      folder: 'once-group',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    expect(deleteRegisteredGroup('once@g.us')).toBe(true);
+    expect(deleteRegisteredGroup('once@g.us')).toBe(false);
+  });
+
+  it('returns false for a JID that was never registered', () => {
+    expect(deleteRegisteredGroup('never-here@g.us')).toBe(false);
+  });
+
+  it('does not affect sibling registrations', () => {
+    setRegisteredGroup('keeper@g.us', {
+      name: 'Keeper',
+      folder: 'keeper-group',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+    setRegisteredGroup('goer@g.us', {
+      name: 'Goer',
+      folder: 'goer-group',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+    });
+
+    deleteRegisteredGroup('goer@g.us');
+
+    expect(getRegisteredGroup('goer@g.us')).toBeUndefined();
+    expect(getRegisteredGroup('keeper@g.us')).toBeDefined();
+  });
+});
+
 // --- Defensive container_config parsing (issue #156) ---
 
 describe('registered group malformed container_config', () => {
@@ -770,7 +936,12 @@ describe('registered group malformed container_config', () => {
     }
   });
 
-  it('treats empty-string container_config as parse failure (corruption indicator), not "no config"', () => {
+  it('treats empty-string container_config as parse failure (corruption indicator), not "no config"', async () => {
+    const loggerMod = await import('./logger.js');
+    const warnSpy = vi
+      .spyOn(loggerMod.logger, 'warn')
+      .mockImplementation(() => loggerMod.logger);
+
     _writeRawRegisteredGroup({
       jid: 'empty@g.us',
       name: 'Empty Config Group',
@@ -779,9 +950,30 @@ describe('registered group malformed container_config', () => {
       added_at: '2024-01-01T00:00:00.000Z',
       container_config: '',
     });
-    const group = getRegisteredGroup('empty@g.us');
-    expect(group).toBeDefined();
-    expect(group?.containerConfig).toBeUndefined();
-    expect(group?.name).toBe('Empty Config Group');
+    _writeRawRegisteredGroup({
+      jid: 'null@g.us',
+      name: 'Null Config Group',
+      folder: 'whatsapp_null',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      container_config: null,
+    });
+
+    const empty = getRegisteredGroup('empty@g.us');
+    expect(empty?.containerConfig).toBeUndefined();
+    // Behavioral DIFFERENCE vs the old `if (!raw)` shape: empty
+    // string now surfaces as a SyntaxError warning, while the
+    // documented NULL "no config" state stays silent.
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ jid: 'empty@g.us', errName: 'SyntaxError' }),
+      expect.stringContaining('invalid container_config JSON'),
+    );
+
+    warnSpy.mockClear();
+    const nul = getRegisteredGroup('null@g.us');
+    expect(nul?.containerConfig).toBeUndefined();
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    warnSpy.mockRestore();
   });
 });

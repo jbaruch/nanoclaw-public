@@ -6,10 +6,9 @@ import {
   MAINTENANCE_SESSION_NAME,
 } from './group-queue.js';
 
-// Mock config to control concurrency limit
+// Mock config — concurrency is no longer gated, just stub DATA_DIR.
 vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
-  MAX_CONCURRENT_CONTAINERS: 2,
 }));
 
 // Mock fs operations used by sendMessage/closeStdin
@@ -66,9 +65,13 @@ describe('GroupQueue', () => {
     expect(maxConcurrent).toBe(1);
   });
 
-  // --- Global concurrency limit ---
+  // --- No global concurrency cap ---
 
-  it('respects global concurrency limit', async () => {
+  it('spawns a container per distinct group with no global cap', async () => {
+    // Burst N > old-cap (5) inbound messages across distinct groups; all
+    // must spawn immediately. The historical global concurrency cap
+    // would have queued the overflow — its removal is what this test
+    // guards against accidentally reintroducing.
     let activeCount = 0;
     let maxActive = 0;
     const completionCallbacks: Array<() => void> = [];
@@ -83,23 +86,19 @@ describe('GroupQueue', () => {
 
     queue.setProcessMessagesFn(processMessages);
 
-    // Enqueue 3 groups (limit is 2)
-    queue.enqueueMessageCheck('group1@g.us');
-    queue.enqueueMessageCheck('group2@g.us');
-    queue.enqueueMessageCheck('group3@g.us');
+    const N = 10;
+    for (let i = 0; i < N; i++) {
+      queue.enqueueMessageCheck(`group${i}@g.us`);
+    }
 
-    // Let promises settle
     await vi.advanceTimersByTimeAsync(10);
 
-    // Only 2 should be active (MAX_CONCURRENT_CONTAINERS = 2)
-    expect(maxActive).toBe(2);
-    expect(activeCount).toBe(2);
+    expect(maxActive).toBe(N);
+    expect(activeCount).toBe(N);
+    expect(processMessages).toHaveBeenCalledTimes(N);
 
-    // Complete one — third should start
-    completionCallbacks[0]();
+    for (const done of completionCallbacks) done();
     await vi.advanceTimersByTimeAsync(10);
-
-    expect(processMessages).toHaveBeenCalledTimes(3);
   });
 
   // --- Tasks prioritized over messages ---
@@ -213,38 +212,6 @@ describe('GroupQueue', () => {
     const countAfterMaxRetries = callCount;
     await vi.advanceTimersByTimeAsync(200000); // Wait a long time
     expect(callCount).toBe(countAfterMaxRetries);
-  });
-
-  // --- Waiting groups get drained when slots free up ---
-
-  it('drains waiting groups when active slots free up', async () => {
-    const processed: string[] = [];
-    const completionCallbacks: Array<() => void> = [];
-
-    const processMessages = vi.fn(async (groupJid: string) => {
-      processed.push(groupJid);
-      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
-      return true;
-    });
-
-    queue.setProcessMessagesFn(processMessages);
-
-    // Fill both slots
-    queue.enqueueMessageCheck('group1@g.us');
-    queue.enqueueMessageCheck('group2@g.us');
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Queue a third
-    queue.enqueueMessageCheck('group3@g.us');
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(processed).toEqual(['group1@g.us', 'group2@g.us']);
-
-    // Free up a slot
-    completionCallbacks[0]();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(processed).toContain('group3@g.us');
   });
 
   // --- Running task dedup (Issue #138) ---
@@ -573,73 +540,6 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
-  it('drainWaiting under saturation prefers default slots over maintenance', async () => {
-    // MAX_CONCURRENT_CONTAINERS is mocked to 2. Fill both slots with
-    // blocking maintenance tasks, then queue BOTH a maintenance task AND a
-    // user message (for different groups). When ONE slot frees, the queue
-    // must drain the USER-FACING message ahead of the queued maintenance
-    // task — that's the whole point of parallel maintenance: scheduled
-    // work doesn't block user replies under contention.
-    const release: Array<() => void> = [];
-    const blockingTask = () =>
-      vi.fn(async () => {
-        await new Promise<void>((r) => release.push(r));
-      });
-
-    // Fill both concurrent slots.
-    queue.enqueueTask(
-      'a@g.us',
-      'block-a',
-      MAINTENANCE_SESSION_NAME,
-      blockingTask(),
-    );
-    queue.enqueueTask(
-      'b@g.us',
-      'block-b',
-      MAINTENANCE_SESSION_NAME,
-      blockingTask(),
-    );
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Queue maintenance FIRST (older entry), then user message — priority
-    // logic must override FIFO insertion order.
-    let maintRan = false;
-    let msgRan = false;
-    queue.enqueueTask(
-      'c@g.us',
-      'queued-maint',
-      MAINTENANCE_SESSION_NAME,
-      vi.fn(async () => {
-        maintRan = true;
-      }),
-    );
-    // processMessages must block so the freed slot stays occupied while we
-    // observe — otherwise the message finishes synchronously, frees the
-    // slot, and drainWaiting would pick up the maintenance task too.
-    let releaseMsg: (() => void) | undefined;
-    queue.setProcessMessagesFn(async () => {
-      msgRan = true;
-      await new Promise<void>((r) => {
-        releaseMsg = r;
-      });
-      return true;
-    });
-    queue.enqueueMessageCheck('d@g.us');
-
-    // Release ONE blocking slot — only the user message should be drained.
-    release[0]!();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(msgRan).toBe(true);
-    expect(maintRan).toBe(false);
-
-    // Release the message, then the second blocking task → maintenance runs.
-    releaseMsg!();
-    release[1]!();
-    await vi.advanceTimersByTimeAsync(10);
-    expect(maintRan).toBe(true);
-  });
-
   it('two tasks on the same group with the same sessionName serialize', async () => {
     // Within a session the slot is still single-serial — same as before,
     // just keyed by (groupJid, sessionName) instead of groupJid alone.
@@ -731,17 +631,146 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
-  // --- Self-resuming continuation chain isolation ---
+  // --- Container-status derivation (chat_status surface) ---
+
+  it('reports not-spawned for a slot that has never run', () => {
+    expect(queue.getStatus('group-x@g.us', DEFAULT_SESSION_NAME)).toBe(
+      'not-spawned',
+    );
+  });
+
+  it('reports running while a message-processing run is in flight', async () => {
+    let resolveProcessing: () => void;
+    const processMessages = vi.fn(
+      async () =>
+        await new Promise<boolean>((resolve) => {
+          resolveProcessing = () => resolve(true);
+        }),
+    );
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(queue.getStatus('group1@g.us', DEFAULT_SESSION_NAME)).toBe(
+      'running',
+    );
+
+    resolveProcessing!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('reports idle when notifyIdle is called mid-run', async () => {
+    let resolveProcessing: () => void;
+    const processMessages = vi.fn(
+      async (_jid: string) =>
+        await new Promise<boolean>((resolve) => {
+          resolveProcessing = () => resolve(true);
+        }),
+    );
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    queue.notifyIdle('group1@g.us');
+    expect(queue.getStatus('group1@g.us', DEFAULT_SESSION_NAME)).toBe('idle');
+
+    resolveProcessing!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('reports not-spawned after a clean run completes', async () => {
+    const processMessages = vi.fn(async () => true);
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(queue.getStatus('group1@g.us', DEFAULT_SESSION_NAME)).toBe(
+      'not-spawned',
+    );
+  });
+
+  it('reports cooling-down between failed runs (retry backoff window)', async () => {
+    const processMessages = vi.fn(async () => false);
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // First run failed and scheduled a retry; we're now in the backoff
+    // window (retryCount > 0 inside GroupQueue). Don't advance the
+    // timer past the retry threshold or the second run would overlap.
+    expect(queue.getStatus('group1@g.us', DEFAULT_SESSION_NAME)).toBe(
+      'cooling-down',
+    );
+  });
+
+  it('reports cooling-down when caller signals an active circuit breaker', async () => {
+    const processMessages = vi.fn(async () => true);
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Slot ran cleanly so retryCount is 0 and lastExitStatus is 'clean'
+    // — without the breaker flag we'd report 'not-spawned'. The caller
+    // (host's chat_status wiring) passes the per-folder breaker state
+    // in; that signal should win.
+    expect(queue.getStatus('group1@g.us', DEFAULT_SESSION_NAME, true)).toBe(
+      'cooling-down',
+    );
+  });
+
+  it('reports crashed after MAX_RETRIES failures exhaust the backoff', async () => {
+    const processMessages = vi.fn(async () => false);
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+
+    // Drive through every retry: 5000, 10000, 20000, 40000, 80000.
+    // After the 5th retry runs and fails, scheduleRetry resets
+    // retryCount to 0 and stops scheduling — the slot is no longer
+    // cooling down; it's crashed (last exit was an error, no recovery
+    // pending). This is the case the issue's incident report describes:
+    // container died, no log, no retry will ever fire on its own.
+    await vi.advanceTimersByTimeAsync(10);
+    for (const delay of [5000, 10000, 20000, 40000, 80000]) {
+      await vi.advanceTimersByTimeAsync(delay + 10);
+    }
+
+    expect(queue.getStatus('group1@g.us', DEFAULT_SESSION_NAME)).toBe(
+      'crashed',
+    );
+  });
+
+  it('reports crashed when a task slot threw and no retry exists', async () => {
+    // Tasks don't reschedule on failure (unlike message runs), so a
+    // single throw should land us straight in 'crashed'. Confirms the
+    // status derivation works for the maintenance slot too.
+    const taskFn = vi.fn(async () => {
+      throw new Error('boom');
+    });
+    queue.enqueueTask(
+      'group1@g.us',
+      'task-1',
+      MAINTENANCE_SESSION_NAME,
+      taskFn,
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(queue.getStatus('group1@g.us', MAINTENANCE_SESSION_NAME)).toBe(
+      'crashed',
+    );
+  });
+
+  // --- Self-resuming continuation chain isolation (#93/#131) ---
   //
-  // A continuation-aware caller (helper skill) can chain scheduled
-  // tasks by enqueuing the next link from inside the current link's
-  // runtime. The contract that must hold: an inbound user message
-  // arriving mid-chain still routes to `default` and runs concurrently
+  // The proposal asserts that an inbound user message arriving mid-
+  // continuation-chain still routes to `default` and runs concurrently
   // with the maintenance chain — neither stalling the user's reply
   // nor disrupting the chain's progress to completion. The slot keys
   // (`(groupJid, sessionName)`) already separate the queues, but the
   // chain shape (task N+1 enqueued from inside task N's runtime) is a
-  // pattern the existing tests don't exercise.
+  // pattern existing tests don't exercise. This is the integration
+  // assertion called out in #131 — the maintenance chain progresses
+  // serially within its own slot AND the default slot remains
+  // responsive throughout.
 
   it('continuation chain in maintenance slot does not block default-slot user messages', async () => {
     const N = 3; // chain depth — keep small to bound the test
@@ -750,9 +779,9 @@ describe('GroupQueue', () => {
     const groupJid = 'group1@g.us';
 
     // Each continuation link is a task that itself enqueues the next
-    // link (a continuation-aware helper would enqueue via
-    // schedule_task, which lands as another maintenance enqueueTask —
-    // same shape). The Nth (terminal) link does not re-enqueue.
+    // link (the resumable-cycle helper would enqueue via schedule_task,
+    // which lands as another maintenance enqueueTask — same shape).
+    // The Nth (terminal) link does not re-enqueue.
     const chainStarted: Array<() => void> = [];
     const chainBlock: Array<Promise<void>> = [];
     const chainRelease: Array<() => void> = [];
@@ -785,9 +814,9 @@ describe('GroupQueue', () => {
           await chainBlock[idx]!;
           maintExecutionOrder.push(`link-${idx}:end`);
           // Schedule the next link from inside this one — mirrors the
-          // helper's pattern of writing the continuation row +
-          // scheduling it AT END OF this run, so task-scheduler picks
-          // it up on its next poll.
+          // resumable-cycle helper's pattern of writing the
+          // continuation row + scheduling it AT END OF this run, so
+          // task-scheduler picks it up on its next poll.
           if (idx + 1 < N) {
             enqueueChainLink(idx + 1);
           }
@@ -847,8 +876,9 @@ describe('GroupQueue', () => {
     // parallelised within the maintenance slot itself — the
     // (groupJid, MAINTENANCE_SESSION_NAME) queue is single-serial,
     // same as the default slot. A buggy enqueue path that fanned all
-    // links out at once would silently break a stateful chain
-    // contract (link N's state-write must observe link N-1's commit).
+    // links out at once would silently break the resume-state
+    // contract (link N's `remaining_steps` write must observe link
+    // N-1's commit).
     const N = 3;
     const order: string[] = [];
     const groupJid = 'group1@g.us';

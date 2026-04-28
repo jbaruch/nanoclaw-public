@@ -31,6 +31,14 @@ export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
   trusted?: boolean; // Trusted groups get limited credentials (e.g. voice transcription)
+  /**
+   * Opt this non-main group into the 15-min unanswered-message heartbeat.
+   * Default: undefined / false — no heartbeat. The main group always gets
+   * a heartbeat regardless of this flag (handled separately in
+   * `registerGroup`). Made explicit by #158 to kill the historical
+   * "trigger-required → auto-heartbeat" coupling.
+   */
+  enableHeartbeat?: boolean;
 }
 
 export interface RegisteredGroup {
@@ -56,7 +64,47 @@ export interface NewMessage {
   reply_to_message_id?: string;
   reply_to_message_content?: string;
   reply_to_sender_name?: string;
+  // Channel-native message ID returned by the platform on send. Only
+  // populated for outbound bot messages on Telegram — the `id` column
+  // for bot sends is our synthetic `bot-<ts>-<rand>` so there's no other
+  // place to pin the Telegram numeric ID. Inbound user messages already
+  // store the platform ID as `id` itself and leave this null. Queryable
+  // for debugging "what did the bot actually post at Telegram ID X?".
+  //
+  // Optional + NULL-able: writers may omit (column still defaults to
+  // NULL via `?? null` in storeMessage), and DB getters surface the
+  // persisted NULL as `null` IF their SELECT list includes the
+  // column. The three runtime states:
+  //   - `undefined` — writer didn't provide a value (normalized to
+  //     NULL by storeMessage before persisting), OR reader loaded
+  //     from a query whose explicit SELECT list doesn't include
+  //     this column (e.g. `getNewMessages` / `getMessagesSince` in
+  //     src/db.ts — they project a fixed subset of fields).
+  //   - `null` — column was selected and the row's stored value is
+  //     SQL NULL.
+  //   - `string` — recorded bot-send id.
+  // Call sites: writers with a known id pass a string; writers
+  // without it omit; readers may see undefined / null / string
+  // depending on the SELECT they went through.
+  telegram_message_id?: string | null;
 }
+
+/**
+ * Provenance of a scheduled_tasks row. Drives the agent-runner's decision
+ * to wrap the prompt in `<untrusted-input>` at fire time.
+ * - 'owner':           host code or Baruch's direct tooling — trusted
+ * - 'main_agent':      main group's agent scheduled it — trusted
+ * - 'trusted_agent':   trusted non-main group's agent — trusted
+ * - 'untrusted_agent': untrusted group's agent — NOT trusted, wrap applies
+ * The untrusted_agent case is the reason this field exists: without it,
+ * an untrusted agent could self-schedule a malicious prompt that later
+ * fires unwrapped and bypasses the trust boundary.
+ */
+export type CreatedByRole =
+  | 'owner'
+  | 'main_agent'
+  | 'trusted_agent'
+  | 'untrusted_agent';
 
 export interface ScheduledTask {
   id: string;
@@ -66,23 +114,36 @@ export interface ScheduledTask {
   script?: string | null;
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
+  /**
+   * IANA timezone for evaluating `cron` expressions (e.g. "UTC",
+   * "America/Chicago"). Null/undefined = use the server's `TIMEZONE`
+   * config at fire time, preserving pre-#102 behavior. Has no effect
+   * on `interval` (always elapsed-ms) or `once` — for `once`, any
+   * offset-suffixed ISO-8601 (`Z`, `+HH:MM`, `-HH:MM`) is treated as
+   * an absolute instant; bare strings without a suffix are
+   * interpreted in server-local time at schedule/update time and
+   * pinned to the resulting UTC moment in `next_run`.
+   */
+  schedule_timezone?: string | null;
   context_mode: 'group' | 'isolated';
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
+  created_by_role: CreatedByRole;
   /**
-   * Continuation marker for self-resuming cycles. NULL/undefined for
-   * ordinary one-shot scheduled tasks. When set by a continuation-aware
-   * caller (helper skill), the task-scheduler surfaces the value to the
-   * spawned container as `NANOCLAW_CONTINUATION=1` plus
-   * `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`. The calling skill checks
-   * the env var alongside a prompt-prefix marker; both must agree to
-   * take a continuation branch, otherwise the run is treated as a fresh
-   * user invocation. A scheduler that sets the env but mangles the
-   * prompt (or vice versa) therefore fails closed instead of silently
-   * bypassing whatever lock/state contract the chain depends on.
+   * Continuation marker for self-resuming cycles (#93/#130). NULL/undefined
+   * for ordinary one-shot scheduled tasks. When set by the resumable-cycle
+   * helper skill (in the `nanoclaw-admin` tile), the task-scheduler
+   * surfaces the value to the spawned container as
+   * `NANOCLAW_CONTINUATION=1` plus
+   * `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`. The calling skill (nightly /
+   * weekly / morning-brief) checks the env var alongside a prompt-prefix
+   * marker; both must agree to take the lock-skip continuation branch,
+   * otherwise the run is treated as a fresh user invocation. A scheduler
+   * that sets the env but mangles the prompt (or vice versa) therefore
+   * fails closed instead of silently bypassing the two-phase lock.
    */
   continuation_cycle_id?: string | null;
 }
@@ -126,11 +187,6 @@ export interface Channel {
     caption?: string,
     replyToMessageId?: string,
   ): Promise<void>;
-  // Optional: create a draft stream for progressive message display.
-  createDraftStream?(
-    jid: string,
-    replyToMessageId?: string,
-  ): import('./draft-stream.js').DraftStream;
 }
 
 // Callback type that channels use to deliver inbound messages

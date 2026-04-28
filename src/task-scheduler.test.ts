@@ -21,10 +21,13 @@ import {
   _initTestDatabase,
   createTask,
   deleteTask,
+  getAllChats,
+  getLastBotMessageTimestamp,
   getSession,
   getTaskById,
   pruneCompletedTasks,
   setSession,
+  storeChatMetadata,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
@@ -34,7 +37,9 @@ import {
   DORMANT_WARN_COOLDOWN_MS,
   PRUNE_INTERVAL_MS,
   _resetSchedulerLoopForTests,
+  applyComputeNextRunRemediation,
   computeNextRun,
+  computeNextRunDetailed,
   getCompletedTaskTtlMs,
   startSchedulerLoop,
 } from './task-scheduler.js';
@@ -66,6 +71,7 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 60_000).toISOString(),
       status: 'active',
       created_at: '2026-02-22T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     const enqueueTask = vi.fn(
@@ -81,10 +87,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({}),
-      getSessions: () => ({}),
       queue: { enqueueTask } as any,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     await vi.advanceTimersByTimeAsync(10);
@@ -108,6 +114,7 @@ describe('task scheduler', () => {
       last_result: null,
       status: 'active' as const,
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     };
 
     const nextRun = computeNextRun(task);
@@ -132,12 +139,161 @@ describe('task scheduler', () => {
       last_result: null,
       status: 'active' as const,
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     };
 
     expect(computeNextRun(task)).toBeNull();
   });
 
-  it('maintenance task with context_mode=group uses stored maintenance sessionId and persists newSessionId', async () => {
+  it('computeNextRun honors per-task schedule_timezone for cron (#102)', () => {
+    const task = {
+      id: 'cron-utc',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'cron' as const,
+      schedule_value: '0 12 * * *', // noon
+      schedule_timezone: 'UTC',
+      context_mode: 'isolated' as const,
+      next_run: null,
+      last_run: null,
+      last_result: null,
+      status: 'active' as const,
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
+    };
+
+    const nextRun = computeNextRun(task);
+    expect(nextRun).not.toBeNull();
+    const next = new Date(nextRun!);
+    expect(next.getUTCHours()).toBe(12);
+    expect(next.getUTCMinutes()).toBe(0);
+  });
+
+  it('computeNextRunDetailed flags clear-bad-timezone when per-task tz is invalid but TIMEZONE works (#102)', () => {
+    createTask({
+      id: 'cron-bad-tz',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'cron',
+      schedule_value: '0 12 * * *',
+      schedule_timezone: 'Not/A/Real/Zone',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner',
+    });
+    const task = getTaskById('cron-bad-tz')!;
+
+    const result = computeNextRunDetailed(task);
+
+    // First parse fails on bad tz, retry with TIMEZONE succeeds.
+    expect(result.nextRun).not.toBeNull();
+    expect(result.remediation).toBe('clear-bad-timezone');
+    // Pure: no DB writes from compute itself.
+    expect(getTaskById('cron-bad-tz')?.schedule_timezone).toBe(
+      'Not/A/Real/Zone',
+    );
+  });
+
+  it("applyComputeNextRunRemediation clears bad tz when row hasn't changed (#102)", () => {
+    createTask({
+      id: 'cron-apply-clear',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'cron',
+      schedule_value: '0 12 * * *',
+      schedule_timezone: 'Not/A/Real/Zone',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner',
+    });
+
+    applyComputeNextRunRemediation(
+      'cron-apply-clear',
+      'clear-bad-timezone',
+      '0 12 * * *',
+      'Not/A/Real/Zone',
+    );
+
+    expect(getTaskById('cron-apply-clear')?.schedule_timezone).toBeFalsy();
+  });
+
+  it('applyComputeNextRunRemediation skips remediation when row changed since compute (#102)', () => {
+    // Simulate: scheduler observed bad tz, but a concurrent update_task
+    // fixed it before the apply step ran. The fix should NOT be clobbered.
+    createTask({
+      id: 'cron-race',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'cron',
+      schedule_value: '0 12 * * *',
+      schedule_timezone: 'UTC', // user just fixed it
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner',
+    });
+
+    applyComputeNextRunRemediation(
+      'cron-race',
+      'clear-bad-timezone',
+      '0 12 * * *',
+      'Not/A/Real/Zone', // observed when compute ran (before fix)
+    );
+
+    // User's fix preserved — remediation skipped.
+    expect(getTaskById('cron-race')?.schedule_timezone).toBe('UTC');
+  });
+
+  it('computeNextRunDetailed flags pause-broken-cron when both parses fail (#102)', () => {
+    createTask({
+      id: 'cron-broken',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'test',
+      schedule_type: 'cron',
+      schedule_value: 'not-a-cron-expression',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner',
+    });
+    const task = getTaskById('cron-broken')!;
+
+    const result = computeNextRunDetailed(task);
+
+    expect(result.nextRun).toBeNull();
+    expect(result.remediation).toBe('pause-broken-cron');
+    // Compute is pure — status NOT flipped here.
+    expect(getTaskById('cron-broken')?.status).toBe('active');
+
+    // Apply step does the actual flip:
+    applyComputeNextRunRemediation(
+      'cron-broken',
+      'pause-broken-cron',
+      'not-a-cron-expression',
+      null,
+    );
+    expect(getTaskById('cron-broken')?.status).toBe('paused');
+  });
+
+  it('scheduled task ignores any cached maintenance sessionId and never persists a new one (#193)', async () => {
+    // Regression for #193: the lunch reminder bled heartbeat-loop
+    // language from a 6-day-old maintenance turn because every
+    // context_mode=group task on a folder shared the same
+    // sessions[folder][maintenance] resume slot. Each scheduled run
+    // must be a fresh SDK turn — even if a prior sessionId is sitting
+    // in the cache, it must NOT be passed in as `resume`, and the
+    // streamed `newSessionId` must NOT be persisted back to the slot.
     const MAIN_GROUP = {
       name: 'Main',
       folder: 'main',
@@ -146,8 +302,6 @@ describe('task scheduler', () => {
       isMain: true,
     };
 
-    // Seed a prior maintenance sessionId in the sessions cache. The
-    // scheduler should read this and pass it into runContainerAgent.
     setSession('main', MAINTENANCE_SESSION_NAME, 'prior-maint-session');
 
     createTask({
@@ -161,12 +315,11 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 1000).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     mockRunContainerAgent.mockImplementation(
       async (_group, _input, _onProc, onOutput) => {
-        // Simulate a streamed success with a new sessionId — this is what
-        // the container-runner reports back after the SDK's query() resolves.
         await onOutput({
           status: 'success',
           result: 'ok',
@@ -189,38 +342,115 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
-      getSessions: () => ({ main: { maintenance: 'prior-maint-session' } }),
       queue: { enqueueTask, closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     await vi.advanceTimersByTimeAsync(10);
 
-    // The stored prior sessionId was passed in as the resume target.
+    // Container ran in the maintenance slot — but with NO resume target.
     expect(mockRunContainerAgent).toHaveBeenCalled();
     const containerInput = mockRunContainerAgent.mock.calls[0][1];
-    expect(containerInput.sessionId).toBe('prior-maint-session');
+    expect(containerInput.sessionId).toBeUndefined();
     expect(containerInput.sessionName).toBe(MAINTENANCE_SESSION_NAME);
 
-    // The new sessionId from the streaming callback was persisted to the
-    // MAINTENANCE slot (not default).
+    // The seeded prior sessionId is left untouched (no overwrite) and
+    // the streamed newSessionId was NOT persisted — the next run also
+    // starts fresh.
     expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe(
-      'new-maint-session',
+      'prior-maint-session',
     );
-    expect(getSession('main', 'default')).toBeUndefined();
   });
 
-  // --- continuation_cycle_id flow-through ---
+  it('wipes the just-finished JSONL transcript so orphans do not accumulate (#193)', async () => {
+    // Companion to the no-resume test above: because the sessionId is
+    // never persisted, neither nukeSession nor cleanup-sessions.sh can
+    // find this run's transcript later. The scheduler must call
+    // wipeSessionJsonl on every newSessionId observed during the run,
+    // from the post-run finally block — i.e. after logTaskRun and the
+    // updateTaskAfterRun bookkeeping have been attempted.
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'wipe-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: 'ok',
+          newSessionId: 'fresh-turn-session',
+        } as ContainerOutput);
+        return {
+          status: 'success',
+          result: 'ok',
+          newSessionId: 'fresh-turn-session',
+        };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    const wipeSpy = vi.fn(() => 1);
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+      wipeSessionJsonl: wipeSpy,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(wipeSpy).toHaveBeenCalledWith(
+      'main',
+      MAINTENANCE_SESSION_NAME,
+      'fresh-turn-session',
+    );
+    // Streaming + terminal both reported the same id; the Set
+    // de-dups so wipeSpy fires exactly once.
+    expect(wipeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // --- continuation_cycle_id flow-through (#93/#130) ---
   //
   // The scheduler is the bridge between the DB row and the spawned
   // container: when a task row's continuation_cycle_id column is
   // non-NULL, the value must reach the ContainerInput so
   // container-runner can emit the matching env vars. Round-tripping
   // through the scheduler is the load-bearing wiring step — without
-  // it, a chained continuation row created by a continuation-aware
-  // helper would still spawn a container indistinguishable from a
-  // fresh user invocation.
+  // it, a chained continuation row created by the resumable-cycle
+  // helper skill would still spawn a container indistinguishable from
+  // a fresh user invocation.
 
   it('passes continuation_cycle_id from task row through to ContainerInput', async () => {
     const MAIN_GROUP = {
@@ -235,13 +465,15 @@ describe('task scheduler', () => {
       id: 'continuation-task',
       group_folder: 'main',
       chat_jid: 'main@g.us',
-      prompt: '[CONTINUATION 2026-04-21 #1] Continue chain ...',
+      prompt:
+        '[CONTINUATION 2026-04-21 #1] Continue tessl__nightly-housekeeping ...',
       schedule_type: 'once',
       schedule_value: '2026-04-21T00:00:30.000Z',
       context_mode: 'isolated',
       next_run: new Date(Date.now() - 1000).toISOString(),
       status: 'active',
       created_at: '2026-04-21T00:00:00.000Z',
+      created_by_role: 'owner' as const,
       continuation_cycle_id: '2026-04-21',
     });
 
@@ -268,10 +500,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
-      getSessions: () => ({}),
       queue: { enqueueTask, closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     await vi.advanceTimersByTimeAsync(10);
@@ -301,6 +533,7 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 1000).toISOString(),
       status: 'active',
       created_at: '2026-04-21T00:00:00.000Z',
+      created_by_role: 'owner' as const,
       // continuation_cycle_id intentionally omitted — DB stores NULL.
     });
 
@@ -327,10 +560,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
-      getSessions: () => ({}),
       queue: { enqueueTask, closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     await vi.advanceTimersByTimeAsync(10);
@@ -365,6 +598,7 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 1000).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     mockRunContainerAgent.mockImplementation(
@@ -391,10 +625,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
-      getSessions: () => ({}),
       queue: { enqueueTask, closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     await vi.advanceTimersByTimeAsync(10);
@@ -406,6 +640,390 @@ describe('task scheduler', () => {
     // And the streamed newSessionId was NOT persisted — an isolated task
     // finishing must not contaminate the maintenance slot's chain.
     expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBeUndefined();
+  });
+
+  it('streamed scheduled-task result writes a bot row to messages.db', async () => {
+    // Regression for jbaruch/nanoclaw#81 root cause: pre-fix, the
+    // task-scheduler streaming callback sent to Telegram but never
+    // called storeMessage — so every heartbeat/housekeeping cycle
+    // reached the user but left no DB row ("ghost heartbeat"). The
+    // fix mirrors the ipc.ts send_message pattern: storeMessage is
+    // called immediately after sendMessage, with the same row shape.
+    // This test fails without the fix.
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+    const chatJid = 'main@g.us';
+    // Seed the chats row so the FK from messages.chat_jid to chats.jid
+    // doesn't reject the bot insert. Production has this metadata from
+    // the first real user message in the chat; in-test we create it
+    // explicitly.
+    storeChatMetadata(chatJid, '2026-01-01T00:00:00.000Z', 'Main');
+
+    createTask({
+      id: 'store-msg-task',
+      group_folder: 'main',
+      chat_jid: chatJid,
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
+    });
+
+    const streamedText = 'heartbeat: nothing urgent';
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: streamedText,
+          newSessionId: 'new-maint-session',
+        } as ContainerOutput);
+        return { status: 'success', result: streamedText };
+      },
+    );
+
+    const sentTexts: string[] = [];
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ [chatJid]: MAIN_GROUP }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async (_jid: string, text: string) => {
+        sentTexts.push(text);
+      },
+      wipeSessionJsonl: () => 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // sendMessage was called with the streamed text.
+    expect(sentTexts).toEqual([streamedText]);
+
+    // And — the critical assertion — storeMessage was also called, so
+    // `messages.db` now has a bot row for this chat. Without the fix
+    // the DB would have no row, exposing the "ghost send" bug #81.
+    // getLastBotMessageTimestamp returns undefined when no bot row
+    // exists for the chat; a string timestamp when one was written.
+    const botTs = getLastBotMessageTimestamp(chatJid, 'bot');
+    expect(botTs).toBeTruthy();
+  });
+
+  it('streamed scheduled-task writes a bot row even when no prior chats row exists', async () => {
+    // The FK from `messages.chat_jid` to `chats.jid` means storeMessage
+    // throws if no chats row exists for the target chat (scheduled task
+    // firing before any inbound message / metadata sync would create
+    // one). Verifies the task-scheduler upserts chat metadata before
+    // storeMessage so the bot row actually lands in the DB instead of
+    // raising a FOREIGN KEY constraint error and recording the run as
+    // an error.
+    const FRESH_GROUP = {
+      name: 'Fresh',
+      folder: 'fresh',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+    const chatJid = 'fresh-no-metadata@g.us';
+    // NOTE: NOT calling storeChatMetadata here. The task-scheduler fix
+    // must handle the missing-chats-row case on its own AND must write
+    // a correctly-shaped chats row (channel='whatsapp', is_group=true
+    // for `@g.us` JIDs) so the chat shows up in `getAvailableGroups()`.
+
+    createTask({
+      id: 'fresh-chat-task',
+      group_folder: 'fresh',
+      chat_jid: chatJid,
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
+    });
+
+    const streamedText = 'first send in a fresh chat';
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: streamedText,
+        } as ContainerOutput);
+        return { status: 'success', result: streamedText };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ [chatJid]: FRESH_GROUP }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Bot row landed despite no pre-existing chats row. If the
+    // storeChatMetadata upsert gets dropped, storeMessage will throw
+    // FOREIGN KEY constraint failed and this assertion fails.
+    expect(getLastBotMessageTimestamp(chatJid, 'bot')).toBeTruthy();
+
+    // And the chats row itself has the right shape — a `@g.us` JID
+    // infers `channel: 'whatsapp'`, `is_group: true`, so the chat
+    // appears in `getAvailableGroups()` (which filters on
+    // `c.is_group`). Missing/NULL here would hide the group from
+    // every downstream consumer — the exact behavior Copilot
+    // flagged on #83 round 3.
+    const chat = getAllChats().find((c) => c.jid === chatJid);
+    expect(chat).toBeTruthy();
+    expect(chat!.channel).toBe('whatsapp');
+    expect(chat!.is_group).toBe(1);
+  });
+
+  it('streamed scheduled-task to a Telegram group upserts chats as telegram+group', async () => {
+    // Mirror of the `@g.us` test for the Telegram path: negative id
+    // after `tg:` indicates a group/channel, positive indicates a
+    // private 1:1 — both should infer `channel: 'telegram'`, and
+    // only the negative-id case should set `is_group: true`. Guards
+    // against channel-prefix abbreviations (`'tg'`) ever landing in
+    // the DB.
+    const GROUP_REG = {
+      name: 'TG Group',
+      folder: 'tgg',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+    const groupJid = 'tg:-1003000000001';
+    const dmJid = 'tg:42';
+
+    for (const [jid, taskId] of [
+      [groupJid, 'tg-group-task'],
+      [dmJid, 'tg-dm-task'],
+    ]) {
+      createTask({
+        id: taskId,
+        group_folder: 'tgg',
+        chat_jid: jid,
+        prompt: 'run',
+        schedule_type: 'once',
+        schedule_value: '2026-01-01T00:00:00.000Z',
+        context_mode: 'group',
+        next_run: new Date(Date.now() - 1000).toISOString(),
+        status: 'active',
+        created_at: '2026-01-01T00:00:00.000Z',
+        created_by_role: 'owner' as const,
+      });
+    }
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: 'ok',
+        } as ContainerOutput);
+        return { status: 'success', result: 'ok' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ [groupJid]: GROUP_REG, [dmJid]: GROUP_REG }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const group = getAllChats().find((c) => c.jid === groupJid);
+    expect(group).toBeTruthy();
+    expect(group!.channel).toBe('telegram');
+    expect(group!.is_group).toBe(1);
+
+    const dm = getAllChats().find((c) => c.jid === dmJid);
+    expect(dm).toBeTruthy();
+    expect(dm!.channel).toBe('telegram');
+    expect(dm!.is_group).toBe(0);
+  });
+
+  it('streamed scheduled-task to a WhatsApp DM (@s.whatsapp.net) upserts chats as whatsapp+dm', async () => {
+    // Extension of the TG-group/TG-DM test for WhatsApp's DM JID
+    // shape. Matches the db.ts legacy backfill convention
+    // (`@s.whatsapp.net` → whatsapp + is_group=0). Without this
+    // branch, a first send to a WA DM would land with channel/is_group
+    // NULL and the chat would be invisible to getAvailableGroups().
+    const GROUP_REG = {
+      name: 'WA DM',
+      folder: 'wadm',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+    const chatJid = '15555555555@s.whatsapp.net';
+
+    createTask({
+      id: 'wa-dm-task',
+      group_folder: 'wadm',
+      chat_jid: chatJid,
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: 'ok',
+        } as ContainerOutput);
+        return { status: 'success', result: 'ok' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ [chatJid]: GROUP_REG }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const chat = getAllChats().find((c) => c.jid === chatJid);
+    expect(chat).toBeTruthy();
+    expect(chat!.channel).toBe('whatsapp');
+    expect(chat!.is_group).toBe(0);
+  });
+
+  it('streamed scheduled-task with all-internal result does NOT write a bot row', async () => {
+    // Sibling regression: if the streamed text is ENTIRELY wrapped in
+    // `<internal>…</internal>` tags, the stripped `cleanResult` is
+    // empty and the `if (cleanResult)` guard short-circuits both the
+    // send AND the store. Verifies the store gate is aligned with the
+    // send gate — we don't accidentally write empty-content rows.
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+    const chatJid = 'internal-only@g.us';
+    storeChatMetadata(chatJid, '2026-01-01T00:00:00.000Z', 'InternalOnly');
+
+    createTask({
+      id: 'internal-only-task',
+      group_folder: 'main',
+      chat_jid: chatJid,
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: '<internal>debug only — not for user</internal>',
+        } as ContainerOutput);
+        return { status: 'success', result: '' };
+      },
+    );
+
+    const sentTexts: string[] = [];
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ [chatJid]: MAIN_GROUP }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async (_jid: string, text: string) => {
+        sentTexts.push(text);
+      },
+      wipeSessionJsonl: () => 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // No send happened (cleanResult was empty after strip).
+    expect(sentTexts).toEqual([]);
+    // And no bot row was written for this chat — the store gate must
+    // be aligned with the send gate, otherwise we'd get empty-content
+    // rows polluting heartbeat's answered-check accounting.
+    expect(getLastBotMessageTimestamp(chatJid, 'bot')).toBeFalsy();
   });
 
   it('computeNextRun skips missed intervals without infinite loop', () => {
@@ -427,6 +1045,7 @@ describe('task scheduler', () => {
       last_result: null,
       status: 'active' as const,
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     };
 
     const nextRun = computeNextRun(task);
@@ -453,6 +1072,7 @@ describe('task scheduler', () => {
       next_run: new Date(t0).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
     // Mimic scheduler's terminal write-back: nextRun=null marks it completed
     // and stamps last_run with the current (mocked) time.
@@ -478,6 +1098,7 @@ describe('task scheduler', () => {
       next_run: '2026-01-01T00:00:00.000Z',
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
     updateTaskAfterRun('recent-completed', null, 'ok');
 
@@ -499,6 +1120,7 @@ describe('task scheduler', () => {
       next_run: old,
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
 
     const removed = pruneCompletedTasks(COMPLETED_TASK_TTL_MS);
@@ -525,6 +1147,7 @@ describe('task scheduler', () => {
       status: 'active',
       // Backdate creation past the TTL boundary.
       created_at: new Date(t0 - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
+      created_by_role: 'owner' as const,
     });
     // Mark completed WITHOUT going through updateTaskAfterRun — that's the
     // dispatch-failure shape the bug describes. last_run stays NULL.
@@ -573,6 +1196,7 @@ describe('task scheduler', () => {
       next_run: new Date(t0).toISOString(),
       status: 'active',
       created_at: new Date(t0).toISOString(),
+      created_by_role: 'owner' as const,
     });
     updateTaskAfterRun('env-ttl-task', null, 'ok');
 
@@ -606,6 +1230,7 @@ describe('task scheduler', () => {
         next_run: new Date(t0).toISOString(),
         status: 'active',
         created_at: new Date(t0 - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
+        created_by_role: 'owner' as const,
       });
       updateTask(id, { status: 'completed' });
     }
@@ -614,10 +1239,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({}),
-      getSessions: () => ({}),
       queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     // SCHEDULER_POLL_INTERVAL is 60s — advance in poll-sized steps so
@@ -657,6 +1282,7 @@ describe('task scheduler', () => {
       next_run: new Date(tNow).toISOString(),
       status: 'active',
       created_at: new Date(tNow - COMPLETED_TASK_TTL_MS - 60_000).toISOString(),
+      created_by_role: 'owner' as const,
     });
     updateTask('p3', { status: 'completed' });
 
@@ -692,6 +1318,7 @@ describe('task scheduler', () => {
       next_run: new Date(t0 + 60_000).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
     // Stamp last_run > DORMANT_CRON_THRESHOLD_MS in the past.
     updateTaskAfterRun(
@@ -707,10 +1334,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({}),
-      getSessions: () => ({}),
       queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
 
     await vi.advanceTimersByTimeAsync(10);
@@ -749,6 +1376,7 @@ describe('task scheduler', () => {
       next_run: new Date(t0 + 60_000).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
     updateTaskAfterRun(
       'dormant-dedup',
@@ -762,10 +1390,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({}),
-      getSessions: () => ({}),
       queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
     await vi.advanceTimersByTimeAsync(10);
 
@@ -811,6 +1439,7 @@ describe('task scheduler', () => {
       next_run: new Date(t0 + 60_000).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
     updateTaskAfterRun(
       'dormant-vanish',
@@ -823,10 +1452,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({}),
-      getSessions: () => ({}),
       queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
     await vi.advanceTimersByTimeAsync(10);
 
@@ -867,6 +1496,7 @@ describe('task scheduler', () => {
       next_run: new Date(restoreTime + 60_000).toISOString(),
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
+      created_by_role: 'owner' as const,
     });
     vi.setSystemTime(t0);
     updateTaskAfterRun(
@@ -904,6 +1534,7 @@ describe('task scheduler', () => {
       status: 'active',
       // created_at = "now" — fresh task, well within DORMANT_CRON_THRESHOLD_MS.
       created_at: new Date(t0).toISOString(),
+      created_by_role: 'owner' as const,
     });
     // Deliberately do NOT call updateTaskAfterRun — last_run stays NULL,
     // mirroring a never-run cron.
@@ -912,10 +1543,10 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({}),
-      getSessions: () => ({}),
       queue: { enqueueTask: vi.fn(), closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
+      wipeSessionJsonl: () => 0,
     });
     // First tick passes the prune gate (lastPruneAt=0). The dormant
     // sweep runs; with the COALESCE fix it must NOT flag this task.

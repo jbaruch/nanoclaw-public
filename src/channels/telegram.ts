@@ -5,7 +5,6 @@ import { Api, Bot, InputFile } from 'grammy';
 import OpenAI from 'openai';
 
 import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
-import { createDraftStream, DraftStream } from '../draft-stream.js';
 import { getLatestMessage, getMessageById, storeReaction } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -43,20 +42,71 @@ async function sendTelegramMessage(
   // `[text](url)` despite being told to use HTML. Well-formed HTML passes
   // through unchanged; URLs/emails/existing tags are protected.
   const sanitized = sanitizeTelegramHtml(text);
+  const rawChanged = sanitized !== text;
+  logger.debug(
+    {
+      chatId,
+      rawLen: text.length,
+      rawPreview: text.slice(0, 80),
+      sanitizedLen: sanitized.length,
+      sanitizedPreview: sanitized.slice(0, 80),
+      rawChanged,
+      hasReplyTo: Boolean(options.reply_parameters?.message_id),
+    },
+    '[send] sendTelegramMessage entered',
+  );
   try {
     const msg = await api.sendMessage(chatId, sanitized, {
       ...options,
       parse_mode: 'HTML',
     });
+    logger.debug(
+      { chatId, messageId: msg.message_id, sanitizedLen: sanitized.length },
+      '[send] HTML send OK',
+    );
     return msg.message_id;
   } catch (err) {
     // Fallback: HTML parsing failed — send the ORIGINAL text without
     // parse_mode. Sending `sanitized` here would render raw `<b>…</b>`
     // tags literally to the user, which is strictly worse than the raw
     // Markdown the agent produced.
-    logger.debug({ err }, 'HTML send failed, falling back to plain text');
-    const msg = await api.sendMessage(chatId, text, options);
-    return msg.message_id;
+    //
+    // Logged at WARN (not debug) so production info-level logs capture
+    // this: when the fallback fires the user sees raw Markdown, which is
+    // a user-visible symptom we want visible without flipping log level.
+    // `rawPreview` identifies the actual text delivered to Telegram.
+    logger.warn(
+      {
+        err,
+        chatId,
+        rawLen: text.length,
+        rawPreview: text.slice(0, 200),
+        sanitizedPreview: sanitized.slice(0, 200),
+      },
+      '[send] HTML send failed, falling back to plain text (user will see raw Markdown)',
+    );
+    try {
+      const msg = await api.sendMessage(chatId, text, options);
+      logger.warn(
+        { chatId, messageId: msg.message_id },
+        '[send] Plain-text fallback OK — DB row will still be written by the caller',
+      );
+      return msg.message_id;
+    } catch (fallbackErr) {
+      // BOTH sends failed. The message may or may not have reached
+      // Telegram (depending on where the second failure occurred). Log
+      // loudly and re-throw so the caller's try/catch can decide.
+      logger.error(
+        {
+          err: fallbackErr,
+          chatId,
+          rawPreview: text.slice(0, 200),
+          originalHtmlErr: err,
+        },
+        '[send] Both HTML and plain-text sends failed — message may be lost',
+      );
+      throw fallbackErr;
+    }
   }
 }
 
@@ -230,7 +280,7 @@ const EMOJI_SHORTCODE_TO_UNICODE: Record<string, string> = {
  */
 export function normalizeReactionEmoji(input: string): string {
   // Strip U+FE0F (VARIATION SELECTOR-16). Written as the explicit
-  // `\uFE0F` escape — an invisible literal in the regex source is
+  // `️` escape — an invisible literal in the regex source is
   // hard to audit and trivially altered by editor reformatting.
   const noVS16 = input.replace(/\uFE0F/g, '');
   if (TELEGRAM_ALLOWED_REACTIONS.has(noVS16)) return noVS16;
@@ -604,10 +654,31 @@ export async function sendPoolMessage(
   text: string,
   sender: string,
   groupFolder: string,
-): Promise<void> {
+): Promise<string | undefined> {
+  logger.debug(
+    {
+      chatId,
+      sender,
+      groupFolder,
+      textLen: text.length,
+      preview: text.slice(0, 80),
+      poolSize: poolApis.length,
+    },
+    '[send] sendPoolMessage entered',
+  );
   if (poolApis.length === 0) {
-    // No pool bots — fall back to main bot sendMessage via channel
-    return;
+    // No pool bots configured — return undefined without sending.
+    // Earlier comment claimed "fall back to main bot sendMessage via
+    // channel" but no such fallback is implemented here; callers that
+    // observe undefined must treat it as a hard send failure for the
+    // pool path (the IPC handler in `src/ipc.ts` logs the returned id
+    // and stores it on the bot row, so `undefined` correctly surfaces
+    // as "no Telegram id recorded" rather than a silent drop).
+    logger.warn(
+      { chatId, sender, groupFolder },
+      '[send] sendPoolMessage called with empty pool — returning undefined (message NOT sent; pool-identity sends require TELEGRAM_BOT_POOL to be configured)',
+    );
+    return undefined;
   }
 
   const key = `${groupFolder}:${sender}`;
@@ -636,8 +707,22 @@ export async function sendPoolMessage(
   try {
     const numericId = chatId.replace(/^tg:/, '');
     const chunks = splitMessage(text);
-    for (const chunk of chunks) {
-      await sendTelegramMessage(api, numericId, chunk);
+    logger.debug(
+      { chatId, sender, poolIndex: idx, chunkCount: chunks.length },
+      '[send] sendPoolMessage: sending chunks',
+    );
+    // Return the LAST chunk's Telegram ID — matches `channel.sendMessage`
+    // above and is the one reply_to threads point at. Callers that want
+    // per-chunk IDs would need to change the signature; no current caller
+    // cares (the stored `messages.db` row represents the full text, so
+    // one ID is enough to trace the send).
+    let lastMsgId: number | undefined;
+    for (let i = 0; i < chunks.length; i++) {
+      lastMsgId = await sendTelegramMessage(api, numericId, chunks[i]);
+      logger.debug(
+        { chatId, sender, poolIndex: idx, chunkIndex: i },
+        '[send] sendPoolMessage: chunk sent',
+      );
     }
     logger.info(
       {
@@ -649,8 +734,24 @@ export async function sendPoolMessage(
       },
       'Pool message sent',
     );
+    return lastMsgId?.toString();
   } catch (err) {
-    logger.error({ chatId, sender, err }, 'Failed to send pool message');
+    // Swallowed — caller won't know. Log at ERROR so at least the
+    // operator sees it. The message MAY have reached Telegram before
+    // the failure (e.g. fallback succeeded but Grammy threw post-send);
+    // if no DB row lands, correlate this error with what appears in the
+    // chat.
+    logger.error(
+      {
+        chatId,
+        sender,
+        poolIndex: idx,
+        err,
+        preview: text.slice(0, 200),
+      },
+      '[send] Failed to send pool message — caller will still call storeMessage, but the send may have partially landed in Telegram',
+    );
+    return undefined;
   }
 }
 
@@ -686,6 +787,79 @@ export class TelegramChannel implements Channel {
         baseFetchConfig: { agent: https.globalAgent, compress: true },
       },
     });
+
+    // Grammy API transformer — catches every outbound call on THIS Bot
+    // instance regardless of which internal code path invoked it. Logs
+    // method + payload preview + a stack trace of the caller. Existing
+    // [send] tracepoints cover every path we currently know about
+    // (sendTelegramMessage wrapper, sendFile, sendPoolMessage), but
+    // issue #81's ghost messages keep showing up with no matching
+    // trace — meaning some path we haven't discovered is invoking
+    // `this.bot.api.*`. A transformer is the ONLY place that sees
+    // every grammy-originated call without relying on callers to
+    // opt-in to logging.
+    //
+    // Enabled only when LOG_LEVEL=debug. The custom logger in
+    // `src/logger.ts` only defines debug/info/warn/error/fatal — unknown
+    // levels fall back to info, so gating on "trace" would attach the
+    // transformer and pay the stack/preview cost while logger.debug
+    // output was suppressed. Keep the gate strictly to the level that
+    // actually prints.
+    const traceGrammy = process.env.LOG_LEVEL === 'debug';
+    // Guard the grammy internal surface. `bot.api.config.use` exists on
+    // real grammy Bot instances, but unit tests mock `this.bot` without
+    // the `api.config` tree, and nothing in grammy's API stability
+    // policy promises this hook. If it's missing, log and continue —
+    // the diagnostic is a nice-to-have; crashing `connect()` because a
+    // future grammy release renamed `config` would be much worse.
+    const grammyConfig = this.bot.api?.config as
+      | { use?: (transformer: Parameters<Api['config']['use']>[0]) => void }
+      | undefined;
+    if (traceGrammy && typeof grammyConfig?.use === 'function') {
+      grammyConfig.use(async (prev, method, payload, signal) => {
+        // Stack trace — Error().stack captures the synchronous call
+        // chain up to this transformer. Slice the top frames so the
+        // grammy internals don't drown out the interesting caller.
+        const stack = new Error().stack?.split('\n').slice(2, 10).join('\n');
+        // Payload preview — trim strings to avoid dumping 4KB of
+        // message text into every log line. Only text / caption / chat
+        // routing fields matter for forensics.
+        const preview: Record<string, unknown> = {};
+        if (payload && typeof payload === 'object') {
+          const p = payload as Record<string, unknown>;
+          if ('chat_id' in p) preview.chat_id = p.chat_id;
+          if ('message_id' in p) preview.message_id = p.message_id;
+          if ('text' in p && typeof p.text === 'string') {
+            preview.textLen = p.text.length;
+            preview.textPreview = p.text.slice(0, 120);
+          }
+          if ('caption' in p && typeof p.caption === 'string') {
+            preview.captionLen = p.caption.length;
+            preview.captionPreview = p.caption.slice(0, 120);
+          }
+          if ('parse_mode' in p) preview.parse_mode = p.parse_mode;
+          // Log only the `message_id` from reply_parameters. The full
+          // object can carry nested `quote` text / entities that would
+          // defeat the "trimmed preview" goal and potentially echo user
+          // content into debug logs.
+          if ('reply_parameters' in p) {
+            const rp = p.reply_parameters as { message_id?: unknown } | null;
+            if (rp && typeof rp === 'object' && 'message_id' in rp) {
+              preview.reply_to_message_id = rp.message_id;
+            }
+          }
+        }
+        logger.debug({ method, preview, stack }, '[grammy-api] outbound call');
+        return prev(method, payload, signal);
+      });
+      logger.info(
+        'Grammy API transformer attached — every bot.api.* call will be traced',
+      );
+    } else if (traceGrammy) {
+      logger.warn(
+        '[grammy-api] LOG_LEVEL=debug set but bot.api.config.use unavailable — transformer skipped (likely mocked Bot in tests, or a grammy API change)',
+      );
+    }
 
     // Command to get chat ID (useful for registration)
     this.bot.command('chatid', (ctx) => {
@@ -1103,6 +1277,15 @@ export class TelegramChannel implements Channel {
     text: string,
     replyToMessageId?: string,
   ): Promise<string | void> {
+    logger.debug(
+      {
+        jid,
+        textLen: text.length,
+        preview: text.slice(0, 80),
+        replyToMessageId,
+      },
+      '[send] TelegramChannel.sendMessage entered',
+    );
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
       return;
@@ -1123,6 +1306,10 @@ export class TelegramChannel implements Channel {
 
       // Split respecting content boundaries (code blocks, paragraphs, etc.)
       const chunks = splitMessage(text);
+      logger.debug(
+        { jid, chunkCount: chunks.length },
+        '[send] TelegramChannel.sendMessage: sending chunks',
+      );
       let lastMsgId: number | undefined;
       for (let i = 0; i < chunks.length; i++) {
         const chunkOptions = i === 0 ? options : {};
@@ -1134,12 +1321,29 @@ export class TelegramChannel implements Channel {
         );
       }
       logger.info(
-        { jid, length: text.length, replyToMessageId, chunks: chunks.length },
+        {
+          jid,
+          length: text.length,
+          replyToMessageId,
+          chunks: chunks.length,
+          lastMsgId,
+        },
         'Telegram message sent',
       );
       return lastMsgId?.toString();
     } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Telegram message');
+      // Err here only if sendTelegramMessage's fallback catch re-threw
+      // (i.e. both HTML and plain-text sends failed). Return undefined
+      // so the caller's `if (sentMsgId)` guards skip the post-send
+      // work. The message did NOT reach Telegram in this path.
+      logger.error(
+        {
+          jid,
+          err,
+          preview: text.slice(0, 200),
+        },
+        '[send] Failed to send Telegram message — returning undefined (message NOT delivered)',
+      );
     }
   }
 
@@ -1327,31 +1531,6 @@ export class TelegramChannel implements Channel {
       return;
     }
     await this.sendReaction(jid, latest.id, emoji);
-  }
-
-  createDraftStream(jid: string, replyToMessageId?: string): DraftStream {
-    const numericId = jid.replace(/^tg:/, '');
-    return createDraftStream({
-      sendMessage: async (text) => {
-        const opts: Record<string, unknown> = {};
-        if (replyToMessageId) {
-          opts.reply_parameters = {
-            message_id: parseInt(replyToMessageId, 10),
-          };
-        }
-        const msg = await this.bot!.api.sendMessage(numericId, text, opts);
-        return msg.message_id;
-      },
-      editMessage: async (messageId, text) => {
-        await this.bot!.api.editMessageText(numericId, messageId, text);
-      },
-      deleteMessage: async (messageId) => {
-        await this.bot!.api.deleteMessage(numericId, messageId);
-      },
-      throttleMs: 1000,
-      maxLength: 4096,
-      minInitialChars: 30,
-    });
   }
 }
 

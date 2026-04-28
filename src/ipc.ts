@@ -22,13 +22,17 @@ import {
   createTask,
   deleteAllSessions,
   deleteTask,
+  getLastFromMeMessages,
   getTaskById,
+  getTasksForGroup,
   storeMessage,
   updateTask,
 } from './db.js';
+import type { ContainerStatus } from './group-queue.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { stripInternalTags } from './router.js';
+import { isValidTimezone } from './timezone.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -51,6 +55,33 @@ export interface IpcDeps {
   ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
+  /**
+   * Inverse of `registerGroup` (#159). Removes the in-memory entry and
+   * the DB row in one call. Returns false if the JID was not registered
+   * — caller can use that to log a no-op or to surface "nothing to do"
+   * to the requester. The caller is responsible for refreshing the
+   * `available_groups.json` snapshot afterward (mirrors the
+   * registerGroup contract).
+   *
+   * Out of scope: deleting the on-disk `groups/<folder>/` directory.
+   * Operators delete that manually; auto-deletion would silently destroy
+   * agent-curated state (CLAUDE.md, MEMORY.md, scheduled-task workspace)
+   * on every churn of the registration.
+   */
+  unregisterGroup: (jid: string) => boolean;
+  /** Partial update: flip `containerConfig.trusted` only. Returns false if the JID isn't registered. */
+  setGroupTrusted: (jid: string, trusted: boolean) => boolean;
+  /**
+   * Partial update: change the trigger pattern (and optionally
+   * `requiresTrigger`) only. Returns false if (a) the JID isn't
+   * registered, or (b) the trigger fails the non-empty/whitespace
+   * invariant enforced by `updateGroupTrigger`.
+   */
+  setGroupTrigger: (
+    jid: string,
+    trigger: string,
+    requiresTrigger?: boolean,
+  ) => boolean;
   syncGroups: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
@@ -65,6 +96,17 @@ export interface IpcDeps {
     groupFolder: string,
     session: 'default' | 'maintenance' | 'all',
   ) => void;
+  /**
+   * Read the derived container status for a given (jid, sessionName)
+   * slot. Used by `chat_status` to surface running/idle/cooling-down/
+   * crashed/not-spawned without exposing the queue's internal state map.
+   * Implementations must combine the GroupQueue slot state with the
+   * orchestrator-side circuit breaker (per group folder).
+   */
+  getContainerStatus?: (
+    chatJid: string,
+    sessionName: 'default' | 'maintenance',
+  ) => ContainerStatus;
 }
 
 let ipcWatcherRunning = false;
@@ -75,11 +117,12 @@ let ipcWatcherRunning = false;
  * requesting container mounts at `/workspace/ipc/input/` — otherwise the
  * container polls forever and the IPC call times out.
  *
- * The container-side MCP server stamps `sessionName` onto every TASKS_DIR
- * request (see `container/agent-runner/src/ipc-mcp-stdio.ts`). Older
- * containers that predate that change (or any request where the field is
- * missing) fall back to the default session — matches pre-parallel
- * behavior where only one session existed.
+ * The container-side MCP server stamps `sessionName` onto every IPC
+ * payload (both TASKS and MESSAGES — see
+ * `container/agent-runner/src/ipc-mcp-stdio.ts`). Older containers that
+ * predate that change (or any request where the field is missing) fall
+ * back to the default session — matches pre-parallel behavior where
+ * only one session existed.
  */
 // Session names accepted on IPC requests: ONLY the two the orchestrator
 // ever creates. A broader regex (e.g. `[A-Za-z0-9_-]+`) would let a
@@ -91,6 +134,23 @@ const KNOWN_SESSION_NAMES: ReadonlySet<string> = new Set([
   MAINTENANCE_SESSION_NAME,
 ]);
 const VALID_REQUEST_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+// Host-side allowlist for the five tile-repo names the promote flow is
+// wired against. The MCP tools' zod enums (ipc-mcp-stdio.ts::TILE_NAMES)
+// mirror this list client-side for a clean schema error at tool-call
+// time, but the IPC handler is reachable by any payload dropped into
+// the tasks dir — a compromised container could skip the MCP path and
+// write `{tileName: "../../etc"}` directly, escaping GROUPS_DIR via
+// `path.join` or pointing the bash scripts at an attacker-controlled
+// git URL. This set is the actual trust boundary; keeping it in sync
+// with the client-side enum is a release-hygiene concern.
+const KNOWN_TILE_NAMES: ReadonlySet<string> = new Set([
+  'nanoclaw-admin',
+  'nanoclaw-core',
+  'nanoclaw-untrusted',
+  'nanoclaw-trusted',
+  'nanoclaw-host',
+]);
 
 /**
  * Compute the host path where an IPC response file should land.
@@ -165,6 +225,34 @@ function scriptResultPath(
   return path.join(inputDir, `_script_result_${requestId}.json`);
 }
 
+// Prefix for outbound text emitted by the maintenance-session Andy.
+// Without the prefix, a scheduled-task reply looks identical to a
+// user-facing reply in the chat, which confused Baruch when he
+// responded to `[check-unanswered heartbeat from maintenance]` messages
+// as if they were live conversation. The prefix is applied BOTH to
+// Telegram-bound text AND to the messages.db copy so the full trail
+// shows provenance — heartbeat accounting, future message recap, etc.
+const MAINTENANCE_MESSAGE_PREFIX = '[M] ';
+
+/**
+ * Prepend `[M] ` if the payload came from the maintenance session.
+ * Idempotent — if the text already begins with the prefix (double-
+ * hop case, agent that hand-typed it, whatever), we don't stack.
+ * Exported for the unit test; the production caller is in the same
+ * file so the public API is a single entry point.
+ *
+ * @internal — test-only export, should not be part of the public
+ * `.d.ts` surface (we build with `stripInternal: true`).
+ */
+export function applyMaintenancePrefix(
+  text: string,
+  sessionName: string | undefined,
+): string {
+  if (sessionName !== MAINTENANCE_SESSION_NAME) return text;
+  if (text.startsWith(MAINTENANCE_MESSAGE_PREFIX)) return text;
+  return MAINTENANCE_MESSAGE_PREFIX + text;
+}
+
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -210,6 +298,26 @@ export function startIpcWatcher(deps: IpcDeps): void {
             .filter((f) => f.endsWith('.json'));
           for (const file of messageFiles) {
             const filePath = path.join(messagesDir, file);
+            // Hoisted so the catch-block at the bottom can log which
+            // message we were processing when things exploded. Without
+            // this, a throw after `data = JSON.parse(...)` but before
+            // the per-type branches would leave the error-log blind to
+            // what content was in flight.
+            let data:
+              | {
+                  type?: string;
+                  chatJid?: string;
+                  text?: string;
+                  sender?: string;
+                  replyToMessageId?: string;
+                  pin?: boolean;
+                  emoji?: string;
+                  messageId?: string;
+                  filePath?: string;
+                  caption?: string;
+                  [key: string]: unknown;
+                }
+              | undefined;
             try {
               const stat = fs.statSync(filePath);
               if (stat.size > 1_048_576) {
@@ -225,7 +333,17 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 );
                 continue;
               }
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              if (!data) {
+                // JSON.parse produced null/undefined (e.g. the file
+                // contained literal `null`). Skip to the next file.
+                logger.warn(
+                  { file, sourceGroup },
+                  '[ipc] IPC file parsed to null/undefined — skipping',
+                );
+                fs.unlinkSync(filePath);
+                continue;
+              }
               if (
                 data.type === 'react_to_message' &&
                 data.chatJid &&
@@ -299,8 +417,21 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     // Mirrors the message-payload stripping below. If the
                     // caption is fully internal, send the file with no
                     // caption; the file itself is still useful payload.
-                    const cleanCaption = data.caption
+                    const strippedCaption = data.caption
                       ? stripInternalTags(data.caption)
+                      : '';
+                    // Tag maintenance-session captions so Baruch can
+                    // tell a scheduled-task file-send from a live one.
+                    // Skip the prefix entirely when the caption is
+                    // empty — `[M] ` alone on a silent file-send is
+                    // noise.
+                    const cleanCaption = strippedCaption
+                      ? applyMaintenancePrefix(
+                          strippedCaption,
+                          typeof data.sessionName === 'string'
+                            ? data.sessionName
+                            : undefined,
+                        )
                       : '';
                     await deps.sendFile(
                       data.chatJid,
@@ -342,46 +473,151 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   }
                 }
               } else if (data.type === 'message' && data.chatJid && data.text) {
-                // Strip <internal> tags — if nothing remains, skip silently
-                const cleanText = data.text
-                  .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-                  .trim();
-                if (!cleanText) {
+                logger.debug(
+                  {
+                    sourceGroup,
+                    chatJid: data.chatJid,
+                    rawTextLen: data.text.length,
+                    rawPreview: String(data.text).slice(0, 80),
+                    hasSender: Boolean(data.sender),
+                    senderValue: data.sender,
+                    hasReplyTo: Boolean(data.replyToMessageId),
+                    hasPin: Boolean(data.pin),
+                    ipcFile: file,
+                  },
+                  '[ipc] Received send_message IPC',
+                );
+                // Strip <internal> tags via the shared helper so this
+                // path can't drift from the send_file caption path
+                // above. If nothing remains, skip silently.
+                const strippedText = stripInternalTags(data.text);
+                if (!strippedText) {
                   logger.debug(
                     { sourceGroup },
-                    'IPC message suppressed (all internal)',
+                    '[ipc] send_message suppressed (all internal)',
                   );
                   fs.unlinkSync(filePath);
                   continue;
                 }
+                // Tag maintenance-session text so Baruch can tell a
+                // scheduled-task reply from a live conversational one.
+                // Applied AFTER internal-tag stripping (no point
+                // prefixing text we're about to suppress) and BEFORE
+                // both the Telegram send and the messages.db store, so
+                // the prefix flows through accounting uniformly.
+                const cleanText = applyMaintenancePrefix(
+                  strippedText,
+                  typeof data.sessionName === 'string'
+                    ? data.sessionName
+                    : undefined,
+                );
+                logger.debug(
+                  {
+                    sourceGroup,
+                    chatJid: data.chatJid,
+                    cleanLen: cleanText.length,
+                    cleanPreview: cleanText.slice(0, 80),
+                  },
+                  '[ipc] send_message after stripInternalTags + maintenance-prefix',
+                );
 
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
-                if (
+                const authOk =
                   isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (data.sender && data.chatJid.startsWith('tg:')) {
-                    await sendPoolMessage(
+                  Boolean(targetGroup && targetGroup.folder === sourceGroup);
+                logger.debug(
+                  {
+                    sourceGroup,
+                    chatJid: data.chatJid,
+                    isMain,
+                    targetGroupFolder: targetGroup?.folder,
+                    authOk,
+                  },
+                  '[ipc] send_message auth check',
+                );
+                if (authOk) {
+                  const usePool = Boolean(
+                    data.sender && data.chatJid.startsWith('tg:'),
+                  );
+                  logger.debug(
+                    {
+                      sourceGroup,
+                      chatJid: data.chatJid,
+                      path: usePool ? 'pool' : 'direct',
+                      sender: data.sender,
+                    },
+                    '[ipc] send_message path decision',
+                  );
+                  // Capture whichever send path's message ID applies. Both
+                  // `sendPoolMessage` and `deps.sendMessage` return the
+                  // Telegram-native message ID (or undefined if the send
+                  // failed or the channel isn't Telegram). Stored on the
+                  // messages row so "which bot send produced Telegram ID X"
+                  // is queryable without log spelunking.
+                  // Normalize immediately: both send paths can return
+                  // `string | void | undefined`. Collapsing to the
+                  // `string | undefined` domain up front keeps downstream
+                  // uses (`pinMessage`, `storeMessage`) type-safe without
+                  // truthiness checks that would also drop legitimate
+                  // empty-string / '0' IDs if Telegram ever returns them.
+                  let sentMsgId: string | undefined;
+                  if (usePool) {
+                    // `usePool` is only true when `data.sender` is a non-
+                    // empty string — TS just can't re-narrow across the
+                    // intermediate `Boolean(...)` boundary. The `!` is
+                    // safe by the `usePool` definition directly above.
+                    const poolResult = await sendPoolMessage(
                       data.chatJid,
                       cleanText,
-                      data.sender,
+                      data.sender!,
                       sourceGroup,
                     );
+                    sentMsgId =
+                      typeof poolResult === 'string' ? poolResult : undefined;
+                    logger.debug(
+                      {
+                        sourceGroup,
+                        chatJid: data.chatJid,
+                        sentMsgId,
+                      },
+                      '[ipc] sendPoolMessage returned',
+                    );
                   } else {
-                    const sentMsgId = await deps.sendMessage(
+                    const directResult = await deps.sendMessage(
                       data.chatJid,
                       cleanText,
                       data.replyToMessageId,
                     );
+                    sentMsgId =
+                      typeof directResult === 'string'
+                        ? directResult
+                        : undefined;
+                    logger.debug(
+                      {
+                        sourceGroup,
+                        chatJid: data.chatJid,
+                        sentMsgId,
+                      },
+                      '[ipc] deps.sendMessage returned',
+                    );
                     // Pin the message if requested
                     if (data.pin && sentMsgId && deps.pinMessage) {
                       await deps.pinMessage(data.chatJid, sentMsgId);
+                      logger.debug(
+                        { sourceGroup, chatJid: data.chatJid, sentMsgId },
+                        '[ipc] pinMessage returned',
+                      );
                     }
                   }
-                  // Store bot response so heartbeat can track answered messages
+                  // Store bot response so heartbeat can track answered messages.
+                  // If we reach here the send path (pool or direct) returned
+                  // without an unhandled throw — so a DB row should ALWAYS
+                  // appear unless the storeMessage call itself throws (see
+                  // outer catch).
+                  const botRowId = `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
                   storeMessage({
-                    id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                    id: botRowId,
                     chat_jid: data.chatJid,
                     sender: data.sender || ASSISTANT_NAME,
                     sender_name: data.sender || ASSISTANT_NAME,
@@ -390,23 +626,50 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     is_from_me: true,
                     is_bot_message: true,
                     reply_to_message_id: data.replyToMessageId,
+                    telegram_message_id: sentMsgId,
                   });
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      botRowId,
+                      contentLen: cleanText.length,
+                    },
+                    '[ipc] send_message complete — DB row written',
                   );
                 } else {
                   logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
+                    {
+                      chatJid: data.chatJid,
+                      sourceGroup,
+                      targetGroupFolder: targetGroup?.folder,
+                    },
+                    '[ipc] Unauthorized IPC message attempt blocked',
                   );
                 }
               }
               fs.unlinkSync(filePath);
             } catch (err) {
+              // Catches anything thrown above (JSON.parse, auth, send, storeMessage).
+              // If this fires AFTER the send already landed in Telegram, the
+              // user sees a message with no DB row — exactly the ghost-heartbeat
+              // symptom. Log the err, the data type, and a preview so the
+              // operator can correlate with what appeared in the chat.
               logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
+                {
+                  file,
+                  sourceGroup,
+                  err,
+                  dataType: (data as { type?: string } | undefined)?.type,
+                  dataChatJid: (data as { chatJid?: string } | undefined)
+                    ?.chatJid,
+                  dataTextPreview:
+                    typeof (data as { text?: string } | undefined)?.text ===
+                    'string'
+                      ? (data as { text: string }).text.slice(0, 200)
+                      : undefined,
+                },
+                '[ipc] Error processing IPC message — message may have been sent to the chat before the throw, in which case no DB row will exist',
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
@@ -484,6 +747,16 @@ export async function processTaskIpc(
     prompt?: string;
     schedule_type?: string;
     schedule_value?: string;
+    /**
+     * IANA timezone for cron expressions; #102.
+     *
+     * `null` is also accepted on the update path (where it means
+     * "clear back to TIMEZONE default"). Must be `string | null` — not
+     * just `string` — because IPC payloads arrive as raw JSON and the
+     * caller can legitimately send `null` to unset; TS strict mode
+     * would otherwise reject the `data.timezone === null` check.
+     */
+    timezone?: string | null;
     context_mode?: string;
     script?: string;
     groupFolder?: string;
@@ -496,25 +769,35 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For set_trusted
+    trusted?: boolean;
     // For host operations / github_backup / promote_staging
     requestId?: string;
     message?: string;
     tileName?: string;
     skillName?: string;
+    // push_staged_to_branch
+    branch?: string;
+    commitMessage?: string;
     slug?: string;
     filter?: Record<string, boolean>;
     dryRun?: boolean;
     command?: string;
     payload?: string | Record<string, unknown>;
     confirm?: boolean;
+    // chat_status / nuke_chat
+    chat_id?: string;
+    chat_name?: string;
+    session?: 'default' | 'maintenance' | 'all';
     /**
-     * Continuation marker for self-resuming cycles. Set by a
-     * continuation-aware caller when scheduling the next link of a
-     * chain via `schedule_task`. Persisted onto the scheduled_tasks
-     * row verbatim; surfaced to the spawned container at fire time as
+     * Continuation marker for self-resuming cycles (#93/#130). Set by the
+     * resumable-cycle helper skill when scheduling the next link of a
+     * chain via `schedule_task`. Persisted onto the scheduled_tasks row
+     * verbatim; surfaced to the spawned container at fire time as
      * `NANOCLAW_CONTINUATION=1` + `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`.
-     * Free-form opaque slot key, but type-narrowed to string for
-     * safety; non-string values are dropped at the handler.
+     * Free-form opaque slot key (UTC date / ISO week per the proposal),
+     * but type-narrowed to string for safety; non-string values are
+     * dropped at the handler.
      */
     continuation_cycle_id?: string;
   },
@@ -557,16 +840,59 @@ export async function processTaskIpc(
 
         const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
 
+        // #102: optional IANA timezone parameter. Validated up-front so
+        // a typo fails the schedule call rather than silently falling
+        // back to server-local at fire time.
+        //
+        // Force `null` for non-cron types: the column has no effect on
+        // `interval` (always elapsed-ms) or `once` (instant pinned at
+        // schedule time). Persisting it for those types would be a
+        // footgun if the task were later updated to `cron` without
+        // explicitly passing `timezone` — an old, previously-ignored
+        // value would silently start affecting cron evaluation.
+        let scheduleTimezone: string | null = null;
+        if (
+          data.timezone !== undefined &&
+          data.timezone !== null &&
+          data.timezone !== ''
+        ) {
+          // Order matters here: ignore-because-non-cron BEFORE
+          // validate-IANA. A `once` task that happens to carry a
+          // typo'd timezone field shouldn't fail to schedule — the
+          // field has no effect anyway, just drop it. Validate only
+          // when we'd otherwise persist the value.
+          if (scheduleType !== 'cron') {
+            logger.warn(
+              { timezone: data.timezone, scheduleType },
+              'schedule_task: timezone parameter is only meaningful for cron — ignoring',
+            );
+          } else if (!isValidTimezone(data.timezone)) {
+            logger.warn(
+              { timezone: data.timezone },
+              'Invalid IANA timezone for schedule_task',
+            );
+            break;
+          } else {
+            scheduleTimezone = data.timezone;
+          }
+        }
+
         let nextRun: string | null = null;
         if (scheduleType === 'cron') {
           try {
             const interval = CronExpressionParser.parse(data.schedule_value, {
-              tz: TIMEZONE,
+              tz: scheduleTimezone || TIMEZONE,
             });
             nextRun = interval.next().toISOString();
-          } catch {
+          } catch (err) {
+            // Bind + filter rather than catch-all per
+            // `jbaruch/coding-policy: error-handling`. CronExpressionParser
+            // throws plain Error instances on invalid syntax; anything
+            // non-Error here is a bug somewhere else (e.g. a `throw "str"`
+            // upstream) and should propagate.
+            if (!(err instanceof Error)) throw err;
             logger.warn(
-              { scheduleValue: data.schedule_value },
+              { err: err.message, scheduleValue: data.schedule_value },
               'Invalid cron expression',
             );
             break;
@@ -601,13 +927,31 @@ export async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
-        // Optional continuation marker. Set by a continuation-aware
-        // caller when scheduling the next link of a self-resuming
-        // cycle chain; the task-scheduler reads it at fire time and
-        // plumbs the matching env vars onto the spawned container.
-        // Untyped non-string values are dropped — the field is a
-        // free-form opaque slot key, but we never want a stray number
-        // / object to land in the DB column.
+        // Provenance: derived from the VERIFIED source group's trust tier
+        // (sourceGroup and isMain are set from the IPC directory path, not
+        // from untrusted payload fields). The agent that scheduled the
+        // task NEVER gets to claim its own role — this is the security
+        // boundary that keeps an untrusted group from self-scheduling a
+        // prompt that later fires unwrapped as if it were trusted.
+        const sourceGroupEntry = Object.values(registeredGroups).find(
+          (g) => g.folder === sourceGroup,
+        );
+        const createdByRole:
+          | 'main_agent'
+          | 'trusted_agent'
+          | 'untrusted_agent' = isMain
+          ? 'main_agent'
+          : sourceGroupEntry?.containerConfig?.trusted
+            ? 'trusted_agent'
+            : 'untrusted_agent';
+        // Optional continuation marker (#93/#130). Set by the
+        // resumable-cycle helper skill when scheduling the next link of a
+        // self-resuming cycle chain; the task-scheduler reads it at fire
+        // time and plumbs the matching env vars onto the spawned
+        // container. Untyped non-string values are dropped — the field is
+        // a free-form opaque slot key (per the proposal: UTC date for
+        // nightly/morning-brief, ISO week for weekly), but we never want
+        // a stray number / object to land in the DB column.
         let continuationCycleId: string | null = null;
         if (
           typeof data.continuation_cycle_id === 'string' &&
@@ -623,10 +967,12 @@ export async function processTaskIpc(
           script: data.script || null,
           schedule_type: scheduleType,
           schedule_value: data.schedule_value,
+          schedule_timezone: scheduleTimezone,
           context_mode: contextMode,
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),
+          created_by_role: createdByRole,
           continuation_cycle_id: continuationCycleId,
         });
         logger.info(
@@ -635,6 +981,7 @@ export async function processTaskIpc(
             sourceGroup,
             targetFolder,
             contextMode,
+            createdByRole,
             continuationCycleId,
           },
           'Task created via IPC',
@@ -729,8 +1076,73 @@ export async function processTaskIpc(
         if (data.schedule_value !== undefined)
           updates.schedule_value = data.schedule_value;
 
-        // Recompute next_run if schedule changed
-        if (data.schedule_type || data.schedule_value) {
+        // #102: optional timezone update. `null`/empty-string clears
+        // (back to TIMEZONE default); a non-null IANA string overrides.
+        // Only meaningful for cron tasks: if the task IS a cron (or is
+        // being changed to cron in this same update), accept and
+        // persist; otherwise force the value to null so we don't store
+        // a stray timezone that would silently start affecting cron
+        // evaluation if the task were later switched to cron without
+        // explicitly re-passing it.
+        const effectiveScheduleType =
+          updates.schedule_type ?? task.schedule_type;
+
+        // If the schedule_type is being changed AWAY from cron AND the
+        // existing row had a stored schedule_timezone, drop the stored
+        // value too — even if the caller didn't explicitly pass
+        // `timezone`. Otherwise a once/interval task can outlive a
+        // previous cron incarnation with a stray timezone column that
+        // would re-activate if the task were later flipped back to
+        // cron without re-stating tz. (Copilot review round 2.)
+        if (
+          updates.schedule_type !== undefined &&
+          updates.schedule_type !== 'cron' &&
+          task.schedule_timezone &&
+          data.timezone === undefined
+        ) {
+          updates.schedule_timezone = null;
+        }
+
+        if (data.timezone !== undefined) {
+          if (data.timezone === '' || data.timezone === null) {
+            updates.schedule_timezone = null;
+          } else if (effectiveScheduleType !== 'cron') {
+            // Check non-cron BEFORE validating IANA: a typo'd tz on a
+            // once/interval task should drop silently, not abort the
+            // whole update — the field has no effect anyway.
+            logger.warn(
+              {
+                taskId: data.taskId,
+                timezone: data.timezone,
+                effectiveScheduleType,
+              },
+              'update_task: ignoring timezone — effective schedule_type is not cron',
+            );
+            updates.schedule_timezone = null;
+          } else if (!isValidTimezone(data.timezone)) {
+            logger.warn(
+              { taskId: data.taskId, timezone: data.timezone },
+              'Invalid IANA timezone in task update',
+            );
+            break;
+          } else {
+            updates.schedule_timezone = data.timezone;
+          }
+        }
+
+        // Recompute next_run if a recompute-relevant field changed.
+        // Use `!== undefined` (not truthiness) for `schedule_value`
+        // because an empty string IS a valid input on the wire (the
+        // host catches it below as invalid) — truthy-skip would
+        // silently leave next_run stale on a malformed update. For
+        // `timezone`, only count it as a recompute trigger when the
+        // (effective) schedule_type is cron — a timezone-only update
+        // on a once/interval task has no effect on next_run.
+        const triggerRecompute =
+          data.schedule_type !== undefined ||
+          data.schedule_value !== undefined ||
+          (data.timezone !== undefined && effectiveScheduleType === 'cron');
+        if (triggerRecompute) {
           const updatedTask = {
             ...task,
             ...updates,
@@ -739,12 +1151,19 @@ export async function processTaskIpc(
             try {
               const interval = CronExpressionParser.parse(
                 updatedTask.schedule_value,
-                { tz: TIMEZONE },
+                { tz: updatedTask.schedule_timezone || TIMEZONE },
               );
               updates.next_run = interval.next().toISOString();
-            } catch {
+            } catch (err) {
+              // See schedule_task above — same Error-or-rethrow pattern
+              // per `jbaruch/coding-policy: error-handling`.
+              if (!(err instanceof Error)) throw err;
               logger.warn(
-                { taskId: data.taskId, value: updatedTask.schedule_value },
+                {
+                  err: err.message,
+                  taskId: data.taskId,
+                  value: updatedTask.schedule_value,
+                },
                 'Invalid cron in task update',
               );
               break;
@@ -765,6 +1184,20 @@ export async function processTaskIpc(
               );
               break;
             }
+          } else if (updatedTask.schedule_type === 'once') {
+            // #102 follow-up: if a once-task's schedule_value changes
+            // (or the type flips to 'once'), recompute next_run from
+            // the new timestamp. Without this branch the row would
+            // keep its old `next_run` and fire incorrectly.
+            const date = new Date(updatedTask.schedule_value);
+            if (isNaN(date.getTime())) {
+              logger.warn(
+                { taskId: data.taskId, value: updatedTask.schedule_value },
+                'Invalid once timestamp in task update',
+              );
+              break;
+            }
+            updates.next_run = date.toISOString();
           }
         }
 
@@ -810,7 +1243,22 @@ export async function processTaskIpc(
         );
         break;
       }
-      if (data.jid && data.name && data.folder && data.trigger) {
+      if (
+        typeof data.jid === 'string' &&
+        typeof data.name === 'string' &&
+        typeof data.folder === 'string' &&
+        typeof data.trigger === 'string' &&
+        data.jid.length > 0 &&
+        data.name.length > 0 &&
+        data.folder.length > 0 &&
+        data.trigger.length > 0
+      ) {
+        // `typeof === 'string'` guards BEFORE calling `.trim()` on
+        // any field. IPC payloads are untrusted JSON: a malformed
+        // request like `{jid: {}}` or `{name: 42}` would otherwise
+        // throw a TypeError and route the task file to ipc/errors,
+        // creating a low-effort log-spam / DoS vector. set_trusted /
+        // set_trigger already follow this pattern; this reuses it.
         if (!isValidGroupFolder(data.folder)) {
           logger.warn(
             { sourceGroup, folder: data.folder },
@@ -818,17 +1266,43 @@ export async function processTaskIpc(
           );
           break;
         }
+        // Trim string fields so this IPC path can't leave a group
+        // registered under a whitespace-padded key. set_trusted /
+        // set_trigger trim before lookup; an untrimmed register would
+        // otherwise produce a "ghost" registration the partial-update
+        // tools can never match. Same normalization, same site of
+        // truth.
+        const trimmedJid = data.jid.trim();
+        const trimmedName = data.name.trim();
+        const trimmedTrigger = data.trigger.trim();
+        if (
+          trimmedJid.length === 0 ||
+          trimmedName.length === 0 ||
+          trimmedTrigger.length === 0
+        ) {
+          logger.warn(
+            { data },
+            'Invalid register_group request - empty/whitespace fields',
+          );
+          break;
+        }
         // Defense in depth: agent cannot set isMain via IPC.
         // Preserve isMain from the existing registration so IPC config
         // updates (e.g. adding additionalMounts) don't strip the flag.
-        const existingGroup = registeredGroups[data.jid];
-        deps.registerGroup(data.jid, {
-          name: data.name,
+        const existingGroup = registeredGroups[trimmedJid];
+        deps.registerGroup(trimmedJid, {
+          name: trimmedName,
           folder: data.folder,
-          trigger: data.trigger,
+          trigger: trimmedTrigger,
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
-          requiresTrigger: data.requiresTrigger,
+          // Explicitly default to `false` when caller omits — matches
+          // the MCP tool's documented default ("respond to all
+          // messages"). setRegisteredGroup now preserves undefined as
+          // SQL NULL, which is a distinct state from `false`, so we
+          // must not pass undefined here or the new row would behave
+          // differently than callers expect.
+          requiresTrigger: data.requiresTrigger ?? false,
           isMain: existingGroup?.isMain,
         });
         // Refresh snapshot so available_groups.json reflects new trust config immediately
@@ -843,6 +1317,212 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'unregister_group': {
+      // Inverse of register_group (#159). Same isMain gate — only the
+      // main group can change the registry. The dormant-row problem
+      // (#159 motivation) is exactly what happens when there is no
+      // structured remove path: rows linger forever, the spawner
+      // ignores them because the JSON snapshot doesn't list them, and
+      // operators can't fix it from inside chat containers because
+      // `/workspace/store/messages.db` is mounted read-only there.
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized unregister_group attempt blocked',
+        );
+        break;
+      }
+      if (typeof data.jid !== 'string' || data.jid.trim().length === 0) {
+        logger.warn(
+          { data },
+          'Invalid unregister_group request - missing/empty jid',
+        );
+        break;
+      }
+      const trimmedJid = data.jid.trim();
+      const target = registeredGroups[trimmedJid];
+      if (!target) {
+        logger.warn(
+          { jid: trimmedJid },
+          'unregister_group: group not registered (no-op)',
+        );
+        break;
+      }
+      // Refuse to unregister a main group via IPC. Losing the main
+      // registration mid-runtime would leave the orchestrator without
+      // any path that can re-create it (the same isMain gate above
+      // would reject the corresponding register_group call). The
+      // operator can flip `is_main` directly in the DB if they really
+      // mean to, which is a deliberate destructive action rather than
+      // a one-line MCP call.
+      if (target.isMain) {
+        logger.warn(
+          { jid: trimmedJid, folder: target.folder },
+          'unregister_group: refusing to unregister main group',
+        );
+        break;
+      }
+      // Cascade-delete scheduled_tasks tied to the unregistered folder
+      // BEFORE we drop the registration. Without this, the scheduler
+      // keeps firing the auto-created heartbeat (and any other tasks
+      // bound to this folder) every cycle, logging "Group not found
+      // for task" on each tick — exactly the noisy-orphan behaviour
+      // Copilot flagged on PR #198. We do this before unregisterGroup
+      // so a crash between the two leaves the registration alive (DB
+      // delete is the authoritative atomic step); the inverse ordering
+      // would orphan the registration with its tasks already gone,
+      // which is the more confusing recovery path.
+      const orphanTasks = getTasksForGroup(target.folder);
+      for (const task of orphanTasks) {
+        deleteTask(task.id);
+      }
+      if (orphanTasks.length > 0) {
+        logger.info(
+          {
+            jid: trimmedJid,
+            folder: target.folder,
+            taskIds: orphanTasks.map((t) => t.id),
+          },
+          'unregister_group: cascade-deleted scheduled tasks for unregistered folder',
+        );
+        deps.onTasksChanged();
+      }
+
+      const removed = deps.unregisterGroup(trimmedJid);
+      if (!removed) {
+        // In-memory said yes but DB said no — possible if a parallel
+        // path raced us. Log and fall through to snapshot refresh
+        // anyway: the snapshot is derived state and a refresh is
+        // always safe.
+        logger.warn(
+          { jid: trimmedJid, folder: target.folder },
+          'unregister_group: in-memory entry present but DB delete reported no rows',
+        );
+      } else {
+        logger.info(
+          { jid: trimmedJid, folder: target.folder },
+          'Group unregistered',
+        );
+      }
+      // Refresh snapshot so available_groups.json no longer flags the
+      // removed JID as registered. Same site-of-truth pattern as
+      // register_group / set_trusted / set_trigger above.
+      const availableGroups = deps.getAvailableGroups();
+      deps.writeGroupsSnapshot(
+        sourceGroup,
+        true,
+        availableGroups,
+        new Set(Object.keys(registeredGroups)),
+      );
+      break;
+    }
+
+    case 'set_trusted':
+      // Partial update: flip container_config.trusted only. Same isMain
+      // gate as register_group — only the main group can change trust
+      // state. See #105.
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized set_trusted attempt blocked',
+        );
+        break;
+      }
+      if (
+        typeof data.jid === 'string' &&
+        data.jid.trim().length > 0 &&
+        typeof data.trusted === 'boolean'
+      ) {
+        // Trim JID for the same reason as set_trigger: avoids a
+        // misleading "group not registered" warning when a caller
+        // passes whitespace-padded JID.
+        const trimmedJid = data.jid.trim();
+        const ok = deps.setGroupTrusted(trimmedJid, data.trusted);
+        if (!ok) {
+          logger.warn(
+            { jid: trimmedJid },
+            'set_trusted: group not registered (use register_group first)',
+          );
+          break;
+        }
+        const availableGroups = deps.getAvailableGroups();
+        deps.writeGroupsSnapshot(
+          sourceGroup,
+          true,
+          availableGroups,
+          new Set(Object.keys(registeredGroups)),
+        );
+        // setGroupTrusted may have reconciled the heartbeat task's
+        // `script` field as a side effect of the trust flip — refresh
+        // the per-group task snapshots so containers see the change
+        // on their next read instead of waiting for the orchestrator
+        // to write a snapshot for some other reason.
+        deps.onTasksChanged();
+      } else {
+        logger.warn(
+          { data },
+          'Invalid set_trusted request - missing/empty jid or invalid trusted',
+        );
+      }
+      break;
+
+    case 'set_trigger':
+      // Partial update: change trigger_pattern and optionally
+      // requires_trigger. Same isMain gate as register_group. See #105.
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized set_trigger attempt blocked',
+        );
+        break;
+      }
+      if (
+        typeof data.jid === 'string' &&
+        data.jid.trim().length > 0 &&
+        typeof data.trigger === 'string' &&
+        data.trigger.trim().length > 0
+      ) {
+        // Reject empty/whitespace triggers + JIDs, then pass the
+        // trimmed values downstream. `getTriggerPattern('')` trims and
+        // falls back to `DEFAULT_TRIGGER`, so an empty trigger would
+        // silently revert the group to the assistant's default trigger
+        // word — not what the caller asked for. Trimming the JID
+        // before lookup avoids a misleading "group not registered"
+        // warning when a caller passes `' tg:-123 '` (whitespace would
+        // never match the registry key).
+        const trimmedJid = data.jid.trim();
+        const trimmedTrigger = data.trigger.trim();
+        const requiresTrigger =
+          typeof data.requiresTrigger === 'boolean'
+            ? data.requiresTrigger
+            : undefined;
+        const ok = deps.setGroupTrigger(
+          trimmedJid,
+          trimmedTrigger,
+          requiresTrigger,
+        );
+        if (!ok) {
+          logger.warn(
+            { jid: trimmedJid },
+            'set_trigger: group not registered (use register_group first)',
+          );
+          break;
+        }
+        const availableGroups = deps.getAvailableGroups();
+        deps.writeGroupsSnapshot(
+          sourceGroup,
+          true,
+          availableGroups,
+          new Set(Object.keys(registeredGroups)),
+        );
+      } else {
+        logger.warn(
+          { data },
+          'Invalid set_trigger request - missing/empty jid or trigger',
         );
       }
       break;
@@ -871,6 +1551,322 @@ export async function processTaskIpc(
         deps.nukeSession(sourceGroup, validSession);
       }
       break;
+
+    case 'chat_status': {
+      // Admin tile only. Returns a structured snapshot per chat: the
+      // host-side state the admin needs to diagnose silent containers
+      // (running / idle / cooling-down / crashed / not-spawned), tile
+      // classification, trigger config, and the latest is_from_me=1
+      // message recorded for the chat.
+      const resultPath = scriptResultPath(sourceGroup, data);
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized chat_status attempt blocked',
+        );
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({
+            error: 'chat_status is admin-tile only',
+          }),
+        );
+        break;
+      }
+
+      // Resolve which chats to report on. Four cases:
+      //   - both chat_id AND chat_name → reject. Two identifiers that
+      //     might disagree is unsafe targeting; force the caller to
+      //     pick one. Defense in depth — the MCP tool layer also
+      //     blocks this, but a payload arriving directly via the IPC
+      //     dir would otherwise let chat_id silently win.
+      //   - chat_id provided → report only that one (must be registered).
+      //   - chat_name provided → resolve via name match in
+      //     registeredGroups (multiple matches → ambiguous error so the
+      //     caller can pick the right JID rather than us guessing).
+      //   - neither provided → all registered chats.
+      const hasChatId =
+        typeof data.chat_id === 'string' && data.chat_id.trim().length > 0;
+      const hasChatName =
+        typeof data.chat_name === 'string' && data.chat_name.trim().length > 0;
+      if (hasChatId && hasChatName) {
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({
+            error:
+              'chat_status accepts chat_id OR chat_name, not both — they may disagree',
+          }),
+        );
+        break;
+      }
+      const targets: string[] = [];
+      if (hasChatId) {
+        const trimmed = (data.chat_id as string).trim();
+        if (!registeredGroups[trimmed]) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({
+              error: `chat_id ${trimmed} not registered`,
+            }),
+          );
+          break;
+        }
+        targets.push(trimmed);
+      } else if (hasChatName) {
+        const wanted = (data.chat_name as string).trim();
+        const matches = Object.entries(registeredGroups).filter(
+          ([, g]) => g.name === wanted,
+        );
+        if (matches.length === 0) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({
+              error: `chat_name "${wanted}" did not match any registered chat`,
+            }),
+          );
+          break;
+        }
+        if (matches.length > 1) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({
+              error: `chat_name "${wanted}" is ambiguous — matches ${matches.length} chats`,
+              candidates: matches.map(([jid]) => jid),
+            }),
+          );
+          break;
+        }
+        targets.push(matches[0][0]);
+      } else {
+        targets.push(...Object.keys(registeredGroups));
+      }
+
+      // Batch the "latest is_from_me=1 message per chat" lookup into a
+      // single grouped query (idx_messages_fromme_chat composite
+      // index). Per-target getLastFromMeMessage calls were N
+      // statement compilations + N scan-and-sort passes; this is one
+      // query for any N.
+      const lastMessages = getLastFromMeMessages(targets);
+
+      const rows = targets.map((jid) => {
+        const group = registeredGroups[jid];
+        const tile: 'admin' | 'trusted' | 'untrusted' = group.isMain
+          ? 'admin'
+          : group.containerConfig?.trusted
+            ? 'trusted'
+            : 'untrusted';
+        // requiresTrigger defaults differ per tile: main groups bypass
+        // the trigger entirely (privileged inbox), while non-main groups
+        // require the trigger unless explicitly opted out. Mirror the
+        // canSenderInteract logic so the reported value matches what
+        // the orchestrator actually enforces.
+        const triggered = group.isMain
+          ? false
+          : group.requiresTrigger !== false;
+        const last = lastMessages.get(jid) ?? null;
+        return {
+          chat_id: jid,
+          chat_name: group.name,
+          trigger: triggered ? 'triggered' : 'untriggered',
+          tile,
+          last_ayeaye_message: last
+            ? {
+                timestamp: last.timestamp,
+                // Truncate to keep the response small even if the
+                // agent sent a multi-kilobyte reply. 200 chars matches
+                // what fits comfortably in the admin's chat preview.
+                content_snippet:
+                  last.content.length > 200
+                    ? last.content.slice(0, 200) + '…'
+                    : last.content,
+              }
+            : null,
+          containers: deps.getContainerStatus
+            ? {
+                default: deps.getContainerStatus(jid, 'default'),
+                maintenance: deps.getContainerStatus(jid, 'maintenance'),
+              }
+            : { default: 'not-spawned', maintenance: 'not-spawned' },
+        };
+      });
+
+      logger.info(
+        { sourceGroup, count: rows.length },
+        'chat_status served via IPC',
+      );
+      fs.writeFileSync(
+        resultPath,
+        JSON.stringify({ stdout: JSON.stringify({ chats: rows }) }),
+      );
+      break;
+    }
+
+    case 'nuke_chat': {
+      // Admin tile only. Cross-chat nuke — looks up the target by
+      // chat_id or chat_name and forwards to the same wipeSessionJsonl
+      // path the per-chat nuke_session uses. Hard-fails when neither
+      // identifier is provided so admin can never accidentally nuke
+      // its own chat by omission (the nuke_session tool already does
+      // "this chat" — nuke_chat is only useful when targeting another).
+      const resultPath = scriptResultPath(sourceGroup, data);
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized nuke_chat attempt blocked');
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({ error: 'nuke_chat is admin-tile only' }),
+        );
+        break;
+      }
+
+      const hasId =
+        typeof data.chat_id === 'string' && data.chat_id.trim().length > 0;
+      const hasName =
+        typeof data.chat_name === 'string' && data.chat_name.trim().length > 0;
+      if (!hasId && !hasName) {
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({
+            error:
+              'nuke_chat requires chat_id or chat_name — admin always operates cross-chat, never on the implicit current chat',
+          }),
+        );
+        break;
+      }
+      // Two identifiers are an unsafe-targeting smell — if they
+      // disagree, silently picking one is worse than refusing. Reject
+      // here too (the MCP tool layer also blocks the same case).
+      if (hasId && hasName) {
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({
+            error:
+              'nuke_chat accepts chat_id OR chat_name, not both — they may disagree',
+          }),
+        );
+        break;
+      }
+
+      let targetJid = '';
+      if (hasId) {
+        const trimmed = (data.chat_id as string).trim();
+        if (!registeredGroups[trimmed]) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({ error: `chat_id ${trimmed} not registered` }),
+          );
+          break;
+        }
+        targetJid = trimmed;
+      } else {
+        const wanted = (data.chat_name as string).trim();
+        const matches = Object.entries(registeredGroups).filter(
+          ([, g]) => g.name === wanted,
+        );
+        if (matches.length === 0) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({
+              error: `chat_name "${wanted}" did not match any registered chat`,
+            }),
+          );
+          break;
+        }
+        if (matches.length > 1) {
+          fs.writeFileSync(
+            resultPath,
+            JSON.stringify({
+              error: `chat_name "${wanted}" is ambiguous — matches ${matches.length} chats`,
+              candidates: matches.map(([jid]) => jid),
+            }),
+          );
+          break;
+        }
+        targetJid = matches[0][0];
+      }
+
+      const targetGroup = registeredGroups[targetJid];
+      const sessionArg = data.session;
+      const validSession: 'default' | 'maintenance' | 'all' =
+        sessionArg === 'default' ||
+        sessionArg === 'maintenance' ||
+        sessionArg === 'all'
+          ? sessionArg
+          : 'all';
+
+      // Snapshot pre-nuke status to determine which slots actually had
+      // a live container to kill. nukeSession ALWAYS wipes JSONL on
+      // disk regardless of whether anything was running; the
+      // user-visible status enum (per the issue spec) reports the
+      // *live-container* outcome so admin can tell whether the call
+      // actually freed any resources.
+      const slotsRequested: Array<'default' | 'maintenance'> =
+        validSession === 'all' ? ['default', 'maintenance'] : [validSession];
+      const killedSessions: Array<'default' | 'maintenance'> = [];
+      const getStatus = deps.getContainerStatus;
+      for (const slot of slotsRequested) {
+        const wasActive =
+          getStatus &&
+          (getStatus(targetJid, slot) === 'running' ||
+            getStatus(targetJid, slot) === 'idle');
+        if (wasActive) killedSessions.push(slot);
+      }
+
+      try {
+        deps.nukeSession(targetGroup.folder, validSession);
+        // Per the issue's status enum: 'success' when at least one
+        // live container was killed; 'noop' when nothing was running
+        // (even though the on-disk wipe still happened — see the
+        // pre-snapshot comment above). 'partial' is reserved for a
+        // future per-slot-failure signal from nukeSession; today
+        // nukeSession is fire-and-forget per slot, so we can't
+        // distinguish partial failure from full success without a
+        // contract change. 'error' is reported only when nukeSession
+        // throws — the catch branch below.
+        const status: 'success' | 'noop' =
+          killedSessions.length > 0 ? 'success' : 'noop';
+        logger.info(
+          {
+            sourceGroup,
+            targetJid,
+            session: validSession,
+            killedSessions,
+            status,
+          },
+          'nuke_chat completed via IPC',
+        );
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({
+            stdout: JSON.stringify({
+              chat_id: targetJid,
+              chat_name: targetGroup.name,
+              killed_sessions: killedSessions,
+              status,
+            }),
+          }),
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error({ sourceGroup, targetJid, err }, 'nuke_chat failed');
+        // Top-level `error` field — runHostOperation in the
+        // agent-runner only treats `result.error` as a tool failure
+        // and surfaces `isError: true` to the MCP caller. Burying the
+        // failure inside `stdout` would make the call look like a
+        // success to Claude, which would then move on as if the wipe
+        // ran. Include the structured payload alongside so the admin
+        // can still see what was attempted.
+        fs.writeFileSync(
+          resultPath,
+          JSON.stringify({
+            error: `nuke_chat failed for ${targetJid}: ${msg}`,
+            chat_id: targetJid,
+            chat_name: targetGroup.name,
+            killed_sessions: [],
+            status: 'error',
+          }),
+        );
+      }
+      break;
+    }
 
     // --- Named host operations ---
 
@@ -970,6 +1966,20 @@ export async function processTaskIpc(
 
         const promoteResultPath = scriptResultPath(sourceGroup, data);
 
+        if (!KNOWN_TILE_NAMES.has(data.tileName)) {
+          logger.warn(
+            { sourceGroup, tileName: data.tileName },
+            'promote_staging rejected: tileName not in allowlist',
+          );
+          fs.writeFileSync(
+            promoteResultPath,
+            JSON.stringify({
+              error: `Invalid tileName "${data.tileName}". Allowed: ${[...KNOWN_TILE_NAMES].join(', ')}.`,
+            }),
+          );
+          break;
+        }
+
         const promoteScript = path.join(
           process.cwd(),
           'scripts',
@@ -1015,7 +2025,18 @@ export async function processTaskIpc(
           'bash',
           [promoteScript, stagingDir, data.tileName, data.skillName],
           {
-            timeout: 300_000,
+            // 15 minutes. promote-to-tile-repo.sh runs `tessl skill
+            // review --optimize` on each staged skill, and tessl
+            // itself tells you that each review "can take up to 1
+            // minute." A bulk promote (`skillName=all`) against a tile
+            // with 10+ staged skills easily blows past the old
+            // 5-minute cap, which observably killed every bulk promote
+            // Andy tried and returned a mid-run truncated error. 15
+            // min fits the typical 10-15 skill worst case with
+            // headroom; larger bulk promotes should split the staging
+            // directory into smaller batches — every skill is reviewed
+            // (no per-skill opt-out).
+            timeout: 900_000,
             maxBuffer: 5 * 1024 * 1024,
             env: {
               ...process.env,
@@ -1044,43 +2065,240 @@ export async function processTaskIpc(
             } else {
               logger.info(
                 { sourceGroup },
-                'promote_staging pushed to tile repo',
+                'promote_staging opened PR on tile repo',
               );
               fs.writeFileSync(
                 promoteResultPath,
                 JSON.stringify({ stdout: stdout.trim() }),
               );
 
-              // Schedule tessl update + session clear after GHA completes (~5 min)
-              setTimeout(() => {
-                logger.info('Running post-promote tessl update');
-                execFile(
-                  'bash',
-                  [
-                    '-c',
-                    'cd /app/tessl-workspace && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1',
-                  ],
-                  { timeout: 120_000 },
-                  (updateErr, updateStdout) => {
-                    if (updateErr) {
-                      logger.error(
-                        { error: updateErr.message },
-                        'Post-promote tessl update failed',
-                      );
-                    } else {
-                      const cleared = deleteAllSessions();
-                      logger.info(
-                        {
-                          sessionsCleared: cleared,
-                          output: updateStdout.trim().slice(-200),
-                        },
-                        'Post-promote tessl update completed — sessions cleared',
-                      );
-                    }
-                  },
-                );
-              }, 300_000); // 5 minutes
+              // Post-promote `tessl update` + session clear used to
+              // run here on a 5-minute delay, predicated on the old
+              // flow that pushed directly to tile main and triggered
+              // GHA publish within ~5min. New flow opens a PR and
+              // requests Copilot review; publish only happens after
+              // the PR is merged (which could be minutes, hours, or
+              // never if Copilot/human rejects it). The auto-update
+              // would fire against a registry that hasn't changed
+              // yet — at best a no-op, at worst tearing down sessions
+              // for no reason. The agent now calls the `tessl_update`
+              // MCP tool explicitly after the PR merges; a periodic
+              // 15-min catch-up in index.ts covers missed invocations.
             }
+          },
+        );
+      }
+      break;
+
+    case 'tessl_update':
+      if (data.requestId) {
+        const tesslResultPath = scriptResultPath(sourceGroup, data);
+        if (!isMain) {
+          logger.warn({ sourceGroup }, 'Unauthorized tessl_update attempt');
+          fs.writeFileSync(
+            tesslResultPath,
+            JSON.stringify({
+              error: 'Only the main group can trigger tessl_update.',
+            }),
+          );
+          break;
+        }
+
+        logger.info({ sourceGroup }, 'Running tessl_update');
+
+        execFile(
+          'bash',
+          [
+            '-c',
+            'cd /app/tessl-workspace && tessl update --yes --dangerously-ignore-security --agent claude-code 2>&1',
+          ],
+          { timeout: 150_000, maxBuffer: 2 * 1024 * 1024 },
+          (error, stdout) => {
+            if (error) {
+              logger.error(
+                {
+                  sourceGroup,
+                  error: error.message,
+                  output: stdout.slice(-500),
+                },
+                'tessl_update failed',
+              );
+              fs.writeFileSync(
+                tesslResultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stdout: stdout.slice(-2000),
+                }),
+              );
+              return;
+            }
+            const output = stdout.trim();
+            // `tessl update` prints "Updated ..." when a tile actually
+            // moved forward. No-op runs don't, and clearing sessions on a
+            // no-op would nuke conversation state for nothing — hence
+            // the string check instead of an unconditional clear.
+            if (/\bUpdated\b/.test(output)) {
+              const cleared = deleteAllSessions();
+              logger.info(
+                { sourceGroup, sessionsCleared: cleared },
+                'tessl_update found new tiles — sessions cleared',
+              );
+              fs.writeFileSync(
+                tesslResultPath,
+                JSON.stringify({
+                  stdout: `${output}\n\nSessions cleared: ${cleared}`,
+                }),
+              );
+            } else {
+              logger.info(
+                { sourceGroup },
+                'tessl_update completed — no new tiles',
+              );
+              fs.writeFileSync(
+                tesslResultPath,
+                JSON.stringify({ stdout: output || '(no output)' }),
+              );
+            }
+          },
+        );
+      }
+      break;
+
+    case 'push_staged_to_branch':
+      if (
+        data.requestId &&
+        data.tileName &&
+        data.branch &&
+        data.commitMessage
+      ) {
+        const pushResultPath = scriptResultPath(sourceGroup, data);
+        if (!isMain) {
+          logger.warn(
+            { sourceGroup },
+            'Unauthorized push_staged_to_branch attempt',
+          );
+          fs.writeFileSync(
+            pushResultPath,
+            JSON.stringify({
+              error: 'Only the main group can push to tile branches.',
+            }),
+          );
+          break;
+        }
+
+        if (!KNOWN_TILE_NAMES.has(data.tileName)) {
+          logger.warn(
+            { sourceGroup, tileName: data.tileName },
+            'push_staged_to_branch rejected: tileName not in allowlist',
+          );
+          fs.writeFileSync(
+            pushResultPath,
+            JSON.stringify({
+              error: `Invalid tileName "${data.tileName}". Allowed: ${[...KNOWN_TILE_NAMES].join(', ')}.`,
+            }),
+          );
+          break;
+        }
+
+        const pushScript = path.join(
+          process.cwd(),
+          'scripts',
+          'push-staged-to-branch.sh',
+        );
+
+        if (!fs.existsSync(pushScript)) {
+          fs.writeFileSync(
+            pushResultPath,
+            JSON.stringify({ error: 'push-staged-to-branch.sh not found' }),
+          );
+          break;
+        }
+
+        const stagingDir = path.join(
+          GROUPS_DIR,
+          sourceGroup,
+          'staging',
+          data.tileName,
+        );
+
+        // Same .env reader pattern as promote_staging — the orchestrator
+        // holds the tile-repo credentials, containers never see them.
+        const envPath = path.join(process.cwd(), '.env');
+        const envContent = fs.existsSync(envPath)
+          ? fs.readFileSync(envPath, 'utf-8')
+          : '';
+        const getEnv = (key: string) =>
+          envContent
+            .split('\n')
+            .find((l) => l.startsWith(`${key}=`))
+            ?.split('=')
+            .slice(1)
+            .join('=') || '';
+
+        logger.info(
+          {
+            sourceGroup,
+            tileName: data.tileName,
+            branch: data.branch,
+            skillName: data.skillName || 'all',
+          },
+          'Running push_staged_to_branch',
+        );
+
+        execFile(
+          'bash',
+          [
+            pushScript,
+            stagingDir,
+            data.tileName,
+            data.branch,
+            data.commitMessage,
+            data.skillName || 'all',
+          ],
+          {
+            // 5 min is enough for a clone-branch + copy + commit +
+            // push. No tessl review loop here — fixups don't re-trigger
+            // the local optimize pass.
+            timeout: 300_000,
+            maxBuffer: 2 * 1024 * 1024,
+            env: {
+              ...process.env,
+              GITHUB_TOKEN: getEnv('GITHUB_TOKEN'),
+              TILE_OWNER: getEnv('TILE_OWNER') || 'jbaruch',
+              ASSISTANT_NAME: getEnv('ASSISTANT_NAME') || 'Andy',
+            },
+          },
+          (error, stdout, stderr) => {
+            if (error) {
+              logger.error(
+                {
+                  sourceGroup,
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                },
+                'push_staged_to_branch failed',
+              );
+              fs.writeFileSync(
+                pushResultPath,
+                JSON.stringify({
+                  error: error.message,
+                  stderr: stderr.slice(-500),
+                }),
+              );
+              return;
+            }
+            logger.info(
+              {
+                sourceGroup,
+                tileName: data.tileName,
+                branch: data.branch,
+              },
+              'push_staged_to_branch pushed fixup',
+            );
+            fs.writeFileSync(
+              pushResultPath,
+              JSON.stringify({ stdout: stdout.trim() }),
+            );
           },
         );
       }

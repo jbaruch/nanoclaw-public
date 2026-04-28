@@ -48,6 +48,12 @@ vi.mock('grammy', () => ({
       sendMessage: vi.fn().mockResolvedValue({ message_id: 999 }),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
       sendDocument: vi.fn().mockResolvedValue({ message_id: 1001 }),
+      // `config.use` is the hook the grammy API transformer attaches
+      // to. Real grammy exposes it on every Bot instance. Tests that
+      // want to simulate "hook unavailable" (older or future grammy,
+      // renamed surface) can delete `api.config` on the constructed
+      // bot before assertions.
+      config: { use: vi.fn() },
     };
 
     constructor(token: string) {
@@ -84,6 +90,7 @@ vi.mock('grammy', () => ({
 }));
 
 import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import { logger } from '../logger.js';
 
 // --- Test helpers ---
 
@@ -257,6 +264,84 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', opts);
 
       expect(channel.isConnected()).toBe(false);
+    });
+
+    // --- grammy API transformer gate (#81 diagnostic, PR #87) ---
+
+    it('does NOT attach grammy transformer when LOG_LEVEL is not debug', async () => {
+      const prev = process.env.LOG_LEVEL;
+      delete process.env.LOG_LEVEL;
+      try {
+        const opts = createTestOpts();
+        const channel = new TelegramChannel('test-token', opts);
+        await channel.connect();
+        expect(currentBot().api.config.use).not.toHaveBeenCalled();
+      } finally {
+        if (prev === undefined) delete process.env.LOG_LEVEL;
+        else process.env.LOG_LEVEL = prev;
+      }
+    });
+
+    it('attaches grammy transformer when LOG_LEVEL=debug', async () => {
+      const prev = process.env.LOG_LEVEL;
+      process.env.LOG_LEVEL = 'debug';
+      try {
+        const opts = createTestOpts();
+        const channel = new TelegramChannel('test-token', opts);
+        await channel.connect();
+        expect(currentBot().api.config.use).toHaveBeenCalledTimes(1);
+        // First arg is the transformer function — sanity check.
+        expect(typeof currentBot().api.config.use.mock.calls[0][0]).toBe(
+          'function',
+        );
+        // Info log announces the attachment so operators can see it
+        // in docker logs when LOG_LEVEL=debug is set post-restart.
+        expect(logger.info).toHaveBeenCalledWith(
+          expect.stringContaining('Grammy API transformer attached'),
+        );
+      } finally {
+        if (prev === undefined) delete process.env.LOG_LEVEL;
+        else process.env.LOG_LEVEL = prev;
+      }
+    });
+
+    it('warns and skips attach when LOG_LEVEL=debug but api.config.use is unavailable', async () => {
+      const prev = process.env.LOG_LEVEL;
+      process.env.LOG_LEVEL = 'debug';
+      try {
+        const opts = createTestOpts();
+        const channel = new TelegramChannel('test-token', opts);
+        // Simulate the "grammy API surface shifted or the Bot is a
+        // minimal mock" case — the guard should keep connect() from
+        // crashing and surface the skip as a warn.
+        // We have to splice the api object AFTER the Bot is constructed
+        // inside connect(), so grab the mock before connect runs.
+        const origBot = (await import('grammy')) as unknown as {
+          Bot: new (token: string) => {
+            api: { config?: { use: unknown } };
+          };
+        };
+        const OrigBot = origBot.Bot;
+        // Wrap Bot so that right after construction we drop api.config.
+        origBot.Bot = class extends OrigBot {
+          constructor(token: string) {
+            super(token);
+            // Type assertion: the test mock's api is a concrete object.
+            (this.api as { config?: unknown }).config = undefined;
+          }
+        } as typeof OrigBot;
+        try {
+          await channel.connect();
+          expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('bot.api.config.use unavailable'),
+          );
+        } finally {
+          origBot.Bot = OrigBot;
+        }
+      } finally {
+        if (prev === undefined) delete process.env.LOG_LEVEL;
+        else process.env.LOG_LEVEL = prev;
+      }
     });
   });
 
