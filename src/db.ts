@@ -784,6 +784,50 @@ export function pruneCompletedTasks(maxAgeMs: number): number {
 }
 
 /**
+ * Recover once-tasks that were pre-advanced to `status='completed'`
+ * but whose dispatch never landed — `last_run` stays NULL while
+ * `next_run` still points at the originally-scheduled fire time.
+ * This is the same orphan condition that `pruneCompletedTasks` GCs
+ * after `maxAgeMs`, but flipped: instead of deleting the row once
+ * its TTL expires, this resurrects it back to `status='active'` so
+ * the next `getDueTasks()` poll picks it up and actually runs it.
+ *
+ * Intended to be called once on scheduler startup, before the first
+ * loop tick. Recurring tasks never reach `status='completed'`
+ * (computeNextRun only returns null for once-tasks), so the
+ * `schedule_type='once'` clause is defensive. Returns the list of
+ * task IDs that were resurrected, for logging.
+ *
+ * Safe to combine with `pruneCompletedTasks`: the prune cutoff and
+ * the resurrect query both target the same orphan signature, but
+ * resurrect runs first at startup and prune runs periodically — a
+ * row that resurrected and ran will have `last_run` populated and
+ * fall out of the prune predicate via the `created_at` fallback
+ * eventually. A row that resurrected and *still* failed to run will
+ * be GC'd by the next prune sweep on age.
+ */
+export function resurrectZombieTasks(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT id FROM scheduled_tasks
+       WHERE status = 'completed'
+         AND schedule_type = 'once'
+         AND last_run IS NULL
+         AND next_run IS NOT NULL`,
+    )
+    .all() as { id: string }[];
+  if (rows.length === 0) return [];
+  const update = db.prepare(
+    `UPDATE scheduled_tasks SET status = 'active' WHERE id = ?`,
+  );
+  const tx = db.transaction((ids: string[]): void => {
+    for (const id of ids) update.run(id);
+  });
+  tx(rows.map((r) => r.id));
+  return rows.map((r) => r.id);
+}
+
+/**
  * Find recurring (cron / interval) tasks that are still `status='active'`
  * whose age (last_run, falling back to created_at) is older than
  * `maxAgeMs`. These are NOT pruned — only surfaced so the scheduler can
