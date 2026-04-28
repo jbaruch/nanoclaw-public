@@ -115,6 +115,12 @@ export interface Channel {
   syncGroups?(force: boolean): Promise<void>;
   // Optional: send an emoji reaction to a message.
   sendReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
+  // Optional: report whether a JID points at a 1:1 / DM chat (true) vs.
+  // a multi-participant group / channel (false). Used by the observer
+  // module to refuse to mirror reasoning into a chat that isn't owner-
+  // only. Channels that can't determine this should leave it
+  // unimplemented; callers must treat "unknown" as not-private.
+  isPrivateChat?(jid: string): Promise<boolean>;
   // Optional: react to the most recent message in a chat.
   reactToLatestMessage?(jid: string, emoji: string): Promise<void>;
   // Optional: pin a message in the chat.

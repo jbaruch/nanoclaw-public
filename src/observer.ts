@@ -15,16 +15,66 @@ const OBSERVER_CHAT_JID =
 
 let channelsRef: Channel[] | null = null;
 let registeredGroupsRef: (() => Record<string, RegisteredGroup>) | null = null;
+// Toggled to true only after we've verified the configured JID points
+// at a 1:1 / DM chat (or the operator has opted out of verification).
+// Stays false on misconfiguration so onAgentLine becomes a no-op and
+// no thinking content leaks into a wrong chat.
+let observerEnabledFlag = false;
 
-export function initObserver(
+export async function initObserver(
   channels: Channel[],
   registeredGroups: () => Record<string, RegisteredGroup>,
-): void {
+): Promise<void> {
   channelsRef = channels;
   registeredGroupsRef = registeredGroups;
-  if (OBSERVER_CHAT_JID) {
-    logger.info({ jid: OBSERVER_CHAT_JID }, 'Observer chat enabled');
+  if (!OBSERVER_CHAT_JID) return;
+
+  // Privacy gate: refuse to enable if OBSERVER_CHAT_JID points at a
+  // multi-participant chat. The observer mirrors *all* containers'
+  // thinking, tool-use, and partial output into this chat — accidentally
+  // pointing it at a group with external members is a wholesale leak of
+  // every conversation's reasoning. The env var IS the credential, so
+  // we verify with the owning channel and refuse rather than fail open.
+  const owner = channels.find(
+    (c) => c.ownsJid(OBSERVER_CHAT_JID) && c.isConnected(),
+  );
+  if (!owner) {
+    logger.error(
+      { jid: OBSERVER_CHAT_JID },
+      'Observer disabled: no connected channel owns the configured JID',
+    );
+    return;
   }
+  if (!owner.isPrivateChat) {
+    logger.error(
+      { channel: owner.name, jid: OBSERVER_CHAT_JID },
+      'Observer disabled: channel cannot verify chat is private — refusing to enable',
+    );
+    return;
+  }
+  let isPrivate: boolean;
+  try {
+    isPrivate = await owner.isPrivateChat(OBSERVER_CHAT_JID);
+  } catch (err) {
+    logger.error(
+      { err, jid: OBSERVER_CHAT_JID },
+      'Observer disabled: failed to verify chat type — refusing to enable',
+    );
+    return;
+  }
+  if (!isPrivate) {
+    logger.error(
+      { jid: OBSERVER_CHAT_JID },
+      'Observer disabled: configured chat is a group / channel, not a private DM. Set OBSERVER_CHAT_JID to a 1:1 chat with the bot.',
+    );
+    return;
+  }
+  observerEnabledFlag = true;
+  logger.info(
+    { jid: OBSERVER_CHAT_JID },
+    'Observer chat enabled (verified private)',
+  );
+  armSelfTest();
 }
 
 // Progress-reaction state: track the latest user message per chat so
@@ -44,13 +94,24 @@ export function noteLatestUserMessage(
   lastReactionEmoji.set(chatJid, '👀');
 }
 
+// Reverse map cache for folderToChatJid. Rebuilt only when the
+// registeredGroups dict identity changes (the orchestrator hands us a
+// closure over the live dict, so identity equality is the cheapest
+// invalidation signal). Avoids the per-thinking-block O(N) scan.
+let cachedGroupsDict: Record<string, RegisteredGroup> | null = null;
+let cachedFolderToJid: Map<string, string> = new Map();
+
 function folderToChatJid(folder: string): string | undefined {
   if (!registeredGroupsRef) return undefined;
   const groups = registeredGroupsRef();
-  for (const [jid, g] of Object.entries(groups)) {
-    if (g.folder === folder) return jid;
+  if (groups !== cachedGroupsDict) {
+    cachedFolderToJid = new Map();
+    for (const [jid, g] of Object.entries(groups)) {
+      cachedFolderToJid.set(g.folder, jid);
+    }
+    cachedGroupsDict = groups;
   }
-  return undefined;
+  return cachedFolderToJid.get(folder);
 }
 
 function updateReaction(folder: string, emoji: string): void {
@@ -86,7 +147,23 @@ const watchdogs = new Map<string, Watchdog>(); // source -> watchdog
 
 const BLINK_INTERVAL_MS = 30_000;
 const PING_AT_SECONDS = [60, 120, 300]; // 1m, 2m, 5m
-const BLINK_PAIR = ['⚡', '🔥'];
+// Liveness-only emojis — chosen so they DON'T overlap with the
+// semantic states emitted from agent events: ⚡ (tool-use, except
+// send_message) and ✍ (send_message in flight). Using ⚡ here would
+// overwrite legitimate tool-fired state mid-query and leave the
+// "tool" emoji stuck on the message after a long watchdog cycle even
+// when the final state should have been ✍ (composed reply) or 🤔
+// (thinking-only). 🫡 / 🆒 are both in TELEGRAM_ALLOWED_REACTIONS
+// (see src/channels/telegram.ts) and read as "still on it" without
+// claiming a particular semantic phase.
+const BLINK_PAIR = ['🫡', '🆒'];
+// Final reaction set when a query completes. The watchdog blink
+// otherwise leaves whichever blink-emoji happened to be current on
+// the user's message — unrelated to the actual end-state of the
+// query. ✍ is what telegram.ts initially writes when send_message
+// fires, but if no send_message ran (thinking-only or pure-text reply
+// path) we still need a deterministic "done" emoji.
+const DONE_REACTION = '🤝';
 
 function chatChannel(chatJid: string): Channel | undefined {
   return channelsRef?.find((c) => c.ownsJid(chatJid) && c.isConnected());
@@ -127,15 +204,47 @@ function startWatchdog(source: string): void {
   watchdogs.set(source, w);
 }
 
-function stopWatchdog(source: string): void {
+function stopWatchdog(source: string, reactionOnStop?: string): void {
   const w = watchdogs.get(source);
   if (!w) return;
   clearInterval(w.intervalId);
   watchdogs.delete(source);
+  // Reset the user's chat reaction so a stale 🫡/🆒 blink doesn't
+  // outlive the watchdog. If the caller didn't pick a specific
+  // emoji (e.g. mid-flight watchdog teardown to defuse a stale
+  // entry), fall back to the deterministic done emoji.
+  const target = reactionOnStop ?? DONE_REACTION;
+  updateReaction(source, target);
 }
 
 export function observerEnabled(): boolean {
-  return !!OBSERVER_CHAT_JID;
+  return observerEnabledFlag;
+}
+
+// Self-test: if the observer is enabled but the agent-runner log
+// format has drifted (or the orchestrator never spawned a query), we
+// won't know — every onAgentLine call falls through silently.  Arm a
+// one-shot watchdog after init: if no `Query input:` line lands
+// within OBSERVER_SELF_TEST_MS, emit a single warning. That makes
+// SDK-upgrade log-format breaks loud instead of letting the observer
+// rot in place.
+const OBSERVER_SELF_TEST_MS = 10 * 60 * 1000; // 10 minutes
+let selfTestTimer: NodeJS.Timeout | null = null;
+let sawAnyQueryInput = false;
+
+function armSelfTest(): void {
+  if (selfTestTimer) return;
+  selfTestTimer = setTimeout(() => {
+    if (!sawAnyQueryInput) {
+      logger.warn(
+        { graceMs: OBSERVER_SELF_TEST_MS },
+        'Observer enabled but no `Query input:` lines parsed — agent-runner log format may have drifted; check container/agent-runner output',
+      );
+    }
+    selfTestTimer = null;
+  }, OBSERVER_SELF_TEST_MS);
+  // Don't keep the event loop alive purely for this timer.
+  selfTestTimer.unref?.();
 }
 
 interface QueryState {
@@ -222,7 +331,17 @@ export function onAgentLine(source: string, raw: string): void {
 
   // Query boundaries
   if (line.startsWith('Query input:')) {
+    sawAnyQueryInput = true;
     states.set(source, newState());
+    // Defuse any watchdog left over from a prior query that crashed
+    // before emitting `Query done.` (SDK exception, agent-runner kill,
+    // container OOM). Without this, the second query would see
+    // `watchdogs.has(source) === true`, skip startWatchdog, and inherit
+    // a stale `startedAt` / `pingsSent` — threshold pings would
+    // misfire instantly. Pass undefined so the reset uses the
+    // deterministic done emoji rather than the new query's not-yet-
+    // established state.
+    stopWatchdog(source);
     // A new query is starting — the 👀 reaction from telegram.ts is already
     // on the message. Don't pre-emptively change it; the first thinking/tool
     // event will swap to 🤔/🔧 naturally.
@@ -314,7 +433,16 @@ export function onAgentLine(source: string, raw: string): void {
 
   // Query done — stop the liveness watchdog and flush summary
   if (line.startsWith('Query done.')) {
-    stopWatchdog(source);
+    // Pick the deterministic end-state emoji. ✍ if the agent ended on
+    // a send_message (composed reply landed); otherwise fall through
+    // to stopWatchdog's DONE_REACTION default. We deliberately don't
+    // try to reproduce ⚡ — a watchdog blink could already have
+    // overwritten that, and "tool fired" isn't a stable end-state.
+    // toolCalls stores names with the `mcp__<server>__` prefix already
+    // stripped (see normalization in the tool_use branch above).
+    const lastTool = state.toolCalls[state.toolCalls.length - 1];
+    const doneEmoji = lastTool === 'send_message' ? '✍' : undefined;
+    stopWatchdog(source, doneEmoji);
     const wall = /wall=(\d+)ms/.exec(line)?.[1];
     const tokIn = /tokens_in=(\d+)/.exec(line)?.[1];
     const tokOut = /tokens_out=(\d+)/.exec(line)?.[1];

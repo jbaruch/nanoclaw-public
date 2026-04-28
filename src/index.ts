@@ -1025,8 +1025,11 @@ async function main(): Promise<void> {
   }
 
   // Initialize the optional observer channel — opt-in via OBSERVER_CHAT_JID
-  // env var (no-op when unset). See src/observer.ts.
-  initObserver(channels, () => registeredGroups);
+  // env var (no-op when unset). See src/observer.ts.  Awaited so the
+  // privacy-gate verification (refuse to enable if the configured chat
+  // is a multi-participant group) finishes before we start spawning
+  // queries that would feed the observer.
+  await initObserver(channels, () => registeredGroups);
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
