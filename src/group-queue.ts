@@ -79,6 +79,13 @@ export class GroupQueue {
   // Waiting list as structured pairs, not serialised strings — same
   // collision-proofing as the nested map.
   private waitingKeys: Array<{ groupJid: string; sessionName: string }> = [];
+  // Predicate the orchestrator wires up so the queue can ask "is this group
+  // the main DM?" — main bypasses the concurrency cap so the user-facing
+  // chat is never queued behind background heartbeats or other groups.
+  private isMainGroup: (groupJid: string) => boolean = () => false;
+  setIsMainGroupResolver(fn: (groupJid: string) => boolean): void {
+    this.isMainGroup = fn;
+  }
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
@@ -129,7 +136,12 @@ export class GroupQueue {
       return;
     }
 
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+    // Main DM bypasses the cap — that chat is the user's primary control
+    // channel and must never wait behind background heartbeats or other
+    // groups. The cap is a politeness limit on parallel agents, not a
+    // safety limit; main is special by definition (one chat, one user).
+    const bypassCap = this.isMainGroup(groupJid);
+    if (!bypassCap && this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingMessages = true;
       if (
         !this.waitingKeys.some(
@@ -144,6 +156,17 @@ export class GroupQueue {
         'At concurrency limit, message queued',
       );
       return;
+    }
+
+    if (bypassCap && this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+      logger.info(
+        {
+          groupJid,
+          activeCount: this.activeCount,
+          cap: MAX_CONCURRENT_CONTAINERS,
+        },
+        'Main group bypassing concurrency cap',
+      );
     }
 
     this.runForGroup(groupJid, 'messages').catch((err) =>

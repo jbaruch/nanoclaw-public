@@ -1149,6 +1149,10 @@ async function main(): Promise<void> {
   });
   startSessionCleanup();
   queue.setProcessMessagesFn(processGroupMessages);
+  // Wire the main-group predicate so the queue can let main bypass the
+  // concurrency cap. Closure over `registeredGroups` so registration
+  // changes (e.g. /register at runtime) take effect immediately.
+  queue.setIsMainGroupResolver((jid) => !!registeredGroups[jid]?.isMain);
   recoverPendingMessages();
 
   // Write available_groups.json for all main/trusted groups on startup.
