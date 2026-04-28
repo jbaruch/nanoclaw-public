@@ -1,12 +1,25 @@
 /**
  * OneCLI MCP — local stdio server that gives the agent structured access to
- * OneCLI-connected Google services via REST. All outbound HTTPS is routed
- * through the OneCLI gateway (HTTPS_PROXY env) which transparently injects
- * OAuth tokens. No 3rd-party SDKs, no client secrets, no token juggling.
+ * OneCLI-connected services via REST. All outbound HTTPS routes through the
+ * OneCLI gateway (HTTPS_PROXY env) which transparently injects OAuth tokens.
+ * No 3rd-party SDKs, no client secrets, no token juggling.
  *
- * Tools are Google Calendar today; Gmail/Drive/etc can be added as OneCLI
- * connects more apps.
+ * This server hosts the Google integrations: Calendar (7 tools) + Gmail
+ * (9 tools, draft CRUD only — no message send and no attachment download
+ * in this revision). All tools are namespaced `onecli_*` so they can't
+ * collide with another MCP (e.g. Composio) that exposes the same provider
+ * under a different name.
+ *
+ * SmartThings has its own MCP server (onecli-smartthings-mcp-stdio.ts)
+ * gated independently by NANOCLAW_ONECLI_ENABLE_SMARTTHINGS=1 — physical-
+ * device writes are a different risk profile from read-mostly Google
+ * services and shouldn't share an activation gate.
+ *
+ * Activation: agent-runner registers this server when
+ * NANOCLAW_ONECLI_ENABLED=1 is set in the container env (the host-side
+ * OneCLI proxy injection sets it alongside HTTPS_PROXY).
  */
+import nodemailer from 'nodemailer';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -14,11 +27,53 @@ import { z } from 'zod';
 const GCAL_BASE = 'https://www.googleapis.com/calendar/v3';
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1';
 
+// Default fetch timeout — anything over this and we abort. A hung gateway
+// otherwise blocks the MCP request until the SDK's outer per-tool timeout,
+// which is much longer and less informative.
+const FETCH_TIMEOUT_MS = 45_000;
+
+/**
+ * Wrap fetch with an AbortController so a hung connection fails fast with
+ * a clear message instead of stalling the entire turn.
+ */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = FETCH_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(`Request timeout after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Strip the query string from a URL so error messages destined for
+ * messages.db don't leak per-request PII (calendar IDs, thread IDs,
+ * event IDs) into the conversation log. Full URL still goes to stderr
+ * (`docker logs`) for debugging — that path is operator-private.
+ */
+function stripQuery(url: string): string {
+  const i = url.indexOf('?');
+  return i === -1 ? url : url.slice(0, i);
+}
+
 /**
  * Build an RFC 2822 MIME message + base64url encode for Gmail's drafts/messages
- * endpoints. Bare-minimum headers — Gmail fills in Date, Message-ID, From.
+ * endpoints. Implementation delegates to nodemailer's stream transport so the
+ * tricky parts (RFC 2047 header encoding for non-ASCII subjects/recipients,
+ * line-folding, charset declarations, CRLF handling) come from a battle-
+ * tested library rather than hand-rolled string concatenation.
  */
-function encodeRfc2822Draft(args: {
+export async function encodeRfc2822Draft(args: {
   to: string;
   subject: string;
   body: string;
@@ -26,16 +81,27 @@ function encodeRfc2822Draft(args: {
   bcc?: string;
   inReplyTo?: string;
   references?: string;
-}): string {
-  const headers: string[] = [`To: ${args.to}`];
-  if (args.cc) headers.push(`Cc: ${args.cc}`);
-  if (args.bcc) headers.push(`Bcc: ${args.bcc}`);
-  headers.push(`Subject: ${args.subject}`);
-  if (args.inReplyTo) headers.push(`In-Reply-To: ${args.inReplyTo}`);
-  if (args.references) headers.push(`References: ${args.references}`);
-  headers.push('MIME-Version: 1.0');
-  headers.push('Content-Type: text/plain; charset="UTF-8"');
-  const raw = headers.join('\r\n') + '\r\n\r\n' + args.body;
+}): Promise<string> {
+  // streamTransport + buffer:true with newline:'crlf' returns the fully
+  // assembled MIME message as a Buffer in `info.message`. No SMTP, no
+  // external connection — purely a MIME builder.
+  const transporter = nodemailer.createTransport({
+    streamTransport: true,
+    newline: 'crlf',
+    buffer: true,
+  });
+  const headers: Record<string, string> = {};
+  if (args.inReplyTo) headers['In-Reply-To'] = args.inReplyTo;
+  if (args.references) headers['References'] = args.references;
+  const info = await transporter.sendMail({
+    to: args.to,
+    cc: args.cc,
+    bcc: args.bcc,
+    subject: args.subject,
+    text: args.body,
+    headers: Object.keys(headers).length ? headers : undefined,
+  });
+  const raw = (info.message as Buffer).toString('utf-8');
   return Buffer.from(raw, 'utf-8')
     .toString('base64')
     .replace(/\+/g, '-')
@@ -58,7 +124,7 @@ async function gapi(
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(body);
   }
-  const res = await fetch(url, init);
+  const res = await fetchWithTimeout(url, init);
   const text = await res.text();
   let parsed: unknown;
   try {
@@ -67,8 +133,15 @@ async function gapi(
     parsed = text;
   }
   if (!res.ok) {
+    // User-visible error: strip query string so calendar/thread IDs
+    // don't end up in messages.db. Full URL is on stderr already
+    // (caller-side gapi.fetch logs); this just bounds what reaches
+    // chat history.
+    process.stderr.write(
+      `[onecli-mcp] ${method} ${url} → ${res.status}\n`,
+    );
     throw new Error(
-      `${method} ${url} → ${res.status}: ${
+      `${method} ${stripQuery(url)} → ${res.status}: ${
         typeof parsed === 'string' ? parsed : JSON.stringify(parsed)
       }`,
     );
@@ -91,13 +164,47 @@ const server = new McpServer({ name: 'onecli', version: '0.1.0' });
 // information-leaking tools gets exposed. Everything else (event titles,
 // attendees, mail bodies, device commands, history) is held back.
 //
+// THREAT MODEL — read before trusting this gate:
+//   The validator and the validated are the same process. We read
+//   NANOCLAW_TRUST_TIER from `process.env`, but the agent-runner itself
+//   is the same JS context that registers the tools — a sufficiently
+//   determined agent could `delete process.env.NANOCLAW_TRUST_TIER`
+//   before this module loads, or import it indirectly with a different
+//   env. The gate works under the current threat model because:
+//     1. Containers are spawned with `-e NANOCLAW_TRUST_TIER=...` set
+//        by the orchestrator (src/container-runner.ts), which is the
+//        only writer of the value at the host boundary.
+//     2. Agents don't get arbitrary code execution inside the runner —
+//        they communicate via the SDK's JSON message protocol, not by
+//        injecting JS into the process.
+//   IF either assumption changes (e.g. containers spawned with the env
+//   unset OR a future hook lets agent code run outside the SDK
+//   sandbox), this gate must move to a host-injected, agent-unreadable
+//   mechanism (signed token, mounted file, separate process). Tracked
+//   as a follow-up; do not remove this comment without updating the
+//   threat model.
+//
 // Freebusy returns only {start, end} time pairs — no titles, attendees,
 // or any event metadata — so it's the canonical "untrusted-safe"
 // calendar primitive for letting other people query availability
 // without learning what's actually scheduled.
+//
+// HARDENING — read before adding to this list:
+//   * Any write tool MUST stay off this allowlist. Untrusted containers
+//     are reachable from arbitrary chat senders; a write surface there
+//     is privilege escalation, not a feature add. Calendar create /
+//     update / delete and Gmail draft mutations all exist as separate
+//     tools elsewhere in this file specifically because they can NEVER
+//     be exposed to untrusted callers.
+//   * Read tools that leak content (event titles, mail bodies, label
+//     names) similarly must NOT be added — even read access to mail
+//     bodies via an untrusted chat is a data exfiltration channel.
+//   * `onecli_gcal_freebusy` is the only entry today. Adding entries
+//     here changes the public-facing untrusted surface; treat it as a
+//     security-policy edit, not a tool-listing edit.
 const TRUST_TIER = (process.env.NANOCLAW_TRUST_TIER || 'untrusted').toLowerCase();
 const UNTRUSTED_ALLOWLIST = new Set<string>([
-  'gcal_freebusy',
+  'onecli_gcal_freebusy',
 ]);
 
 // Wrap registerTool so untrusted containers silently skip tools not on
@@ -120,7 +227,7 @@ const _origRegisterTool = server.registerTool.bind(server) as (
 // ────────────────────────────────────────────────────────────────
 
 server.registerTool(
-  'gcal_list_events',
+  'onecli_gcal_list_events',
   {
     title: 'List Calendar Events',
     description:
@@ -163,7 +270,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gcal_get_event',
+  'onecli_gcal_get_event',
   {
     title: 'Get Calendar Event',
     description: 'Fetch full details of a specific calendar event.',
@@ -182,7 +289,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gcal_create_event',
+  'onecli_gcal_create_event',
   {
     title: 'Create Calendar Event',
     description:
@@ -224,7 +331,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gcal_update_event',
+  'onecli_gcal_update_event',
   {
     title: 'Update Calendar Event',
     description:
@@ -249,7 +356,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gcal_delete_event',
+  'onecli_gcal_delete_event',
   {
     title: 'Delete Calendar Event',
     description: 'Permanently delete an event.',
@@ -269,7 +376,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gcal_list_calendars',
+  'onecli_gcal_list_calendars',
   {
     title: 'List Calendars',
     description:
@@ -283,7 +390,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gcal_freebusy',
+  'onecli_gcal_freebusy',
   {
     title: 'Query Free/Busy',
     description:
@@ -318,7 +425,7 @@ server.registerTool(
 // ────────────────────────────────────────────────────────────────
 
 server.registerTool(
-  'gmail_search',
+  'onecli_gmail_search',
   {
     title: 'Search Gmail Messages',
     description:
@@ -347,7 +454,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_get_message',
+  'onecli_gmail_get_message',
   {
     title: 'Get Gmail Message',
     description:
@@ -367,7 +474,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_get_thread',
+  'onecli_gmail_get_thread',
   {
     title: 'Get Gmail Thread',
     description:
@@ -400,44 +507,66 @@ server.registerTool(
       `${GMAIL_BASE}/users/me/threads/${encodeURIComponent(id)}?format=${format}`,
     )) as { messages?: Array<Record<string, unknown>> };
 
-    if (data.messages && data.messages.length > maxMessages) {
-      const originalCount = data.messages.length;
-      data.messages = data.messages.slice(-maxMessages);
-      (data as Record<string, unknown>)._truncated = {
-        kept: maxMessages,
-        dropped: originalCount - maxMessages,
-        note: 'Only most-recent messages shown. Increase maxMessages to see more.',
-      };
-    }
-
-    if (format === 'full' && Array.isArray(data.messages)) {
-      // Walk payload.parts recursively and truncate text bodies.
-      const truncatePart = (part: Record<string, unknown>): void => {
-        const body = part.body as
-          | { data?: string; size?: number }
-          | undefined;
-        if (body?.data && typeof body.data === 'string') {
-          // Gmail bodies are base64url-encoded. Only truncate if large.
-          if (body.data.length > bodyMaxChars * 1.4) {
-            body.data = body.data.slice(0, Math.floor(bodyMaxChars * 1.4));
-            (body as Record<string, unknown>)._truncated = true;
-          }
-        }
-        const parts = part.parts as Array<Record<string, unknown>> | undefined;
-        if (Array.isArray(parts)) for (const sub of parts) truncatePart(sub);
-      };
-      for (const msg of data.messages) {
-        const payload = msg.payload as Record<string, unknown> | undefined;
-        if (payload) truncatePart(payload);
-      }
-    }
+    truncateThread(data, { maxMessages, bodyMaxChars, includeBodies: format === 'full' });
 
     return ok(data);
   },
 );
 
+/**
+ * Trim a Gmail thread response to fit MCP-tool output budgets:
+ *   - keep at most `maxMessages` (most-recent), drop earlier ones,
+ *   - when `includeBodies` is true, truncate each base64-encoded body
+ *     past `bodyMaxChars * 1.4` (the *.4 factor is the rough base64
+ *     overhead — 100 plain chars become ~133 base64 chars, so a
+ *     `bodyMaxChars=2000` cap on the *plaintext* corresponds to ~2800
+ *     bytes of base64).
+ *
+ * Mutates `data` in place and stamps `_truncated` markers so the agent
+ * can see what was dropped. Exported because the recursive walk on
+ * `payload.parts` is the kind of code that breaks silently when
+ * Gmail's response shape changes.
+ */
+export function truncateThread(
+  data: { messages?: Array<Record<string, unknown>> } & Record<string, unknown>,
+  opts: {
+    maxMessages: number;
+    bodyMaxChars: number;
+    includeBodies: boolean;
+  },
+): void {
+  if (data.messages && data.messages.length > opts.maxMessages) {
+    const originalCount = data.messages.length;
+    data.messages = data.messages.slice(-opts.maxMessages);
+    data._truncated = {
+      kept: opts.maxMessages,
+      dropped: originalCount - opts.maxMessages,
+      note: 'Only most-recent messages shown. Increase maxMessages to see more.',
+    };
+  }
+
+  if (opts.includeBodies && Array.isArray(data.messages)) {
+    const limit = Math.floor(opts.bodyMaxChars * 1.4);
+    const truncatePart = (part: Record<string, unknown>): void => {
+      const body = part.body as { data?: string; size?: number } | undefined;
+      if (body?.data && typeof body.data === 'string') {
+        if (body.data.length > limit) {
+          body.data = body.data.slice(0, limit);
+          (body as Record<string, unknown>)._truncated = true;
+        }
+      }
+      const parts = part.parts as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(parts)) for (const sub of parts) truncatePart(sub);
+    };
+    for (const msg of data.messages) {
+      const payload = msg.payload as Record<string, unknown> | undefined;
+      if (payload) truncatePart(payload);
+    }
+  }
+}
+
 server.registerTool(
-  'gmail_list_labels',
+  'onecli_gmail_list_labels',
   {
     title: 'List Gmail Labels',
     description:
@@ -451,7 +580,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_create_draft',
+  'onecli_gmail_create_draft',
   {
     title: 'Create Gmail Draft',
     description:
@@ -477,7 +606,7 @@ server.registerTool(
     },
   },
   async ({ to, subject, body, cc, bcc, threadId, inReplyTo, references }) => {
-    const raw = encodeRfc2822Draft({
+    const raw = await encodeRfc2822Draft({
       to,
       subject,
       body,
@@ -494,7 +623,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_update_draft',
+  'onecli_gmail_update_draft',
   {
     title: 'Update Gmail Draft',
     description:
@@ -510,7 +639,7 @@ server.registerTool(
     },
   },
   async ({ draftId, to, subject, body, cc, bcc, threadId }) => {
-    const raw = encodeRfc2822Draft({ to, subject, body, cc, bcc });
+    const raw = await encodeRfc2822Draft({ to, subject, body, cc, bcc });
     const payload: Record<string, unknown> = { message: { raw } };
     if (threadId) (payload.message as Record<string, unknown>).threadId = threadId;
     const data = await gapi(
@@ -523,7 +652,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_list_drafts',
+  'onecli_gmail_list_drafts',
   {
     title: 'List Gmail Drafts',
     description: 'List existing drafts in the mailbox.',
@@ -541,7 +670,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_get_draft',
+  'onecli_gmail_get_draft',
   {
     title: 'Get Gmail Draft',
     description: 'Fetch a specific draft by ID, including its message content.',
@@ -560,7 +689,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  'gmail_delete_draft',
+  'onecli_gmail_delete_draft',
   {
     title: 'Delete Gmail Draft',
     description: 'Permanently delete a draft.',
@@ -581,294 +710,6 @@ server.registerTool(
 //   • gmail_send (messages.send)    — user sends drafts manually.
 //   • gmail_send_draft (drafts.send) — same reason.
 //   • gmail_trash / gmail_modify    — destructive on received mail; out of scope.
-
-// ────────────────────────────────────────────────────────────────
-// SmartThings — devices, scenes, locations. Auth via OneCLI generic
-// secret on `api.smartthings.com`, header=Authorization, format=Bearer
-// {value}. The Authorization header below is just a placeholder; OneCLI
-// overwrites it with the real Personal Access Token on the wire.
-// ────────────────────────────────────────────────────────────────
-
-const ST_BASE = 'https://api.smartthings.com/v1';
-const ST_AUTH = 'Bearer placeholder-via-onecli';
-
-async function st(
-  method: string,
-  url: string,
-  body?: unknown,
-): Promise<unknown> {
-  const init: RequestInit = {
-    method,
-    headers: { Authorization: ST_AUTH },
-  };
-  if (body !== undefined) {
-    (init.headers as Record<string, string>)['Content-Type'] =
-      'application/json';
-    init.body = JSON.stringify(body);
-  }
-  const res = await fetch(url, init);
-  const text = await res.text();
-  let parsed: unknown;
-  try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch {
-    parsed = text;
-  }
-  if (!res.ok) {
-    throw new Error(
-      `${method} ${url} → ${res.status}: ${
-        typeof parsed === 'string' ? parsed : JSON.stringify(parsed)
-      }`,
-    );
-  }
-  return parsed;
-}
-
-server.registerTool(
-  'smartthings_list_devices',
-  {
-    title: 'List SmartThings Devices',
-    description:
-      'List all devices on the user\'s SmartThings hub — lights, switches, thermostats, sensors, locks, etc. Use this to find a device id before calling get_status or send_command. Includes Hue lights linked through the SmartThings → Hue integration.',
-    inputSchema: {
-      locationId: z.string().optional().describe('Filter to a single location.'),
-      capability: z
-        .string()
-        .optional()
-        .describe(
-          'Filter by capability (e.g. "switch", "switchLevel", "thermostatSetpoint", "lock", "motionSensor").',
-        ),
-    },
-  },
-  async ({ locationId, capability }) => {
-    const params = new URLSearchParams();
-    if (locationId) params.set('locationId', locationId);
-    if (capability) params.set('capability', capability);
-    const qs = params.toString();
-    const data = (await st(
-      'GET',
-      `${ST_BASE}/devices${qs ? '?' + qs : ''}`,
-    )) as { items?: Array<Record<string, unknown>> };
-    // Slim down the response — full device records have a lot of noise.
-    const items = (data.items || []).map((d) => ({
-      deviceId: d.deviceId,
-      name: d.label || d.name,
-      manufacturer: (d as { manufacturerName?: string }).manufacturerName,
-      type: d.type,
-      locationId: d.locationId,
-      roomId: d.roomId,
-      capabilities: ((d.components as Array<{ capabilities?: Array<{ id: string }> }>) || [])
-        .flatMap((c) => (c.capabilities || []).map((cap) => cap.id)),
-    }));
-    return ok({ count: items.length, items });
-  },
-);
-
-server.registerTool(
-  'smartthings_get_device_status',
-  {
-    title: 'Get SmartThings Device Status',
-    description:
-      'Read the current state of a device — e.g. is the light on, what level, what temperature, locked or unlocked. Returns the full attribute map across all components/capabilities.',
-    inputSchema: { deviceId: z.string() },
-  },
-  async ({ deviceId }) => {
-    const data = await st(
-      'GET',
-      `${ST_BASE}/devices/${encodeURIComponent(deviceId)}/status`,
-    );
-    return ok(data);
-  },
-);
-
-server.registerTool(
-  'smartthings_send_command',
-  {
-    title: 'Send SmartThings Command',
-    description:
-      'Send a command to a device. Examples: turn a light on (`switch`/`on`), dim to 50% (`switchLevel`/`setLevel`/[50]), set thermostat to 70F (`thermostatCoolingSetpoint`/`setCoolingSetpoint`/[70]), unlock (`lock`/`unlock`). Use list_devices to get capabilities for a device, and SmartThings docs for capability/command/args reference.',
-    inputSchema: {
-      deviceId: z.string(),
-      capability: z.string().describe('Capability id, e.g. "switch", "switchLevel".'),
-      command: z.string().describe('Command name, e.g. "on", "setLevel".'),
-      arguments: z
-        .array(z.union([z.string(), z.number(), z.boolean()]))
-        .optional()
-        .describe('Command arguments (positional, e.g. [50] for setLevel).'),
-      component: z
-        .string()
-        .default('main')
-        .describe('Device component, almost always "main".'),
-    },
-  },
-  async ({ deviceId, capability, command, arguments: args, component }) => {
-    const data = await st(
-      'POST',
-      `${ST_BASE}/devices/${encodeURIComponent(deviceId)}/commands`,
-      {
-        commands: [
-          {
-            component,
-            capability,
-            command,
-            arguments: args || [],
-          },
-        ],
-      },
-    );
-    return ok(data);
-  },
-);
-
-server.registerTool(
-  'smartthings_list_scenes',
-  {
-    title: 'List SmartThings Scenes',
-    description:
-      'List all scenes the user has configured. Scenes are pre-built device groupings ("Movie Time", "Bedtime") that change multiple devices at once.',
-    inputSchema: {
-      locationId: z.string().optional(),
-    },
-  },
-  async ({ locationId }) => {
-    const params = new URLSearchParams();
-    if (locationId) params.set('locationId', locationId);
-    const qs = params.toString();
-    const data = await st(
-      'GET',
-      `${ST_BASE}/scenes${qs ? '?' + qs : ''}`,
-    );
-    return ok(data);
-  },
-);
-
-server.registerTool(
-  'smartthings_execute_scene',
-  {
-    title: 'Execute SmartThings Scene',
-    description:
-      'Trigger a scene. Best UX for "set the lights for a movie", "good night" — instead of orchestrating multiple device commands, the user already grouped them.',
-    inputSchema: { sceneId: z.string() },
-  },
-  async ({ sceneId }) => {
-    const data = await st(
-      'POST',
-      `${ST_BASE}/scenes/${encodeURIComponent(sceneId)}/execute`,
-      {},
-    );
-    return ok(data);
-  },
-);
-
-server.registerTool(
-  'smartthings_get_history',
-  {
-    title: 'Get SmartThings Device Event History',
-    description:
-      'Fetch device event history (when motion was detected, when a switch was flipped, when a door was opened, etc). Use to answer "did anyone walk by the front door yesterday?" or "what time did the bedroom lights go off?" or "did anyone come home in the last hour?". Each event has timestamp, device, capability, attribute, and value. The response includes a `nextPage` cursor object — pass it back as `nextPage` to fetch the page before the oldest event in this batch (history goes backwards in time when oldestFirst=false). Repeat until `nextPage` is null or you have enough.',
-    inputSchema: {
-      locationId: z
-        .string()
-        .describe(
-          'Location id (required). Get from list_locations — most users have one.',
-        ),
-      deviceId: z.string().optional().describe('Filter to a single device.'),
-      limit: z.number().int().min(1).max(200).default(50),
-      oldestFirst: z
-        .boolean()
-        .default(false)
-        .describe('Default false = newest events first.'),
-      nextPage: z
-        .object({
-          epoch: z.number(),
-          hash: z.number(),
-        })
-        .optional()
-        .describe(
-          'Pagination cursor returned from a previous call (`nextPage` field). Pass verbatim to walk further back in time. Omit on first call.',
-        ),
-    },
-  },
-  async ({ locationId, deviceId, limit, oldestFirst, nextPage }) => {
-    const params = new URLSearchParams({
-      locationId,
-      limit: String(limit),
-      oldestFirst: String(oldestFirst),
-    });
-    if (deviceId) params.set('deviceId', deviceId);
-    // SmartThings cursor uses two query params together; both required.
-    if (nextPage) {
-      params.set('pagingBeforeEpoch', String(nextPage.epoch));
-      params.set('pagingBeforeHash', String(nextPage.hash));
-    }
-    const data = (await st(
-      'GET',
-      `${ST_BASE}/history/devices?${params}`,
-    )) as {
-      items?: Array<Record<string, unknown>>;
-      _links?: { next?: { href?: string } };
-    };
-    // Slim event records — full responses include translated metadata,
-    // hashes, and other fields the agent rarely needs. Keep what's useful
-    // for "tell me what happened."
-    const items = (data.items || []).map((e) => ({
-      time: e.time,
-      device: e.deviceName,
-      deviceId: e.deviceId,
-      text: e.text,
-      capability: e.capability,
-      attribute: e.attribute,
-      value: e.value,
-      unit: e.unit,
-    }));
-    // Extract a clean cursor object from the API's `_links.next.href`
-    // query string (epoch + hash). null when there are no older events.
-    let cursor: { epoch: number; hash: number } | null = null;
-    const nextHref = data._links?.next?.href;
-    if (nextHref) {
-      try {
-        const u = new URL(nextHref);
-        const e = u.searchParams.get('pagingBeforeEpoch');
-        const h = u.searchParams.get('pagingBeforeHash');
-        if (e && h) cursor = { epoch: Number(e), hash: Number(h) };
-      } catch {
-        /* ignore — leave cursor null */
-      }
-    }
-    return ok({ count: items.length, items, nextPage: cursor });
-  },
-);
-
-server.registerTool(
-  'smartthings_list_locations',
-  {
-    title: 'List SmartThings Locations',
-    description:
-      'List the user\'s SmartThings locations (homes / properties). Most users have one. Use the locationId to filter device/scene/room calls.',
-    inputSchema: {},
-  },
-  async () => {
-    const data = await st('GET', `${ST_BASE}/locations`);
-    return ok(data);
-  },
-);
-
-server.registerTool(
-  'smartthings_list_rooms',
-  {
-    title: 'List SmartThings Rooms',
-    description:
-      'List rooms in a SmartThings location. Combine with list_devices to filter by room (devices have roomId).',
-    inputSchema: { locationId: z.string() },
-  },
-  async ({ locationId }) => {
-    const data = await st(
-      'GET',
-      `${ST_BASE}/locations/${encodeURIComponent(locationId)}/rooms`,
-    );
-    return ok(data);
-  },
-);
 
 // ────────────────────────────────────────────────────────────────
 

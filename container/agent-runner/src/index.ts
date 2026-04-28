@@ -654,21 +654,57 @@ async function runQuery(
           },
         }
       : {}),
-    // OneCLI MCP — structured tools (gcal_*, gmail_*, ...) that route through
-    // the OneCLI gateway for transparent OAuth injection. Only register when
-    // HTTPS_PROXY is set, which container-runner.ts does for main + trusted.
-    ...(process.env.HTTPS_PROXY
+    // OneCLI MCP — structured tools (onecli_gcal_*, onecli_gmail_*) that
+    // route through an OneCLI gateway for transparent OAuth injection.
+    // Optional alternative to Composio; the two are not mutually
+    // exclusive (tool names are namespaced `onecli_*` so they can't
+    // collide).
+    //
+    // Activation: gates on NANOCLAW_ONECLI_ENABLED=1 — a dedicated env
+    // var so registration isn't tangled with HTTPS_PROXY (which is also
+    // commonly set by corporate proxies, mitmproxy, debug-proxies, etc.
+    // and whose presence shouldn't on its own activate an MCP server).
+    // The host-side OneCLI proxy injection sets both
+    // NANOCLAW_ONECLI_ENABLED=1 AND HTTPS_PROXY=... at spawn time.
+    ...(process.env.NANOCLAW_ONECLI_ENABLED === '1'
       ? {
           onecli: {
             command: 'node',
             args: [path.join(__dirname, 'onecli-mcp-stdio.js')],
             env: {
-              HTTPS_PROXY: process.env.HTTPS_PROXY,
+              HTTPS_PROXY: process.env.HTTPS_PROXY || '',
               HTTP_PROXY: process.env.HTTP_PROXY || '',
               NO_PROXY: process.env.NO_PROXY || '',
               NODE_USE_ENV_PROXY: '1',
               NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || '',
               SSL_CERT_FILE: process.env.SSL_CERT_FILE || '',
+              NANOCLAW_TRUST_TIER: process.env.NANOCLAW_TRUST_TIER || '',
+            },
+          },
+        }
+      : {}),
+    // SmartThings MCP — gated separately via
+    // NANOCLAW_ONECLI_ENABLE_SMARTTHINGS=1 so operators who want
+    // Calendar / Gmail don't get 8 physical-device write tools as
+    // dead code. Also requires NANOCLAW_ONECLI_ENABLED=1 (the
+    // umbrella) AND NANOCLAW_TRUST_TIER!=untrusted — physical-state
+    // mutation tools must never be registered in untrusted contexts.
+    ...(process.env.NANOCLAW_ONECLI_ENABLED === '1' &&
+    process.env.NANOCLAW_ONECLI_ENABLE_SMARTTHINGS === '1' &&
+    (process.env.NANOCLAW_TRUST_TIER || 'untrusted').toLowerCase() !==
+      'untrusted'
+      ? {
+          'onecli-smartthings': {
+            command: 'node',
+            args: [path.join(__dirname, 'onecli-smartthings-mcp-stdio.js')],
+            env: {
+              HTTPS_PROXY: process.env.HTTPS_PROXY || '',
+              HTTP_PROXY: process.env.HTTP_PROXY || '',
+              NO_PROXY: process.env.NO_PROXY || '',
+              NODE_USE_ENV_PROXY: '1',
+              NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || '',
+              SSL_CERT_FILE: process.env.SSL_CERT_FILE || '',
+              NANOCLAW_TRUST_TIER: process.env.NANOCLAW_TRUST_TIER || '',
             },
           },
         }
