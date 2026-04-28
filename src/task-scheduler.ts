@@ -239,16 +239,23 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
-  // Scheduled tasks resume THEIR OWN session chain from the `maintenance`
-  // slot. The sessions map is keyed by `(groupFolder, sessionName)` —
-  // maintenance has its own per-session `.claude/` mount, so its
-  // sessionIds are stored and resumed separately from the user-facing
-  // default container. `context_mode: 'isolated'` starts fresh each run.
+  // Scheduled tasks intentionally do NOT resume a prior SDK session, even for
+  // `context_mode: 'group'`. Session resume causes the SDK to replay the prior
+  // turn's final response as the first streamed output chunk of the new turn —
+  // the agent-runner converts that to an OUTPUT_START/END marker, which
+  // `runTask`'s streaming callback captures as the current task's `result` and
+  // writes to `last_result`. This is the cross-attribution bug: task B sees
+  // task A's output as its own. Always starting fresh avoids the replay.
+  //
+  // `context_mode: 'group'` still stores the `newSessionId` returned by the
+  // container so the per-session `.claude/` transcript chain grows on disk —
+  // we just never pass an old id to `query()`. The write-back below keeps the
+  // chain for logging/introspection without enabling the replay.
+  //
+  // `context_mode: 'isolated'` never stored or resumed — no change.
   const sessions = deps.getSessions();
-  const sessionId =
-    task.context_mode === 'group'
-      ? sessions[task.group_folder]?.[MAINTENANCE_SESSION_NAME]
-      : undefined;
+  // Never pass sessionId to the container (avoids SDK replay of prior turn).
+  const sessionId = undefined;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the

@@ -138,7 +138,15 @@ describe('task scheduler', () => {
     expect(computeNextRun(task)).toBeNull();
   });
 
-  it('maintenance task with context_mode=group uses stored maintenance sessionId and persists newSessionId', async () => {
+  it('maintenance task with context_mode=group does NOT pass prior sessionId but DOES persist newSessionId (issue #10 fix)', async () => {
+    // Pre-fix: the scheduler passed the stored maintenance sessionId to
+    // runContainerAgent, which caused the SDK to replay the prior turn's
+    // final response as the first streamed chunk — captured as the new
+    // task's result and written to last_result (cross-attribution bug).
+    //
+    // Post-fix: sessionId is NEVER passed to the container (always fresh
+    // start). The newSessionId returned by the container IS still stored so
+    // the per-session .claude/ transcript chain continues to grow on disk.
     const MAIN_GROUP = {
       name: 'Main',
       folder: 'main',
@@ -147,8 +155,7 @@ describe('task scheduler', () => {
       isMain: true,
     };
 
-    // Seed a prior maintenance sessionId in the sessions cache. The
-    // scheduler should read this and pass it into runContainerAgent.
+    // Seed a prior maintenance sessionId — post-fix it must NOT be passed.
     setSession('main', MAINTENANCE_SESSION_NAME, 'prior-maint-session');
 
     createTask({
@@ -198,14 +205,16 @@ describe('task scheduler', () => {
 
     await vi.advanceTimersByTimeAsync(10);
 
-    // The stored prior sessionId was passed in as the resume target.
     expect(mockRunContainerAgent).toHaveBeenCalled();
     const containerInput = mockRunContainerAgent.mock.calls[0][1];
-    expect(containerInput.sessionId).toBe('prior-maint-session');
+
+    // sessionId MUST NOT be passed — issue #10 fix. Passing it causes the SDK
+    // to replay the prior turn's result as the current task's output.
+    expect(containerInput.sessionId).toBeUndefined();
     expect(containerInput.sessionName).toBe(MAINTENANCE_SESSION_NAME);
 
-    // The new sessionId from the streaming callback was persisted to the
-    // MAINTENANCE slot (not default).
+    // The newSessionId from the streaming callback IS still persisted to the
+    // MAINTENANCE slot (not default) — the transcript chain keeps growing.
     expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe(
       'new-maint-session',
     );
@@ -1039,5 +1048,171 @@ describe('task scheduler', () => {
     expect(resurrected).toEqual([]);
     // Recurring row stays where the operator put it.
     expect(getTaskById('cron-frozen')?.status).toBe('completed');
+  });
+
+  // --- Issue #10: last_result cross-attribution fix ---
+  //
+  // When a context_mode='group' task resumes a prior SDK session the SDK
+  // replays the prior turn's final response as the first streamed chunk —
+  // the agent-runner converts that to an OUTPUT_START/END marker, which
+  // runTask's streaming callback captured as the *new* task's result and
+  // wrote to last_result. Fix: never pass sessionId to the container for
+  // scheduled tasks (always start fresh). The newSessionId returned by the
+  // container is still stored so the per-session .claude/ transcript chain
+  // grows, but we don't pass the id to query().
+
+  it('scheduled task does not pass sessionId to container even for context_mode=group (cross-attribution fix)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    // Seed a prior maintenance sessionId — the pre-fix code would have passed
+    // this to runContainerAgent, causing the SDK to replay the prior turn.
+    setSession('main', MAINTENANCE_SESSION_NAME, 'prior-session-must-not-be-used');
+
+    createTask({
+      id: 'no-resume-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'run fresh',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: 'fresh-result',
+          newSessionId: 'new-session-from-run',
+        } as ContainerOutput);
+        return { status: 'success', result: 'fresh-result' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({ main: { maintenance: 'prior-session-must-not-be-used' } }),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(mockRunContainerAgent).toHaveBeenCalled();
+    const containerInput = mockRunContainerAgent.mock.calls[0][1];
+
+    // The prior sessionId MUST NOT be passed — doing so triggers SDK replay
+    // of the previous turn's result, causing cross-attribution (issue #10).
+    expect(containerInput.sessionId).toBeUndefined();
+
+    // The newSessionId returned by the container IS still stored so the
+    // per-session transcript chain continues to grow.
+    expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe('new-session-from-run');
+  });
+
+  it('two sequential context_mode=group tasks get isolated last_result values (no cross-attribution)', async () => {
+    // Regression test for issue #10: task B must never see task A's result
+    // in its own last_result row, even when they share the same group and
+    // maintenance session slot.
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    const now = Date.now();
+
+    createTask({
+      id: 'task-A',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'task A prompt',
+      schedule_type: 'interval',
+      schedule_value: '120000',
+      context_mode: 'group',
+      next_run: new Date(now - 2000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    createTask({
+      id: 'task-B',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'task B prompt',
+      schedule_type: 'interval',
+      schedule_value: '120000',
+      context_mode: 'group',
+      next_run: new Date(now - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    // Each task returns its own distinctively-labelled result.
+    mockRunContainerAgent
+      .mockImplementationOnce(async (_group, _input, _onProc, onOutput) => {
+        await onOutput!({ status: 'success', result: 'MARKER_FROM_TASK_A' } as ContainerOutput);
+        return { status: 'success', result: 'MARKER_FROM_TASK_A' };
+      })
+      .mockImplementationOnce(async (_group, _input, _onProc, onOutput) => {
+        await onOutput!({ status: 'success', result: 'MARKER_FROM_TASK_B' } as ContainerOutput);
+        return { status: 'success', result: 'MARKER_FROM_TASK_B' };
+      });
+
+    // Run tasks synchronously in order to avoid concurrency noise.
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const taskA = getTaskById('task-A');
+    const taskB = getTaskById('task-B');
+
+    // Task A's last_result must only contain A's marker.
+    expect(taskA?.last_result).toContain('MARKER_FROM_TASK_A');
+    expect(taskA?.last_result).not.toContain('MARKER_FROM_TASK_B');
+
+    // Task B's last_result must only contain B's marker (cross-attribution fix).
+    expect(taskB?.last_result).toContain('MARKER_FROM_TASK_B');
+    expect(taskB?.last_result).not.toContain('MARKER_FROM_TASK_A');
   });
 });
