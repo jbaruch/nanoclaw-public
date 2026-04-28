@@ -444,7 +444,19 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
+  // Poll IPC for the _close sentinel during the query. We deliberately do
+  // NOT drain JSON message files here — there's a race where pollIpc fires
+  // after the SDK has emitted Result and agent-runner has broken out of
+  // the for-await over responses, but BEFORE runQuery returns and
+  // ipcPolling flips to false. In that window, draining a file consumes
+  // it from disk (delete + consumedInputFiles entry) and pushes it into a
+  // stream the SDK has stopped reading from — message is silently lost.
+  // Mid-query draining is also unnecessary: the SDK conversation is
+  // turn-based, and adding a second user message mid-turn doesn't get
+  // processed until after the current turn ends anyway. Letting
+  // waitForIpcMessage drain between queries gives the same throughput
+  // with deterministic delivery — files only disappear when their content
+  // has been read into a string that becomes the next runQuery's prompt.
   let ipcPolling = true;
   let closedDuringQuery = false;
   const pollIpcDuringQuery = () => {
@@ -455,11 +467,6 @@ async function runQuery(
       stream.end();
       ipcPolling = false;
       return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
@@ -664,8 +671,15 @@ async function runQuery(
       // Adaptive also auto-enables interleaved thinking, which matters for
       // our multi-tool-call agentic workflow. Safe on 4.6/Sonnet 4.6 (both
       // support adaptive and will use it over the deprecated manual mode).
+      //
+      // `display: 'summarized'` is required on Opus 4.7+ to get readable
+      // thinking content. Anthropic changed the default to `'omitted'` on
+      // 4.7 (faster streaming, but `block.thinking` comes back as empty
+      // string with only a signature blob). Older models default to
+      // 'summarized' and accept the explicit value as a no-op.
+      //
       // See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
-      thinking: { type: 'adaptive' as const },
+      thinking: { type: 'adaptive' as const, display: 'summarized' as const },
       // AGENT_EFFORT is set by the orchestrator alongside AGENT_MODEL so
       // cost/latency can be tuned per deploy without rebuilding this image.
       // xhigh is Opus 4.7's recommended default for coding/agentic work
