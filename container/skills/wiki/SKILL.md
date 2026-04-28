@@ -49,7 +49,9 @@ When the user asks a question:
 
 ### Lint
 
-Periodic health check. Look for:
+Periodic health check. **Self-service by default — do not ask "should I fix?"** The lint is often invoked from scheduled contexts (weekly-housekeeping, heartbeat), where there is no interactive reader on the other end. Hanging on a yes/no prompt silently blocks the whole scheduled cycle — observed on 2026-04-19 when the Sun 4am weekly sent "rebuild?" to Telegram and idled waiting for a reply that never came.
+
+Find:
 - Contradictions between pages
 - Stale claims superseded by newer sources
 - Orphan pages with no inbound links
@@ -57,7 +59,29 @@ Periodic health check. Look for:
 - Missing cross-references
 - Gaps — topics referenced but never sourced
 
-Report findings and offer to fix.
+Then act per category — decide, don't ask:
+
+| Category | Action |
+|---|---|
+| Missing cross-references | **Auto-fix.** Add the inbound/outbound link and update the page's `updated:` frontmatter. Safe — purely additive, reversible. |
+| Orphan pages with no inbound links | **Auto-fix.** Add a reference from the nearest category index or hub page and update the page's `updated:` frontmatter. If no natural hub exists, set the frontmatter keys `lint_orphan: YYYY-MM-DD` and `updated:` on the orphan page — these go into the Fixed summary count, not the Report section. |
+| Stale claims superseded by newer sources | **Auto-fix** when the newer source is already ingested and the supersession is unambiguous (same entity, clearer numbers/dates, newer `created:`). Strike the stale line, add a Markdown link: `superseded by [Newer Page Title](newer-page.md)`, and update the page's `updated:` frontmatter. Ambiguous cases — different methodology, partial overlap, conflicting primary sources — fall to **Report**. |
+| Gaps — topics referenced but never sourced | **Report.** Cannot fix without new source ingestion, which requires human judgment on what to fetch. List the topic and the pages that reference it. |
+| Contradictions between pages | **Report.** Requires human judgment on which claim is correct. Never auto-pick. List the contradicting pages and quote the conflicting lines. |
+| Important concepts mentioned but lacking dedicated pages | **Report.** Creating a concept page is a judgment call about scope and depth — don't synthesize without a source pointer. |
+
+**Output** — write a single summary to stdout (if run from CLI) or one `send_message` (if run from a skill context), never a paired question:
+
+```
+Wiki lint — YYYY-MM-DD
+Fixed: <fixed_crossrefs> cross-refs added, <fixed_orphans> orphans hub-linked, <fixed_superseded> stale lines superseded
+Report: <report_gaps> gaps, <report_contradictions> contradictions, <report_missing_concepts> missing concept pages
+[details follow as bullets if any Report-category hits]
+```
+
+If nothing to fix and nothing to report → silence. Do NOT emit "wiki is clean" or any acknowledgment.
+
+**Rationale for acting over asking.** The three auto-fix categories are each reversible via git (the wiki lives under version control) and produce no semantic conflicts: missing cross-refs are discovered links, orphan hub-linking places a page where a reader can find it, and unambiguous supersession strikes an already-superseded fact. The three report-only categories involve choices (which source to trust, how deep a concept page should go, whether to ingest a new source) that belong to the wiki owner, not to a scheduled job at 4am.
 
 ## Page format
 
@@ -71,6 +95,8 @@ sources: [source1.md, source2.pdf]
 related: [other-page.md, another.md]
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
+# Optional lint-state keys (set by the self-service lint, not by ingest):
+# lint_orphan: YYYY-MM-DD    # set when an orphan page has no natural hub
 ---
 
 Content here. Link to related pages: [Related Topic](related-topic.md)

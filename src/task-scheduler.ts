@@ -16,7 +16,8 @@ import {
   getTaskById,
   logTaskRun,
   pruneCompletedTasks,
-  setSession,
+  storeChatMetadata,
+  storeMessage,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
@@ -32,16 +33,77 @@ import { RegisteredGroup, ScheduledTask } from './types.js';
  *
  * Co-authored-by: @community-pr-601
  */
-export function computeNextRun(task: ScheduledTask): string | null {
-  if (task.schedule_type === 'once') return null;
+/**
+ * Result type that lets callers know WHY a recurring task got
+ * `nextRun: null` so they can apply remediation against the FRESH DB
+ * row (avoiding races against concurrent `update_task` IPC).
+ *
+ * The legacy `string | null` shape is preserved by `computeNextRun`
+ * for backwards compat — call `computeNextRunDetailed` to get the
+ * structured result.
+ */
+export type NextRunRemediation =
+  | 'pause-broken-cron' // both per-task tz and TIMEZONE retry failed
+  | 'clear-bad-timezone'; // per-task tz failed, TIMEZONE retry succeeded
+
+export interface NextRunResult {
+  nextRun: string | null;
+  remediation?: NextRunRemediation;
+}
+
+export function computeNextRunDetailed(task: ScheduledTask): NextRunResult {
+  if (task.schedule_type === 'once') return { nextRun: null };
 
   const now = Date.now();
 
   if (task.schedule_type === 'cron') {
-    const interval = CronExpressionParser.parse(task.schedule_value, {
-      tz: TIMEZONE,
-    });
-    return interval.next().toISOString();
+    // Per-task `schedule_timezone` (#102) takes precedence over the
+    // server-wide TIMEZONE config. NULL/undefined falls back to TIMEZONE
+    // — the pre-#102 behavior.
+    //
+    // Pure function (no DB writes): a previous version called
+    // `updateTask` directly here, which raced with concurrent
+    // `update_task` IPC — a user fixing a broken tz could have their
+    // change clobbered by a still-in-flight scheduler tick that read
+    // the old value. Now we just compute and report; the caller is
+    // responsible for pausing or clearing the tz against the FRESH
+    // DB row.
+    try {
+      const interval = CronExpressionParser.parse(task.schedule_value, {
+        tz: task.schedule_timezone || TIMEZONE,
+      });
+      return { nextRun: interval.next().toISOString() };
+    } catch (err) {
+      logger.warn(
+        {
+          taskId: task.id,
+          scheduleValue: task.schedule_value,
+          scheduleTimezone: task.schedule_timezone,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'computeNextRun: cron parse failed — retrying with server TIMEZONE',
+      );
+      try {
+        const interval = CronExpressionParser.parse(task.schedule_value, {
+          tz: TIMEZONE,
+        });
+        return {
+          nextRun: interval.next().toISOString(),
+          remediation: 'clear-bad-timezone',
+        };
+      } catch (retryErr) {
+        logger.error(
+          {
+            taskId: task.id,
+            scheduleValue: task.schedule_value,
+            err:
+              retryErr instanceof Error ? retryErr.message : String(retryErr),
+          },
+          'computeNextRun: cron parse failed even with TIMEZONE fallback',
+        );
+        return { nextRun: null, remediation: 'pause-broken-cron' };
+      }
+    }
   }
 
   if (task.schedule_type === 'interval') {
@@ -52,7 +114,7 @@ export function computeNextRun(task: ScheduledTask): string | null {
         { taskId: task.id, value: task.schedule_value },
         'Invalid interval value',
       );
-      return new Date(now + 60_000).toISOString();
+      return { nextRun: new Date(now + 60_000).toISOString() };
     }
     // Anchor to the scheduled time, not now, to prevent drift.
     // Skip past any missed intervals so we always land in the future.
@@ -60,10 +122,67 @@ export function computeNextRun(task: ScheduledTask): string | null {
     while (next <= now) {
       next += ms;
     }
-    return new Date(next).toISOString();
+    return { nextRun: new Date(next).toISOString() };
   }
 
-  return null;
+  return { nextRun: null };
+}
+
+/**
+ * Backwards-compat shim: `computeNextRun` retains its original
+ * `string | null` shape so existing callers that don't care about
+ * remediation hints continue to work. Internally delegates to
+ * `computeNextRunDetailed` and discards the remediation field —
+ * callers that DO need to act on remediation should call the
+ * detailed variant directly and apply the remediation against the
+ * fresh DB row (re-fetch via `getTaskById`) to avoid clobbering
+ * concurrent IPC updates.
+ */
+export function computeNextRun(task: ScheduledTask): string | null {
+  return computeNextRunDetailed(task).nextRun;
+}
+
+/**
+ * Apply the remediation hint produced by `computeNextRunDetailed`
+ * against the FRESH state of the task (re-fetched from DB). If the
+ * task changed since the compute step (e.g. a concurrent
+ * `update_task` fixed the cron expression or timezone), we skip the
+ * remediation — the caller's fix wins.
+ */
+export function applyComputeNextRunRemediation(
+  taskId: string,
+  remediation: NextRunRemediation,
+  observedScheduleValue: string,
+  observedScheduleTimezone: string | null | undefined,
+): void {
+  const fresh = getTaskById(taskId);
+  if (!fresh) return;
+  // If the user updated the task between compute and now, the values
+  // we'd be remediating against are no longer the source of the
+  // failure. Skip — let the next scheduler tick re-evaluate.
+  if (
+    fresh.schedule_value !== observedScheduleValue ||
+    (fresh.schedule_timezone ?? null) !== (observedScheduleTimezone ?? null)
+  ) {
+    logger.info(
+      { taskId, remediation },
+      'applyComputeNextRunRemediation: task changed since compute — skipping',
+    );
+    return;
+  }
+  if (remediation === 'pause-broken-cron') {
+    updateTask(taskId, { status: 'paused' });
+    logger.warn(
+      { taskId },
+      'Paused task — cron expression unparseable with both per-task tz and server TIMEZONE',
+    );
+  } else if (remediation === 'clear-bad-timezone') {
+    updateTask(taskId, { schedule_timezone: null });
+    logger.warn(
+      { taskId, droppedTimezone: observedScheduleTimezone },
+      'Dropped invalid schedule_timezone — falling back to TIMEZONE going forward',
+    );
+  }
 }
 
 /**
@@ -144,13 +263,6 @@ const lastDormantWarnAt = new Map<string, number>();
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
-  /**
-   * Nested session cache: `folder → sessionName → sessionId`.
-   * Scheduled tasks look up the MAINTENANCE slot's sessionId here so
-   * consecutive heartbeat/nightly runs resume their own prior session
-   * chain, not the user-facing default container's.
-   */
-  getSessions: () => Record<string, Record<string, string>>;
   queue: GroupQueue;
   onProcess: (
     groupJid: string,
@@ -160,6 +272,39 @@ export interface SchedulerDependencies {
     groupFolder: string,
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
+  /**
+   * Wipe the on-disk session artifacts (JSONL transcript and the
+   * sibling per-session tool-results directory) for a just-finished
+   * scheduled-task SDK session. Each scheduled run is a fresh SDK turn
+   * (#193) — its sessionId is never persisted to the sessions cache or
+   * DB, so `nukeSession` and the time-based `cleanup-sessions.sh`
+   * script cannot find it to wipe later. Without this hook, every run
+   * leaves orphan files under
+   * `data/sessions/<group>/maintenance/.claude/projects/<slug>/`.
+   *
+   * Invocation contract: the scheduler de-duplicates every `newSessionId`
+   * the SDK reports during the run (streaming events plus the terminal
+   * `runContainerAgent` return value, since either may carry the id, and
+   * the SDK can re-issue the id mid-run) and calls this helper once per
+   * unique id from a `finally` block that runs after the post-run DB
+   * bookkeeping (`logTaskRun`, `updateTaskAfterRun`). The `finally`
+   * placement guarantees the wipe still fires when those DB writes throw
+   * — otherwise a transient SQLite error would leave the just-created
+   * artifacts orphan-on-disk, defeating #193.
+   *
+   * Implemented by the orchestrator via `wipeSessionJsonl` (delete-
+   * while-open is safe on POSIX, so we don't have to wait for container
+   * teardown). The implementation is defensive — ENOENT and other
+   * expected fs errors are swallowed internally and reflected in the
+   * returned count. Returned count is the total number of filesystem
+   * entries removed: up to 2 per slug (1 JSONL + 1 tool-results dir),
+   * summed across every project-slug subdirectory walked.
+   */
+  wipeSessionJsonl: (
+    groupFolder: string,
+    sessionName: string,
+    sessionId: string,
+  ) => number;
 }
 
 async function runTask(
@@ -171,7 +316,11 @@ async function runTask(
   try {
     groupDir = resolveGroupFolderPath(task.group_folder);
   } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
+    // resolveGroupFolderPath throws Error on path-validation failure.
+    // Anything else is a bug elsewhere; propagate per
+    // `jbaruch/coding-policy: error-handling`.
+    if (!(err instanceof Error)) throw err;
+    const error = err.message;
     // Stop retry churn for malformed legacy rows.
     updateTask(task.id, { status: 'paused' });
     logger.error(
@@ -238,16 +387,25 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
-  // Scheduled tasks resume THEIR OWN session chain from the `maintenance`
-  // slot. The sessions map is keyed by `(groupFolder, sessionName)` —
-  // maintenance has its own per-session `.claude/` mount, so its
-  // sessionIds are stored and resumed separately from the user-facing
-  // default container. `context_mode: 'isolated'` starts fresh each run.
-  const sessions = deps.getSessions();
-  const sessionId =
-    task.context_mode === 'group'
-      ? sessions[task.group_folder]?.[MAINTENANCE_SESSION_NAME]
-      : undefined;
+  // #193: scheduled tasks NEVER resume the SDK session. Every run starts
+  // a fresh turn. Two distinct tasks (a lunch reminder firing minutes
+  // after a heartbeat) used to share `sessions[group][maintenance]` and
+  // the prior turn's terminal message bled into the next run's stream,
+  // cross-attributing `last_result`. Containers still mount the
+  // per-session `.claude/` dir under `MAINTENANCE_SESSION_NAME` (parallel
+  // slot, won't block default), but no `resume: sessionId` is passed and
+  // no `newSessionId` is persisted on completion. `context_mode` is
+  // retained on the schema for future use; it no longer gates SDK resume.
+  //
+  // Disk hygiene: every fresh SDK turn writes a new JSONL transcript
+  // under `data/sessions/<group>/maintenance/.claude/projects/<slug>/`.
+  // Because the sessionId is no longer persisted, neither `nukeSession`
+  // nor the time-based `cleanup-sessions.sh` script can find these
+  // transcripts to wipe later. Collect every newSessionId observed
+  // during the run (streaming events plus the terminal runContainerAgent
+  // return) and pass them to `deps.wipeSessionJsonl` from the post-run
+  // finally block — see `SchedulerDependencies` JSDoc.
+  const observedSessionIds = new Set<string>();
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -269,27 +427,30 @@ async function runTask(
       group,
       {
         prompt: task.prompt,
-        sessionId,
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
+        // Provenance: the role that created this task, so the agent-runner
+        // can decide whether to wrap the prompt in <untrusted-input>. Only
+        // 'untrusted_agent'-created tasks get wrapped; owner/main/trusted
+        // bypass. See ContainerInput.createdByRole docs.
+        createdByRole: task.created_by_role,
         // Route every scheduled task into the parallel `maintenance` slot so
         // it runs concurrently with user-facing work. Sole writer of this
         // value — inbound paths route to `'default'` instead.
         sessionName: MAINTENANCE_SESSION_NAME,
-        // Continuation marker for self-resuming cycles. NULL on
-        // ordinary tasks; set only when a continuation-aware caller
-        // scheduled this row as the next link of a chain.
-        // Container-runner emits NANOCLAW_CONTINUATION=1 +
-        // NANOCLAW_CONTINUATION_CYCLE_ID env vars iff this is non-empty.
-        // `?? undefined` normalises the DB SELECT result (NULL for
-        // ordinary rows) into the optional ContainerInput field shape —
-        // never pass `null` here, since `if (continuationCycleId)` in
-        // buildContainerArgs would treat the string `"null"` as truthy
-        // if a stringification slipped in.
+        // Continuation marker for self-resuming cycles (#93/#130). NULL on
+        // ordinary tasks; set only when the resumable-cycle helper skill
+        // scheduled this row as the next link of a chain. Container-runner
+        // emits NANOCLAW_CONTINUATION=1 + NANOCLAW_CONTINUATION_CYCLE_ID
+        // env vars iff this is non-empty. `?? undefined` normalises the DB
+        // SELECT result (NULL for ordinary rows) into the optional
+        // ContainerInput field shape — never pass `null` here, since
+        // `if (continuationCycleId)` in buildContainerArgs would treat the
+        // string `"null"` as truthy if a stringification slipped in.
         continuationCycleId: task.continuation_cycle_id ?? undefined,
       },
       (proc, containerName) =>
@@ -301,20 +462,12 @@ async function runTask(
           task.group_folder,
         ),
       async (streamedOutput: ContainerOutput) => {
-        // Persist the maintenance session's own sessionId so the NEXT
-        // scheduled task on this group can resume the same chain. Only
-        // for `context_mode: 'group'` tasks — an isolated task wants a
-        // fresh SDK session and its newSessionId would otherwise overwrite
-        // the slot and contaminate the next 'group' task's resume.
-        if (streamedOutput.newSessionId && task.context_mode === 'group') {
-          const groupSessions =
-            sessions[task.group_folder] ?? (sessions[task.group_folder] = {});
-          groupSessions[MAINTENANCE_SESSION_NAME] = streamedOutput.newSessionId;
-          setSession(
-            task.group_folder,
-            MAINTENANCE_SESSION_NAME,
-            streamedOutput.newSessionId,
-          );
+        // #193: do not persist newSessionId. Each scheduled run is a
+        // standalone turn; persisting would re-introduce the cross-task
+        // bleed via the next run's resume. Collect for post-run wipe so
+        // the orphan JSONL doesn't accumulate under the maintenance slot.
+        if (streamedOutput.newSessionId) {
+          observedSessionIds.add(streamedOutput.newSessionId);
         }
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -324,6 +477,94 @@ async function runTask(
             .trim();
           if (cleanResult) {
             await deps.sendMessage(task.chat_jid, cleanResult);
+            // Store the bot send so `messages.db` reflects every send
+            // out of this session. Without this, scheduled-task sends
+            // (heartbeat, housekeeping, morning-brief, etc.) reach
+            // Telegram but leave no DB row — the "ghost heartbeat" /
+            // "no trace in messages.db" class of jbaruch/nanoclaw#81.
+            // The IPC-path `send_message` handler in src/ipc.ts writes
+            // the same shape; this mirrors it so heartbeat's answered-
+            // check accounting and forensic greps both see the row.
+            //
+            // Upsert chat metadata first so the `messages.chat_jid →
+            // chats.jid` FK doesn't reject the insert on a chat that
+            // has no prior metadata (task fires before any user
+            // message, or chat was manually registered without the
+            // normal group-sync write-through). Idempotent: existing
+            // rows keep their `name` because we pass `name` as
+            // undefined and `storeChatMetadata` omits `name` from the
+            // UPDATE in that branch (not COALESCE); `channel` and
+            // `is_group` are preserved via COALESCE when we pass
+            // undefined for them. `last_message_time` advances to the
+            // outgoing send's timestamp, same as the IPC path would
+            // effectively do by chaining a chat-metadata update.
+            //
+            // Pass inferred `channel` + `isGroup` so a NEW chat row
+            // (first-ever metadata write) has the right shape for
+            // `getAvailableGroups()`, which filters on `is_group`.
+            // Match the channel-name convention the codebase already
+            // uses everywhere else (`'telegram'`, `'whatsapp'`) — NOT
+            // the JID prefix abbreviation. JID shapes in this repo:
+            //   - `tg:<id>` — Telegram. Negative id = group/channel,
+            //     positive = private 1:1.
+            //   - `<id>@g.us` — WhatsApp group (no `wa:` prefix).
+            //   - `<id>@s.whatsapp.net` — WhatsApp DM.
+            // Matches the conventions `db.ts`'s legacy-chat backfill
+            // uses (`@g.us` → group, `@s.whatsapp.net` → DM).
+            // Anything else: leave both undefined so COALESCE in
+            // storeChatMetadata preserves existing values rather than
+            // writing NULL or an abbreviated channel string.
+            const sendTimestamp = new Date().toISOString();
+            let inferredChannel: string | undefined;
+            let inferredIsGroup: boolean | undefined;
+            if (task.chat_jid.startsWith('tg:')) {
+              inferredChannel = 'telegram';
+              inferredIsGroup = task.chat_jid.startsWith('tg:-');
+            } else if (task.chat_jid.endsWith('@g.us')) {
+              inferredChannel = 'whatsapp';
+              inferredIsGroup = true;
+            } else if (task.chat_jid.endsWith('@s.whatsapp.net')) {
+              inferredChannel = 'whatsapp';
+              inferredIsGroup = false;
+            }
+            // Wrap the DB writes so a SQLite error (FK constraint,
+            // disk full, schema mid-migration) never rejects the
+            // `onOutput` promise. The streaming output chain in
+            // `container-runner.ts` awaits this via `.then(...)` with
+            // no `.catch(...)`, so a throw here can wedge the run
+            // from ever resolving and stall the scheduler loop. The
+            // send already succeeded; a missing DB row is recoverable
+            // (at worst we'd get a duplicate in `unanswered` on the
+            // next cycle) — stalling the scheduler is not.
+            try {
+              storeChatMetadata(
+                task.chat_jid,
+                sendTimestamp,
+                undefined,
+                inferredChannel,
+                inferredIsGroup,
+              );
+              storeMessage({
+                id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                chat_jid: task.chat_jid,
+                sender: ASSISTANT_NAME,
+                sender_name: ASSISTANT_NAME,
+                content: cleanResult,
+                timestamp: sendTimestamp,
+                is_from_me: true,
+                is_bot_message: true,
+              });
+            } catch (dbErr) {
+              logger.error(
+                {
+                  taskId: task.id,
+                  chatJid: task.chat_jid,
+                  err: dbErr,
+                  preview: cleanResult.slice(0, 200),
+                },
+                '[task-scheduler] storeChatMetadata/storeMessage failed after send — continuing, send already landed in Telegram',
+              );
+            }
           }
           // Don't close here — agent may still be polling for host script results.
           // Close only on final 'success' status below.
@@ -344,18 +585,12 @@ async function runTask(
 
     if (closeTimer) clearTimeout(closeTimer);
 
-    // Same write-back path for the terminal `output` (non-streaming case).
-    // Same `'group'`-only gate as the streaming path above — don't let an
-    // isolated task overwrite the maintenance slot's session chain.
-    if (output.newSessionId && task.context_mode === 'group') {
-      const groupSessions =
-        sessions[task.group_folder] ?? (sessions[task.group_folder] = {});
-      groupSessions[MAINTENANCE_SESSION_NAME] = output.newSessionId;
-      setSession(
-        task.group_folder,
-        MAINTENANCE_SESSION_NAME,
-        output.newSessionId,
-      );
+    // #193: terminal `output.newSessionId` is also discarded — see the
+    // streaming-path comment above. Same fresh-turn invariant. Also
+    // collected so the post-run wipe catches it even if no streaming
+    // event delivered the same id.
+    if (output.newSessionId) {
+      observedSessionIds.add(output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -371,28 +606,70 @@ async function runTask(
     );
   } catch (err) {
     if (closeTimer) clearTimeout(closeTimer);
-    error = err instanceof Error ? err.message : String(err);
+    // Per `jbaruch/coding-policy: error-handling`: non-Error throws
+    // indicate bugs upstream and should propagate. The scheduler loop
+    // (Step 2 of `loop` below) is the last-resort safety net that
+    // catches them, logs, and keeps ticking — so re-throwing here
+    // doesn't kill the orchestrator.
+    if (!(err instanceof Error)) throw err;
+    error = err.message;
     logger.error({ taskId: task.id, error }, 'Task failed');
   }
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
-    task_id: task.id,
-    run_at: new Date().toISOString(),
-    duration_ms: durationMs,
-    status: error ? 'error' : 'success',
-    result,
-    error,
-  });
+  // Post-run bookkeeping is wrapped in try/finally so the disk-hygiene
+  // wipe still runs if any DB write throws (transient SQLite, disk
+  // full, schema mid-migration). Without the finally a thrown
+  // logTaskRun / updateTaskAfterRun would leave the just-created
+  // JSONL orphan-on-disk forever — exactly what #193 is preventing.
+  try {
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: durationMs,
+      status: error ? 'error' : 'success',
+      result,
+      error,
+    });
 
-  const nextRun = computeNextRun(task);
-  const resultSummary = error
-    ? `Error: ${error}`
-    : result
-      ? result.slice(0, 200)
-      : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+    // Re-fetch the task to compute next_run against the FRESH schedule
+    // fields. The captured `task` is from before dispatch — between
+    // there and here a user can have called `update_task` to change
+    // `schedule_value`, `schedule_timezone`, or `schedule_type`, and
+    // their fix shouldn't be clobbered by a write-back computed from
+    // the stale capture (the same race `applyComputeNextRunRemediation`
+    // already guards against on the remediation path).
+    const fresh = getTaskById(task.id) ?? task;
+    const computed = computeNextRunDetailed(fresh);
+    if (computed.remediation) {
+      applyComputeNextRunRemediation(
+        fresh.id,
+        computed.remediation,
+        fresh.schedule_value,
+        fresh.schedule_timezone,
+      );
+    }
+    const resultSummary = error
+      ? `Error: ${error}`
+      : result
+        ? result.slice(0, 200)
+        : 'Completed';
+    updateTaskAfterRun(fresh.id, computed.nextRun, resultSummary);
+  } finally {
+    // #193: wipe the JSONL transcripts created by this run. The
+    // sessionId is never persisted (no resume, no DB row), so without
+    // this wipe the file accumulates forever under the maintenance
+    // slot. Multiple ids are possible if the SDK re-issued
+    // newSessionId mid-run — wipe all of them. No try/catch wrapper:
+    // `wipeSessionJsonl` already swallows ENOENT and other expected
+    // fs errors internally; anything that escapes is a programming
+    // bug per `jbaruch/coding-policy: error-handling`, and propagation
+    // is caught by the scheduler loop's terminal safety net.
+    for (const sid of observedSessionIds) {
+      deps.wipeSessionJsonl(task.group_folder, MAINTENANCE_SESSION_NAME, sid);
+    }
+  }
 }
 
 let schedulerRunning = false;
@@ -479,13 +756,30 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         }
 
         // Pre-advance next_run before dispatch to prevent double-fire on crash.
-        const claimedNextRun = computeNextRun(currentTask);
-        if (claimedNextRun !== null) {
-          updateTask(currentTask.id, { next_run: claimedNextRun });
-        } else {
-          // once-task: mark completed before dispatch
+        const computed = computeNextRunDetailed(currentTask);
+        if (computed.remediation) {
+          // Apply remediation against the FRESH DB row — if a user
+          // raced an `update_task` IPC between the read above and
+          // here that fixed the broken cron/tz, the helper detects
+          // the mismatch and skips, letting the user's fix stand.
+          applyComputeNextRunRemediation(
+            currentTask.id,
+            computed.remediation,
+            currentTask.schedule_value,
+            currentTask.schedule_timezone,
+          );
+        }
+        if (computed.nextRun !== null) {
+          updateTask(currentTask.id, { next_run: computed.nextRun });
+        } else if (currentTask.schedule_type === 'once') {
+          // Genuine once-task completion — pre-mark as completed.
           updateTask(currentTask.id, { status: 'completed' });
         }
+        // else: cron/interval with nextRun=null means
+        // `computeNextRunDetailed` returned a `pause-broken-cron`
+        // remediation that the apply step above already handled.
+        // Do NOT flip to completed — that would lose the paused
+        // state set by the remediation. See #102 round-4 review.
 
         deps.queue.enqueueTask(
           currentTask.chat_jid,
@@ -495,7 +789,22 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         );
       }
     } catch (err) {
-      logger.error({ err }, 'Error in scheduler loop');
+      // Terminal safety net for the scheduler loop. Inner code paths
+      // re-throw non-Error per `jbaruch/coding-policy: error-handling`;
+      // this catch is where they finally land. Re-throwing further
+      // here would crash the loop and stop every scheduled task — the
+      // explicit design choice is "log and keep ticking" so a single
+      // bug in one task can't take the orchestrator's whole scheduler
+      // down. Distinguishes Error from non-Error in the log so the
+      // bug source is identifiable downstream.
+      if (err instanceof Error) {
+        logger.error({ err }, 'Scheduler loop caught Error');
+      } else {
+        logger.error(
+          { err: String(err) },
+          'Scheduler loop caught non-Error throw — fix the upstream call site',
+        );
+      }
     }
 
     setTimeout(loop, SCHEDULER_POLL_INTERVAL);

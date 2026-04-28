@@ -1,1 +1,1 @@
-npm run format:fix
+npx --no-install lint-staged

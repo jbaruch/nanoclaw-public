@@ -25,6 +25,12 @@ import {
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import {
+  containerLogPath,
+  ensureHostLogDirs,
+  hostLogsDir,
+  stripAnsi,
+} from './host-logs.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
@@ -76,8 +82,8 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
  * either step leaves the secret either un-forwarded or back on the
  * command line.
  *
- * Variables with placeholder values (proxied through the credential
- * proxy) are NOT secrets and stay on the command line.
+ * Variables with placeholder values (proxied through OneCLI) are NOT
+ * secrets and stay on the command line.
  */
 export const SECRET_CONTAINER_VARS: ReadonlySet<string> = new Set([
   'COMPOSIO_API_KEY',
@@ -137,29 +143,34 @@ export function buildSecretEnvFile(
     fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
     0o600,
   );
-  // Write inside a nested try so a write failure (disk full, EIO,
-  // EDQUOT) doesn't leave the file behind — the outer caller never
-  // gets a cleanup callback if we throw, so we MUST unlink here
-  // before rethrowing. Without this, a partial-secret tempfile
-  // would persist on disk until the next reboot's tmpdir clear.
+  // success flag drives finally-block cleanup without a catch-all:
+  // exceptions from writeFileSync/closeSync propagate naturally, and
+  // finally unlinks the on-disk tempfile if the write didn't fully
+  // succeed. Without this, a write failure (disk full, EIO, EDQUOT)
+  // would leak a partial-secret tempfile because the outer caller
+  // never sees a cleanup callback from a throwing buildSecretEnvFile.
+  let writeSucceeded = false;
   try {
-    try {
-      fs.writeFileSync(fd, lines.join('\n') + '\n');
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch (err) {
-    try {
-      fs.unlinkSync(tmpPath);
-    } catch (unlinkErr) {
-      if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
-        logger.warn(
-          { err: unlinkErr, tmpPath },
-          'Failed to clean up secret env-file after write error',
-        );
+    fs.writeFileSync(fd, lines.join('\n') + '\n');
+    writeSucceeded = true;
+  } finally {
+    fs.closeSync(fd);
+    if (!writeSucceeded) {
+      // unlink failures other than ENOENT are logged but don't mask
+      // the original error — the outer try is propagating the real
+      // cause via finally semantics.
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch (unlinkErr) {
+        const code = (unlinkErr as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          logger.warn(
+            { err: unlinkErr, tmpPath },
+            'Failed to clean up secret env-file after write error',
+          );
+        }
       }
     }
-    throw err;
   }
 
   let cleaned = false;
@@ -195,9 +206,10 @@ export function buildSecretEnvFile(
  *
  * NOTE: changing the model family may require matching changes in
  * agent-runner's `query()` call. Opus 4.7 specifically needs
- * `thinking: { type: 'adaptive' }` (manual `type: 'enabled'` is rejected)
- * and does not support `effort: 'max'` well. The current runner is set up
- * for 4.7's expectations.
+ * `thinking: { type: 'adaptive', display: 'summarized' }` (manual
+ * `type: 'enabled'` is rejected; `display` defaults to `'omitted'` on 4.7
+ * which would silently empty out thinking content) and does not support
+ * `effort: 'max'` well. The current runner is set up for 4.7's expectations.
  */
 const AGENT_MODEL = 'claude-opus-4-7[1m]';
 
@@ -295,6 +307,20 @@ export interface ContainerInput {
   script?: string;
   replyToMessageId?: string;
   /**
+   * Provenance of a scheduled task (undefined for non-scheduled runs).
+   * Drives whether the agent-runner wraps the prompt in `<untrusted-input>`.
+   * Only `'untrusted_agent'` triggers the wrap; owner/main/trusted bypass
+   * because their content originates from a trusted source.
+   *
+   * Security boundary: the task-scheduler passes this from the DB row's
+   * `created_by_role` column, which was itself set by ipc.ts from the
+   * VERIFIED source-group trust tier at schedule_task time. The agent
+   * that scheduled the task never got to claim its own role — so an
+   * untrusted agent that self-scheduled a prompt sees it come back
+   * wrapped on the next fire.
+   */
+  createdByRole?: 'owner' | 'main_agent' | 'trusted_agent' | 'untrusted_agent';
+  /**
    * Which per-group session this container run belongs to. Drives the
    * `.claude/` dir location and the group-queue slot key.
    * - `'default'` (omitted): user-facing Andy, serves inbound IPC messages.
@@ -307,18 +333,18 @@ export interface ContainerInput {
    */
   sessionName?: string;
   /**
-   * Continuation marker for self-resuming cycles. Set only on
+   * Continuation marker for self-resuming cycles (#93/#130). Set only on
    * scheduled-task spawns whose `scheduled_tasks.continuation_cycle_id`
    * column is non-NULL. When present the spawned container gets:
    *   - `NANOCLAW_CONTINUATION=1`
    *   - `NANOCLAW_CONTINUATION_CYCLE_ID=<value>`
    *
-   * Absence (undefined / empty) means "fresh invocation" — neither env
-   * var is set, and that absence is itself the signal the calling skill
-   * cross-checks against its prompt-prefix marker. Mismatch fails
-   * closed to fresh invocation; a scheduler that sets the env but
-   * mangles the prompt (or vice versa) therefore never silently
-   * bypasses whatever continuation/lock contract the chain depends on.
+   * Absence (undefined / empty) means "fresh invocation" — neither env var
+   * is set, and that absence is itself the signal the calling skill
+   * (resumable-cycle / nightly-housekeeping / etc.) cross-checks against
+   * its prompt-prefix marker. Mismatch fails closed to fresh invocation;
+   * a scheduler that sets the env but mangles the prompt (or vice versa)
+   * therefore never silently bypasses the two-phase lock acquisition.
    */
   continuationCycleId?: string;
 }
@@ -484,6 +510,31 @@ export function buildVolumeMounts(
       containerPath: '/workspace/project',
       readonly: true,
     });
+    // Host log artifacts: orchestrator log + per-container streaming
+    // logs + state snapshot. Admin-tile only — these files are
+    // inherently cross-chat (every group's container output, the
+    // orchestrator's own diagnostics) and must not leak to untrusted
+    // or trusted-non-main tiles. Read-only by construction so admin
+    // can observe but not mutate the host's view of itself.
+    //
+    // ensureHostLogDirs() is best-effort and returns false on
+    // permission / disk errors. Skip the mount if the directory
+    // tree didn't materialize — better to lose host-logs visibility
+    // than to abort the container spawn entirely. The agent will
+    // see no /workspace/host-logs and fall back to chat_status for
+    // diagnosis (live data, no historical files).
+    if (ensureHostLogDirs()) {
+      mounts.push({
+        hostPath: toHostPath(hostLogsDir()),
+        containerPath: '/workspace/host-logs',
+        readonly: true,
+      });
+    } else {
+      logger.warn(
+        { group: group.name },
+        'host-logs dir bootstrap failed — admin tile will spawn without /workspace/host-logs',
+      );
+    }
     // Shadow ALL files containing secrets so agents can't read bot tokens.
     // Without this, subagents curl the Telegram API directly, bypassing MCP.
     // mount --bind inside the container doesn't work (needs CAP_SYS_ADMIN),
@@ -507,6 +558,48 @@ export function buildVolumeMounts(
     readonly: !isMain && !group.containerConfig?.trusted,
   });
 
+  // CLAUDE.md trust-tier mount. The per-group folder is no longer the
+  // source of truth for this file — it's a thin pointer (trust marker
+  // + @imports of SOUL/MEMORY/RULES/FORMATTING) that depends on the
+  // CURRENT trust flag. Mounting it from the global directory at every
+  // spawn means a trust flip is reflected on the next message without
+  // any reconciliation step (#153). Mounted readonly so the agent can't
+  // accidentally diverge it from the template; per-group memory now
+  // lives in MEMORY.md (writable for trusted/main, readonly for
+  // untrusted by virtue of the group folder mount above).
+  //
+  // For main the source IS the per-group file (`groups/main/CLAUDE.md`),
+  // so this is a no-op layer that just adds the readonly bit. For
+  // trusted/untrusted the source is the global template, which shadows
+  // any stale per-group file the migration may have left behind.
+  const claudeMdSource = isMain
+    ? path.join(groupDir, 'CLAUDE.md')
+    : group.containerConfig?.trusted
+      ? path.join(GROUPS_DIR, 'global', 'CLAUDE.md')
+      : path.join(GROUPS_DIR, 'global', 'CLAUDE-untrusted.md');
+  if (fs.existsSync(claudeMdSource)) {
+    mounts.push({
+      hostPath: toHostPath(claudeMdSource),
+      containerPath: '/workspace/group/CLAUDE.md',
+      readonly: true,
+    });
+  } else {
+    // Silent fallback would let the container resolve /workspace/group/CLAUDE.md
+    // via the underlying group-folder mount — i.e. whatever stale or customized
+    // copy may still be on disk — which is exactly the #153 drift this fix is
+    // supposed to eliminate. Log loudly so a mis-deployed install is visible
+    // instead of looking healthy until the next trust flip exposes it.
+    logger.warn(
+      {
+        claudeMdSource,
+        groupFolder: group.folder,
+        isMain,
+        trusted: !!group.containerConfig?.trusted,
+      },
+      'CLAUDE.md trust-tier source missing; /workspace/group/CLAUDE.md will fall back to whatever the group folder contains. Run `git pull` and `scripts/migrate-thin-claude-md.ts --apply`.',
+    );
+  }
+
   // Global memory directory (SOUL.md, shared CLAUDE.md).
   // Trusted + main get the full directory. Untrusted get only SOUL-untrusted.md
   // mounted as SOUL.md so core-behavior's "read SOUL.md" still works.
@@ -526,6 +619,20 @@ export function buildVolumeMounts(
       mounts.push({
         hostPath: toHostPath(untrustedSoul),
         containerPath: '/workspace/global/SOUL.md',
+        readonly: true,
+      });
+    }
+    // Untrusted CLAUDE.md @-imports /workspace/global/FORMATTING.md so the
+    // agent picks the right Slack/WA/Telegram/Discord syntax. Mount the
+    // file individually instead of the whole global dir — sharing
+    // FORMATTING.md across trust tiers is safe (it's universal channel
+    // syntax with no owner state in it) but the rest of `global/` stays
+    // off-limits per the existing untrusted boundary.
+    const untrustedFormatting = path.join(globalDir, 'FORMATTING.md');
+    if (fs.existsSync(untrustedFormatting)) {
+      mounts.push({
+        hostPath: toHostPath(untrustedFormatting),
+        containerPath: '/workspace/global/FORMATTING.md',
         readonly: true,
       });
     }
@@ -1165,6 +1272,54 @@ export function buildVolumeMounts(
       isMain,
     );
     mounts.push(...validatedMounts);
+
+    // Shadow SECRET_FILES that are reachable through an additionalMount.
+    //
+    // The main-group block above `/dev/null`-mounts each SECRET_FILES
+    // entry at `/workspace/project/<relPath>` — but that shadow only
+    // covers the canonical project mount. An additionalMount can
+    // re-expose the nanoclaw tree at a DIFFERENT container path (e.g.
+    // a group registered with `hostPath: ~/nanoclaw` lands it at
+    // `/workspace/extra/nanoclaw/`), and the `.env` at
+    // `<mount>/.env` has no shadow applied there. A trusted agent
+    // could then read the real token out of the extra mount even
+    // though `/workspace/project/.env` is `/dev/null`.
+    //
+    // For every validated additionalMount whose host path CONTAINS any
+    // SECRET_FILES entry, add a `/dev/null` bind at the corresponding
+    // container path inside the extra mount. `path.relative` returning
+    // a non-empty, non-`..`-prefixed, non-absolute string is the
+    // "inside" predicate — matches what Docker's path resolution does.
+    for (const vm of validatedMounts) {
+      for (const relPath of SECRET_FILES) {
+        // `toHostPath` is for the PATH COMPARISON only (it translates
+        // the orchestrator-local cwd into its host-side equivalent so
+        // `path.relative` compares against the host-side `vm.hostPath`
+        // that Docker will actually bind). The EXISTENCE CHECK
+        // deliberately uses the orchestrator-local path — in DooD mode
+        // the orchestrator can't stat arbitrary host paths (it only
+        // sees what's mounted into its own container), so a stat on
+        // `toHostPath(...)` would wrongly return false and skip the
+        // shadow. See `mount-security.ts` for the same "can't stat
+        // host paths from inside DooD" note.
+        const secretLocalPath = path.join(process.cwd(), relPath);
+        const secretHostPath = toHostPath(secretLocalPath);
+        const relFromMount = path.relative(vm.hostPath, secretHostPath);
+        if (
+          !relFromMount ||
+          relFromMount.startsWith('..') ||
+          path.isAbsolute(relFromMount)
+        ) {
+          continue;
+        }
+        if (!fs.existsSync(secretLocalPath)) continue;
+        mounts.push({
+          hostPath: '/dev/null',
+          containerPath: path.posix.join(vm.containerPath, relFromMount),
+          readonly: true,
+        });
+      }
+    }
   }
 
   return mounts;
@@ -1276,11 +1431,11 @@ function buildContainerArgs(
     args.push('-e', `NANOCLAW_REPLY_TO_MESSAGE_ID=${replyToMessageId}`);
   }
 
-  // Continuation marker for self-resuming cycles. Both env vars are
-  // emitted together when the scheduled-task row carried a non-NULL
-  // `continuation_cycle_id`; neither is emitted on a fresh invocation.
-  // The calling skill checks both signals (env vars + the prompt
-  // prefix it parses out of the task prompt) and fails closed to
+  // Continuation marker for self-resuming cycles (#93/#130). Both env
+  // vars are emitted together when the scheduled-task row carried a
+  // non-NULL `continuation_cycle_id`; neither is emitted on a fresh
+  // invocation. The calling skill checks both signals (env vars + the
+  // prompt prefix it parses out of the task prompt) and fails closed to
   // "fresh invocation" if they disagree, so the env presence is
   // load-bearing — never paper over a missing value with a default.
   if (continuationCycleId) {
@@ -1417,6 +1572,105 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  // Per-spawn streaming log under host-logs/. Distinct from the
+  // post-exit summary written at `logsDir` below — the streaming file
+  // captures output line-by-line as the container produces it, so the
+  // admin tile can read what a stuck container is actually doing
+  // without waiting for it to exit. Failure to open the stream is
+  // non-fatal: the container still runs, we just lose the host-logs
+  // copy for this spawn (the in-memory buffers + post-exit summary
+  // remain unaffected).
+  const spawnStartedAt = new Date();
+  // `input.sessionName` is optional on the type but is always set by
+  // every caller that actually invokes runContainerAgent (default or
+  // maintenance). Fall back to the canonical default to keep the file
+  // path deterministic if a future caller forgets to stamp the field.
+  const streamSessionName = input.sessionName || DEFAULT_SESSION_NAME;
+  const streamLogPath = containerLogPath(
+    group.folder,
+    streamSessionName,
+    spawnStartedAt,
+  );
+  let streamLog: fs.WriteStream | null = null;
+  try {
+    fs.mkdirSync(path.dirname(streamLogPath), { recursive: true });
+    streamLog = fs.createWriteStream(streamLogPath, { flags: 'a' });
+    // Attach an error listener BEFORE the first write. Stream errors
+    // emit async (e.g. ENOENT if the parent dir is wiped between
+    // mkdir and create, EBADF if the fd is reaped) — without a
+    // listener, Node's default handler is "throw uncaught exception"
+    // which would crash the orchestrator on a logging path. This must
+    // never happen: lose the streamed log, keep serving the user.
+    streamLog.on('error', (err) => {
+      logger.warn(
+        { err, group: group.name, streamLogPath },
+        'host-logs stream errored mid-spawn; dropping per-spawn stream',
+      );
+      // Null the local ref so subsequent writes from the data
+      // listeners no-op rather than try to push into a broken stream.
+      streamLog = null;
+    });
+    streamLog.write(
+      [
+        `=== Container Stream Log ===`,
+        `Group: ${group.name}`,
+        `Folder: ${group.folder}`,
+        `Session: ${streamSessionName}`,
+        `Container: ${containerName}`,
+        `Start: ${spawnStartedAt.toISOString()}`,
+        `=== STDOUT/STDERR (line-prefixed) ===`,
+        ``,
+      ].join('\n'),
+    );
+  } catch (err) {
+    logger.warn(
+      { err, group: group.name, streamLogPath },
+      'host-logs stream open failed; container will run without per-spawn stream',
+    );
+    streamLog = null;
+  }
+
+  // Buffered line writer per stream. Container output isn't line-
+  // aligned (a single `data` event can split a line, or contain many),
+  // so we buffer until we see `\n` and emit `[OUT] ` / `[ERR] ` per
+  // complete line. Trailing partial line is flushed on container exit.
+  //
+  // The buffer is bounded: a misbehaving container that emits megabytes
+  // without a newline (e.g. binary garbage, a long single-line log
+  // dump) would otherwise grow the orchestrator's heap unboundedly.
+  // Cap at 64 KB per stream — well above typical line lengths but
+  // small enough that even pathological output flushes quickly.
+  const LINE_BUFFER_MAX = 64 * 1024;
+  const makeLinePrefixer = (prefix: string) => {
+    let buffer = '';
+    const writeLines = (chunk: string) => {
+      if (!streamLog) return;
+      buffer += chunk;
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        streamLog.write(`${prefix} ${stripAnsi(line)}\n`);
+      }
+      // Cap the buffer: if no newline appeared and the buffer crossed
+      // the limit, flush the entire current buffer as a synthetic
+      // line. Tagged with `[…cap…]` so a reader knows the line was
+      // not delimited by a real newline (might cut mid-token).
+      if (buffer.length > LINE_BUFFER_MAX) {
+        streamLog.write(`${prefix} […cap…] ${stripAnsi(buffer)}\n`);
+        buffer = '';
+      }
+    };
+    const flush = () => {
+      if (!streamLog || buffer.length === 0) return;
+      streamLog.write(`${prefix} ${stripAnsi(buffer)}\n`);
+      buffer = '';
+    };
+    return { writeLines, flush };
+  };
+  const stdoutPrefixer = makeLinePrefixer('[OUT]');
+  const stderrPrefixer = makeLinePrefixer('[ERR]');
+
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1439,6 +1693,10 @@ export async function runContainerAgent(
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
+
+      // Streaming host-logs copy. Best-effort — write errors don't
+      // affect the buffer accumulation or marker parsing below.
+      stdoutPrefixer.writeLines(chunk);
 
       // Always accumulate for logging
       if (!stdoutTruncated) {
@@ -1491,6 +1749,7 @@ export async function runContainerAgent(
 
     container.stderr.on('data', (data) => {
       const chunk = data.toString();
+      stderrPrefixer.writeLines(chunk);
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
@@ -1558,6 +1817,22 @@ export async function runContainerAgent(
       // calls it too in case `close` is skipped (spawn ENOENT etc).
       cleanupSecretEnvFile();
       const duration = Date.now() - startTime;
+
+      // Flush any partial trailing line and close the streaming log.
+      // Failure to close cleanly is non-fatal — Node will GC the fd
+      // eventually; the streamed bytes already on disk are intact.
+      stdoutPrefixer.flush();
+      stderrPrefixer.flush();
+      if (streamLog) {
+        try {
+          streamLog.write(
+            `\n=== Container Exited ===\nCode: ${code}\nDuration: ${duration}ms\nEnd: ${new Date().toISOString()}\n`,
+          );
+          streamLog.end();
+        } catch {
+          // Stream already errored / closed — nothing useful to do.
+        }
+      }
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1771,6 +2046,25 @@ export async function runContainerAgent(
         { group: group.name, containerName, error: err },
         'Container spawn error',
       );
+      // Spawn-error path: the close handler may not fire on some
+      // failure modes (e.g. spawn ENOENT — the binary doesn't exist),
+      // so flush + close the streaming log here too. Without this the
+      // file descriptor leaks until process GC and the file is left
+      // open with no exit footer, which makes the on-disk record
+      // ambiguous (was the container still running, or did it die
+      // before producing any output?).
+      stdoutPrefixer.flush();
+      stderrPrefixer.flush();
+      if (streamLog) {
+        try {
+          streamLog.write(
+            `\n=== Container Spawn Failed ===\nError: ${err.message}\nEnd: ${new Date().toISOString()}\n`,
+          );
+          streamLog.end();
+        } catch {
+          // Stream already errored / closed — nothing to recover.
+        }
+      }
       resolve({
         status: 'error',
         result: null,

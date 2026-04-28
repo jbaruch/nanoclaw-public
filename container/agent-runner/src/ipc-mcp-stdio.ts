@@ -31,18 +31,29 @@ function writeIpcFile(dir: string, data: object): string {
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const filepath = path.join(dir, filename);
 
-  // Stamp `sessionName` onto every request written to TASKS_DIR so the host
-  // responder routes `_script_result_*` replies back into THIS session's
-  // `input-<session>/` dir (which is what's bind-mounted at
-  // `/workspace/ipc/input/` for this container). Non-TASKS writers
-  // (e.g. MESSAGES_DIR) keep their payload as-is.
+  // Stamp `sessionName` onto EVERY IPC file the container emits (TASKS
+  // and MESSAGES alike). Two consumers need it:
+  //   - TASKS: the host responder routes `_script_result_*` replies
+  //     back into THIS session's `input-<session>/` dir (which is
+  //     what's bind-mounted at `/workspace/ipc/input/` for this
+  //     container). Without the stamp, replies go to the default
+  //     session's dir and this container polls forever.
+  //   - MESSAGES: the host's outbound-message handler uses it to
+  //     distinguish default-session (user-facing) messages from
+  //     maintenance-session (scheduled-task) messages so the human
+  //     knows which Andy persona is talking — e.g. prefixing the
+  //     rendered text with `[M]` for maintenance. The `messages/`
+  //     bind mount is shared across sessions within a group (see the
+  //     mount setup in the orchestrator's container-runner), so the
+  //     payload is the only place the session info can survive the
+  //     IPC hop.
   //
   // Spread order: `sessionName` goes AFTER `...data` so the env-derived
   // value always wins over any caller-provided field. Without this, a
   // caller that passes `sessionName` in `data` — even by accident —
-  // could redirect the host's reply to a different session's input dir.
-  const payload =
-    dir === TASKS_DIR ? { ...(data as object), sessionName } : data;
+  // could lie about its session and either hijack another session's
+  // responses or dodge the maintenance-prefix tagging.
+  const payload = { ...(data as object), sessionName };
 
   // Atomic write: temp file then rename
   const tempPath = `${filepath}.tmp`;
@@ -62,8 +73,10 @@ async function runHostOperation(
   timeoutMs = 180_000,
 ): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  // `sessionName` is stamped by `writeIpcFile` when dir === TASKS_DIR,
-  // so we don't need to include it in every caller's payload.
+  // `sessionName` is stamped by `writeIpcFile` on every IPC payload
+  // (both TASKS_DIR and MESSAGES_DIR), so we don't need to include it
+  // in every caller's payload — and shouldn't, since the env-derived
+  // stamp wins over caller-provided values by design.
   writeIpcFile(TASKS_DIR, {
     type,
     groupFolder,
@@ -208,10 +221,10 @@ MESSAGING BEHAVIOR - The task agent's output is sent to the user or group. It ca
 \u2022 Only send a message when there's something to report (e.g., "notify me if...")
 \u2022 Never send a message (background maintenance tasks)
 
-SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
-\u2022 cron: Standard cron expression (e.g., "*/5 * * * *" for every 5 minutes, "0 9 * * *" for daily at 9am LOCAL time)
+SCHEDULE VALUE FORMAT:
+\u2022 cron: Standard cron expression (e.g., "*/5 * * * *" for every 5 minutes, "0 9 * * *"). By default evaluated in the server's local timezone. Pass an explicit \`timezone\` (IANA name like "UTC" or "America/Chicago") for tz-stable cron schedules \u2014 recommended for anything you want to fire at a specific UTC moment regardless of where the server is.
 \u2022 interval: Milliseconds between runs (e.g., "300000" for 5 minutes, "3600000" for 1 hour)
-\u2022 once: Local time WITHOUT "Z" suffix (e.g., "2026-02-01T15:30:00"). Do NOT use UTC/Z suffix.`,
+\u2022 once: UTC ISO-8601 with "Z" suffix (e.g., "2026-02-01T15:30:00Z") \u2014 RECOMMENDED. The task fires at exactly that UTC moment regardless of server timezone changes. Local strings without a suffix (e.g., "2026-02-01T15:30:00") still work and are pinned to the absolute instant they resolve to in the server's CURRENT tz at SCHEDULE time \u2014 but if you compose them by converting from a UTC anchor in your head, a tz change between when you schedule and when you compose the next one will silently shift those next ones, since you'll be doing the UTC\u2192local math against the wrong tz. UTC strings remove that whole class of bug.`,
   {
     prompt: z
       .string()
@@ -226,7 +239,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     schedule_value: z
       .string()
       .describe(
-        'cron: "*/5 * * * *" | interval: milliseconds like "300000" | once: local timestamp like "2026-02-01T15:30:00" (no Z suffix!)',
+        'cron: "*/5 * * * *" | interval: milliseconds like "300000" | once: UTC ISO-8601 like "2026-02-01T15:30:00Z" (recommended) or local-time without suffix (deprecated)',
+      ),
+    timezone: z
+      .string()
+      .optional()
+      .describe(
+        'IANA timezone for cron expressions (e.g., "UTC", "America/Chicago"). Defaults to server local timezone. Has no effect on interval or once. Recommended: pass "UTC" for cron schedules anchored to absolute time.',
       ),
     context_mode: z
       .enum(['group', 'isolated'])
@@ -252,7 +271,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     if (args.schedule_type === 'cron') {
       try {
         CronExpressionParser.parse(args.schedule_value);
-      } catch {
+      } catch (err) {
+        // CronExpressionParser only throws Error instances on invalid
+        // syntax. Anything non-Error here is an upstream bug; let it
+        // propagate per `jbaruch/coding-policy: error-handling`.
+        if (!(err instanceof Error)) throw err;
         return {
           content: [
             {
@@ -277,27 +300,55 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         };
       }
     } else if (args.schedule_type === 'once') {
-      if (
-        /[Zz]$/.test(args.schedule_value) ||
-        /[+-]\d{2}:\d{2}$/.test(args.schedule_value)
-      ) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Timestamp must be local time without timezone suffix. Got "${args.schedule_value}" — use format like "2026-02-01T15:30:00".`,
-            },
-          ],
-          isError: true,
-        };
-      }
+      // #102: UTC `Z`-suffixed strings are now the RECOMMENDED form
+      // (they're tz-stable across server tz changes). Local-time strings
+      // without a suffix still work — the host pins them to an absolute
+      // UTC instant at SCHEDULE time via `new Date(s).toISOString()`,
+      // and `next_run` is then a fixed instant the scheduler fires on
+      // regardless of any later tz change. The class of bug UTC
+      // strings sidestep is at *compose* time: when an agent
+      // mentally converts a UTC anchor to local against the server's
+      // CURRENT tz to build the string, a tz change between when the
+      // string is composed and when the next one is composed silently
+      // shifts each subsequent task. UTC strings remove that math.
       const date = new Date(args.schedule_value);
       if (isNaN(date.getTime())) {
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Invalid timestamp: "${args.schedule_value}". Use local time format like "2026-02-01T15:30:00".`,
+              text: `Invalid timestamp: "${args.schedule_value}". Recommended format: UTC ISO-8601 like "2026-02-01T15:30:00Z".`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    // #102: validate optional IANA timezone for cron. Only validate
+    // when it'd actually be used (cron) — host already drops it for
+    // non-cron, and rejecting on a non-cron schedule for a typo'd
+    // tz that has no effect would be unhelpful pedantry.
+    // Skip empty-string tz: the host treats it as "no tz provided"
+    // and falls back to TIMEZONE, so failing the call here would be
+    // stricter than the host accepts.
+    if (
+      args.timezone !== undefined &&
+      args.timezone !== '' &&
+      args.schedule_type === 'cron'
+    ) {
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: args.timezone });
+      } catch (err) {
+        // `Intl.DateTimeFormat` throws RangeError on unknown IANA tz.
+        // Anything non-Error is a host bug; propagate per
+        // `jbaruch/coding-policy: error-handling`.
+        if (!(err instanceof Error)) throw err;
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Invalid IANA timezone: "${args.timezone}". Use names like "UTC", "America/Chicago", "Europe/Berlin".`,
             },
           ],
           isError: true,
@@ -311,7 +362,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
 
     const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const data = {
+    const data: Record<string, unknown> = {
       type: 'schedule_task',
       taskId,
       prompt: args.prompt,
@@ -323,6 +374,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       createdBy: groupFolder,
       timestamp: new Date().toISOString(),
     };
+    // Only forward `timezone` for cron tasks. The host already drops
+    // it for non-cron schedule types, but pruning at the source keeps
+    // the IPC payload semantically clean and avoids the "stray field"
+    // confusion Copilot flagged on review.
+    if (args.timezone !== undefined && args.schedule_type === 'cron') {
+      data.timezone = args.timezone;
+    }
 
     writeIpcFile(TASKS_DIR, data);
 
@@ -493,6 +551,12 @@ server.tool(
       .string()
       .optional()
       .describe('New schedule value (see schedule_task for format)'),
+    timezone: z
+      .string()
+      .optional()
+      .describe(
+        'New IANA timezone for cron (e.g., "UTC", "America/Chicago"). Empty string clears it (back to server default). See #102.',
+      ),
     script: z
       .string()
       .optional()
@@ -501,25 +565,31 @@ server.tool(
       ),
   },
   async (args) => {
-    // Validate schedule_value if provided
-    if (
-      args.schedule_type === 'cron' ||
-      (!args.schedule_type && args.schedule_value)
-    ) {
-      if (args.schedule_value) {
-        try {
-          CronExpressionParser.parse(args.schedule_value);
-        } catch {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `Invalid cron: "${args.schedule_value}".`,
-              },
-            ],
-            isError: true,
-          };
-        }
+    // Validate schedule_value when provided, but ONLY against the
+    // explicitly-asserted schedule_type. The previous gate also tried
+    // cron-validating any update with a schedule_value but no type —
+    // which incorrectly rejected valid once-timestamps and interval
+    // millisecond strings during partial updates that left the type
+    // unchanged. The host re-validates against the post-update type
+    // anyway, so the agent-side check should be conservative: only
+    // catch the cases where the caller explicitly said "this is a
+    // cron" or "this is an interval".
+    if (args.schedule_type === 'cron' && args.schedule_value) {
+      try {
+        CronExpressionParser.parse(args.schedule_value);
+      } catch (err) {
+        // See schedule_task above — same Error-or-rethrow pattern per
+        // `jbaruch/coding-policy: error-handling`.
+        if (!(err instanceof Error)) throw err;
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Invalid cron: "${args.schedule_value}".`,
+            },
+          ],
+          isError: true,
+        };
       }
     }
     if (args.schedule_type === 'interval' && args.schedule_value) {
@@ -530,6 +600,36 @@ server.tool(
             {
               type: 'text' as const,
               text: `Invalid interval: "${args.schedule_value}".`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+    // Validate any non-empty timezone unless the caller is EXPLICITLY
+    // changing schedule_type to once/interval (where tz is documented
+    // to have no effect — the host drops it). This catches the common
+    // case of a partial update that touches an existing cron task's
+    // tz without re-stating schedule_type. Empty string is the
+    // documented "clear back to TIMEZONE default" signal and skips
+    // validation by design.
+    if (
+      args.timezone !== undefined &&
+      args.timezone !== '' &&
+      args.schedule_type !== 'once' &&
+      args.schedule_type !== 'interval'
+    ) {
+      try {
+        Intl.DateTimeFormat(undefined, { timeZone: args.timezone });
+      } catch (err) {
+        // See schedule_task above — same Error-or-rethrow pattern per
+        // `jbaruch/coding-policy: error-handling`.
+        if (!(err instanceof Error)) throw err;
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Invalid IANA timezone: "${args.timezone}".`,
             },
           ],
           isError: true,
@@ -550,6 +650,7 @@ server.tool(
       data.schedule_type = args.schedule_type;
     if (args.schedule_value !== undefined)
       data.schedule_value = args.schedule_value;
+    if (args.timezone !== undefined) data.timezone = args.timezone;
 
     writeIpcFile(TASKS_DIR, data);
 
@@ -572,16 +673,24 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   {
     jid: z
       .string()
+      .trim()
+      .min(1)
       .describe(
-        'The chat JID (e.g., "120363336345536173@g.us", "tg:-1001234567890", "dc:1234567890123456")',
+        'The chat JID (e.g., "120363336345536173@g.us", "tg:-1001234567890", "dc:1234567890123456"). Whitespace-only rejected.',
       ),
-    name: z.string().describe('Display name for the group'),
+    name: z.string().trim().min(1).describe('Display name for the group'),
     folder: z
       .string()
+      .trim()
+      .min(1)
       .describe(
         'Channel-prefixed folder name (e.g., "whatsapp_family-chat", "telegram_dev-team")',
       ),
-    trigger: z.string().describe('Trigger word (e.g., "@Andy")'),
+    trigger: z
+      .string()
+      .trim()
+      .min(1)
+      .describe('Trigger word (e.g., "@Andy"). Whitespace-only rejected.'),
     requiresTrigger: z
       .boolean()
       .optional()
@@ -589,6 +698,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
         'Whether messages must start with the trigger word. Default: false (respond to all messages). Set to true for busy groups with many participants where you only want the agent to respond when explicitly mentioned.',
       ),
     trusted: z.boolean().optional().describe('Whether the group gets a trusted container (read-write filesystem, admin tiles, longer timeout). Default: false. Set true for personal/friends groups.'),
+    enableHeartbeat: z.boolean().optional().describe('Opt this non-main group into the 15-min unanswered-message heartbeat. Default: false. Pre-#158 this was implicit on requiresTrigger; now explicit.'),
     additionalMounts: z.array(z.object({
       hostPath: z.string().describe('Path on the host (supports "~" expansion; does not need to be absolute).'),
       containerPath: z.string().optional().describe('Optional mount name inside /workspace/extra/. When omitted, the host derives it from basename(hostPath).'),
@@ -608,9 +718,10 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       };
     }
 
-    const containerConfig = (args.trusted !== undefined || args.additionalMounts)
+    const containerConfig = (args.trusted !== undefined || args.enableHeartbeat !== undefined || args.additionalMounts)
       ? {
           ...(args.trusted !== undefined ? { trusted: args.trusted } : {}),
+          ...(args.enableHeartbeat !== undefined ? { enableHeartbeat: args.enableHeartbeat } : {}),
           ...(args.additionalMounts ? { additionalMounts: args.additionalMounts } : {}),
         }
       : undefined;
@@ -640,8 +751,188 @@ Use available_groups.json to find the JID for a group. The folder name must be c
 );
 
 server.tool(
+  'unregister_group',
+  `Remove a chat/group from the registry so the agent stops responding there. Main group only.
+
+Inverse of \`register_group\` (#159). Removes both the SQLite \`registered_groups\` row AND the JID's authoritative entry in \`available_groups.json\` in one call. The on-disk \`groups/<folder>/\` directory (CLAUDE.md, MEMORY.md, scheduled-task workspace) is left intact — operators delete that manually if/when they want a clean slate.
+
+Refuses to unregister the main group itself (losing the main registration mid-runtime would leave the orchestrator without an IPC path to recreate it). No-op when the JID isn't registered.`,
+  {
+    jid: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        'The chat JID of the registered group to remove (e.g., "tg:1698969", "120363336345536173@g.us"). Whitespace-only rejected.',
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Only the main group can unregister groups.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'unregister_group',
+      jid: args.jid,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Unregister requested for ${args.jid}. (No-op if the JID wasn't registered. The on-disk groups/<folder>/ directory is preserved — delete manually if no longer needed.)`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  'set_trusted',
+  `Flip a registered group's \`trusted\` flag without re-stating its other parameters. Main group only.
+
+Use this when promoting a chat to trusted (read-write filesystem, admin tiles, longer timeout) or demoting it back. Does NOT register a new group — call \`register_group\` first if the JID isn't already registered. The trigger word, folder, and additionalMounts are preserved.`,
+  {
+    jid: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        'The chat JID of an already-registered group (e.g., "tg:-1001234567890"). Whitespace-only rejected.',
+      ),
+    trusted: z
+      .boolean()
+      .describe(
+        'true = trusted container (RW filesystem, admin tiles); false = untrusted container',
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Only the main group can change trust state.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'set_trusted',
+      // `args.jid` is already trimmed by the Zod schema's `.trim()`
+      // transform — pass through verbatim.
+      jid: args.jid,
+      trusted: args.trusted,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          // "requested" rather than "set": the host receives the IPC
+          // file and applies it asynchronously, and may no-op if the
+          // JID isn't registered. We can't confirm the actual write
+          // from this side without a synchronous round-trip.
+          text: `Trust update requested for ${args.jid} → ${args.trusted}. (No-op if the JID isn't registered — call register_group first.)`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  'set_trigger',
+  `Change a registered group's trigger word (and optionally requiresTrigger) without re-stating its other parameters. Main group only.
+
+Use this when renaming the assistant in a chat or switching between always-respond and trigger-only modes. Does NOT register a new group — call \`register_group\` first if the JID isn't already registered.`,
+  {
+    jid: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        'The chat JID of an already-registered group. Whitespace-only rejected.',
+      ),
+    // `.trim()` + `.min(1)` rejects empty/whitespace-only triggers.
+    // Why: `getTriggerPattern('')` trims and falls back to
+    // `DEFAULT_TRIGGER`, so a caller setting a custom trigger to an
+    // empty string would silently get the assistant's default trigger
+    // word back — not what they asked for. Trim also normalizes
+    // surrounding whitespace so `' @Andy '` doesn't store as such.
+    trigger: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        'New non-empty trigger word (e.g., "@Andy"). Replaces the existing trigger. Surrounding whitespace is trimmed.',
+      ),
+    requiresTrigger: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether messages must start with the trigger word. Omit to leave unchanged.',
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Only the main group can change trigger config.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const data: Record<string, unknown> = {
+      type: 'set_trigger',
+      jid: args.jid,
+      trigger: args.trigger,
+      timestamp: new Date().toISOString(),
+    };
+    if (args.requiresTrigger !== undefined) {
+      data.requiresTrigger = args.requiresTrigger;
+    }
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          // "requested" rather than "set": host applies asynchronously and
+          // may no-op if the JID isn't registered.
+          text:
+            args.requiresTrigger === undefined
+              ? `Trigger update requested for ${args.jid} → "${args.trigger}". (No-op if the JID isn't registered — call register_group first.)`
+              : `Trigger update requested for ${args.jid} → "${args.trigger}" (requiresTrigger=${args.requiresTrigger}). (No-op if the JID isn't registered — call register_group first.)`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
   'nuke_session',
-  "Kill this group's container(s) and start fresh on the next message/scheduled tick. Use when context is corrupted, rules are stale, or user asks to start fresh. Parallel-maintenance groups run two containers per group (user-facing `default` + scheduled-task `maintenance`) — pass `session` to narrow the nuke: 'default' keeps maintenance running, 'maintenance' keeps user-facing running, 'all' (default) kills both. Omit `session` for pre-parallel behaviour.",
+  "Destructive: kill this group's container(s), drop the session DB row(s), AND delete the on-disk JSONL transcript for the targeted slot(s). Next message/scheduled tick starts a TRULY fresh session — no resumed transcript. Use when context is corrupted, rules are stale, poison reached the model, or user asks to start fresh. Parallel-maintenance groups run two containers per group (user-facing `default` + scheduled-task `maintenance`) — pass `session` to narrow the nuke: 'default' keeps maintenance running, 'maintenance' keeps user-facing running, 'all' (default) wipes both. Cannot be undone — the JSONL is gone after this.",
   {
     session: z
       .enum(['default', 'maintenance', 'all'])
@@ -735,11 +1026,24 @@ server.tool(
   },
 );
 
+// Five tile repos the promote flow is wired against. Host-side
+// `KNOWN_TILE_NAMES` in src/ipc.ts enforces this as the real security
+// boundary; keeping the same list as a zod enum here gives callers a
+// clear client-side error (at tool-call time) instead of a generic
+// "host operation failed" after round-tripping to the orchestrator.
+const TILE_NAMES = [
+  'nanoclaw-admin',
+  'nanoclaw-core',
+  'nanoclaw-untrusted',
+  'nanoclaw-trusted',
+  'nanoclaw-host',
+] as const;
+
 server.tool(
   'promote_staging',
-  'Promote staged skills and rules to tessl tiles. Runs the full pipeline: copy from staging, lint, git commit+push, publish to registry, install. Main group only.',
+  'Promote staged skills and rules to a tile repo. Copies staging into a fresh clone, runs a read-only `tessl skill review` pass on each promoted skill when `tessl` is on PATH (reports score; never mutates content; skipped with a warning when unavailable — Copilot + the post-merge GHA review still gate the PR), pushes a timestamped `promote/<utc>-<tile>-<rand>` branch, opens a PR on the tile repo, and summons Copilot review via GraphQL. Does NOT merge, push to main, or publish to the registry — merge is manual (or via Composio), publish fires in GHA at merge time, and the agent calls `tessl_update` afterwards to pull the new version. Main group only.',
   {
-    tileName: z.string().describe('Target tile: "nanoclaw-admin", "nanoclaw-core", or "nanoclaw-untrusted"'),
+    tileName: z.enum(TILE_NAMES).describe('Target tile repo.'),
     skillName: z.string().optional().describe('Specific skill to promote. Omit for all staging items. Use "--rules-only" to promote only rules.'),
   },
   async (args) => {
@@ -750,45 +1054,216 @@ server.tool(
       };
     }
 
-    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const data = {
-      type: 'promote_staging',
-      groupFolder,
-      tileName: args.tileName,
-      skillName: args.skillName || 'all',
-      requestId,
-      timestamp: new Date().toISOString(),
-    };
+    // 15 minutes matches the host-side execFile cap in src/ipc.ts. The
+    // previous hand-rolled 5-minute poll would time out and report
+    // failure while the host script was still running (observed on
+    // bulk promotes with 10+ skills hitting the tessl review loop at
+    // ~1 min/skill). Delegate poll plumbing to runHostOperation so
+    // this tool inherits future tweaks to result-file handling etc.
+    return runHostOperation(
+      'promote_staging',
+      {
+        tileName: args.tileName,
+        skillName: args.skillName || 'all',
+      },
+      900_000,
+    );
+  },
+);
 
-    writeIpcFile(TASKS_DIR, data);
+server.tool(
+  'push_staged_to_branch',
+  `Push fixups from this group's staging directory to an existing tile-repo PR branch. Use after a promote PR gets review comments: fix the skill back in staging, then call this with the branch name that promote_staging printed ("Branch: promote/...-<tile>"). No new PR is opened — the existing PR auto-updates. Main group only.
 
-    // Poll for result (promotion can take a while — tessl publish, git push)
-    const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
-    const timeoutMs = 300_000;
-    const pollMs = 1000;
-    const start = Date.now();
-
-    while (Date.now() - start < timeoutMs) {
-      if (fs.existsSync(resultPath)) {
-        const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
-        fs.unlinkSync(resultPath);
-        if (result.error) {
-          return {
-            content: [{ type: 'text' as const, text: `Promotion failed: ${result.error}` }],
-            isError: true,
-          };
-        }
-        return {
-          content: [{ type: 'text' as const, text: result.stdout || 'Promotion complete.' }],
-        };
-      }
-      await new Promise(r => setTimeout(r, pollMs));
+skillName options:
+- omit → push everything currently in staging
+- specific skill (e.g. "tessl__check-unanswered") → push only that skill
+- "--rules-only" → push only rules`,
+  {
+    tileName: z
+      .enum(TILE_NAMES)
+      .describe('Target tile repo (same one the PR is against).'),
+    branch: z
+      .string()
+      .min(1)
+      .describe(
+        'Existing PR branch, e.g. "promote/20260418T224156Z-nanoclaw-core-a3b2". Parse it from the `Branch: ...` line in promote_staging output.',
+      ),
+    commitMessage: z
+      .string()
+      .min(1)
+      .describe(
+        'Short commit message describing the fixup (e.g. "fix: address Copilot comment on unanswered-precheck.py").',
+      ),
+    skillName: z
+      .string()
+      .optional()
+      .describe(
+        'Specific skill to push. Omit for all staging items. Use "--rules-only" to push only rules.',
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          { type: 'text' as const, text: 'Only the main group can push to tile branches.' },
+        ],
+        isError: true,
+      };
     }
 
-    return {
-      content: [{ type: 'text' as const, text: 'Promotion timed out after 5 minutes.' }],
-      isError: true,
-    };
+    // Reuse runHostOperation for the write-IPC + poll-for-result
+    // plumbing. Keeps timeout/poll cadence/result-file cleanup
+    // consistent across all host-operation MCP tools (sync_tripit,
+    // tessl_update, push_staged_to_branch, etc.), so a future change
+    // to (say) how result files are formatted doesn't require
+    // updating each tool's poll loop.
+    return runHostOperation(
+      'push_staged_to_branch',
+      {
+        tileName: args.tileName,
+        branch: args.branch,
+        commitMessage: args.commitMessage,
+        skillName: args.skillName || 'all',
+      },
+      300_000,
+    );
+  },
+);
+
+server.tool(
+  'chat_status',
+  'Report host-side state for one or all registered chats: which tile owns each chat (admin/trusted/untrusted), trigger config, container status (running/idle/cooling-down/crashed/not-spawned) per session slot (default + maintenance), and the latest is_from_me=1 message recorded for the chat. Use this to diagnose silent containers — when a chat went quiet you can see whether the container is running, cooling down after an error, or never spawned. Provide chat_id (JID) OR chat_name (display name) to filter to one chat; omit both for all chats. Main group only.',
+  {
+    chat_id: z
+      .string()
+      .optional()
+      .describe(
+        'Specific chat JID, e.g. tg:-1003869886477. Mutually exclusive with chat_name.',
+      ),
+    chat_name: z
+      .string()
+      .optional()
+      .describe(
+        'Chat display name (looked up against the registered groups list). Errors if ambiguous; pass chat_id instead in that case.',
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'chat_status is admin-tile only.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    // chat_id and chat_name are mutually exclusive — passing both
+    // means two identifiers that might disagree, and silently
+    // prioritizing one over the other is unsafe targeting. Reject
+    // here so the agent gets a clear schema error rather than a
+    // surprise from the host handler. The host enforces the same
+    // rule as defense in depth (in case a future client bypasses
+    // the MCP layer).
+    if (args.chat_id && args.chat_name) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Provide chat_id OR chat_name, not both.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    return runHostOperation('chat_status', {
+      chat_id: args.chat_id,
+      chat_name: args.chat_name,
+    });
+  },
+);
+
+server.tool(
+  'nuke_chat',
+  "Forcibly nuke another chat's session(s) cross-chat — wipes JSONL transcripts, kills the container, and clears DB session rows. Use when a foreign chat's container is hung, in a corrupted state, or stuck on a poisoned plan and the only way back is a clean restart. Requires chat_id OR chat_name (admin always operates cross-chat — to nuke your own chat use nuke_session). Main group only.",
+  {
+    chat_id: z
+      .string()
+      .optional()
+      .describe('Specific chat JID, e.g. tg:-1003869886477.'),
+    chat_name: z
+      .string()
+      .optional()
+      .describe(
+        'Chat display name. Errors if ambiguous; pass chat_id instead in that case.',
+      ),
+    session: z
+      .enum(['default', 'maintenance', 'all'])
+      .optional()
+      .describe(
+        "Which session slot(s) to wipe. 'default' is the user-facing container, 'maintenance' is the scheduled-task container, 'all' (the default) does both.",
+      ),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'nuke_chat is admin-tile only.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    if (!args.chat_id && !args.chat_name) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'nuke_chat requires chat_id or chat_name — admin always operates cross-chat. Use nuke_session to wipe the current chat.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    // Two identifiers are an unsafe-targeting smell — see the same
+    // rule on chat_status above. Reject before the IPC round-trip.
+    if (args.chat_id && args.chat_name) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Provide chat_id OR chat_name, not both.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    return runHostOperation('nuke_chat', {
+      chat_id: args.chat_id,
+      chat_name: args.chat_name,
+      session: args.session,
+    });
+  },
+);
+
+server.tool(
+  'tessl_update',
+  'Run `tessl update` on the host to pull the latest tile versions from the registry. Call this after a promote PR merges (GHA publishes on merge, then the agent triggers this to get the new version). If new tiles land, sessions are cleared automatically so the next message picks them up. A periodic 15-min catch-up runs in the orchestrator as a safety net. Main group only.',
+  {},
+  async () => {
+    if (!isMain) {
+      return {
+        content: [
+          { type: 'text' as const, text: 'Only the main group can trigger tessl_update.' },
+        ],
+        isError: true,
+      };
+    }
+    return runHostOperation('tessl_update');
   },
 );
 

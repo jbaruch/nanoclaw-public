@@ -33,6 +33,8 @@ cd "$PRIVATE_DIR"
 EXCLUDES=(
   # Secrets / private integrations
   --exclude='.env'
+  --exclude='scripts/heartbeat-external.conf'
+  --exclude='scripts/heartbeat-external.state'
   --exclude='scripts/trakt-auth.py'
   --exclude='scripts/audible-backup.sh'
   --exclude='src/hubitat-listener.ts'
@@ -396,6 +398,20 @@ PY
 
 echo ""
 
+# --- Normalize formatting -----------------------------------------------------
+# The structural scrubs above (Hubitat removal in steps 3 + 4, etc.) splice out
+# code blocks but leave their surrounding blank lines, producing `\n\n\n` runs
+# that fail public CI's `prettier --check "src/**/*.ts"`. Run prettier --write
+# from private's pinned binary so the synced tree is already formatted; the
+# leak verifier below is regex-based and formatter-agnostic.
+echo "Normalizing formatting..."
+(
+  cd "$PUBLIC_DIR"
+  "$PRIVATE_DIR/node_modules/.bin/prettier" --write 'src/**/*.ts' >/dev/null
+)
+echo "  prettier: formatted src/**/*.ts"
+echo ""
+
 # --- Leak-prevention allowlist check -----------------------------------------
 # Enumerate every IPC handler / MCP tool in the scrubbed public tree and
 # compare against an explicit allowlist. Anything unknown aborts the sync
@@ -406,29 +422,43 @@ echo ""
 # corresponding allowlist below.
 APPROVED_PUBLIC_IPC_HANDLERS=(
   'cancel_task'
+  'chat_status'
   'github_backup'
+  'nuke_chat'
   'nuke_session'
   'pause_task'
   'promote_staging'
+  'push_staged_to_branch'
   'refresh_groups'
   'register_group'
   'resume_task'
   'schedule_task'
+  'set_trigger'
+  'set_trusted'
+  'tessl_update'
+  'unregister_group'
   'update_task'
 )
 APPROVED_PUBLIC_MCP_TOOLS=(
   'cancel_task'
+  'chat_status'
   'github_backup'
   'list_tasks'
+  'nuke_chat'
   'nuke_session'
   'pause_task'
   'promote_staging'
+  'push_staged_to_branch'
   'react_to_message'
   'register_group'
   'resume_task'
   'schedule_task'
   'send_file'
   'send_message'
+  'set_trigger'
+  'set_trusted'
+  'tessl_update'
+  'unregister_group'
   'update_task'
 )
 

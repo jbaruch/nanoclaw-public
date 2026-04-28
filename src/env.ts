@@ -1,6 +1,20 @@
 import fs from 'fs';
 import path from 'path';
-import { logger } from './logger.js';
+
+// env.ts deliberately does NOT import the logger. Doing so creates an
+// import cycle:
+//   config.ts → env.ts → logger.ts → host-logs.ts → config.ts
+// Under vitest's parallel-worker isolation that cycle resolves to a
+// partially-initialized `logger` (TypeError: Cannot read properties
+// of undefined (reading 'debug') the first time `readEnvFile` is
+// called from inside the cycle). We use process.stderr directly for
+// the single debug-level message env.ts emits — the timestamp/format
+// logger normally adds isn't load-bearing for a missing-.env note,
+// and the explicit prefix below makes it clear where the line came
+// from when reading raw stderr.
+const ENV_DEBUG_ENABLED =
+  (process.env.LOG_LEVEL || 'info') === 'debug' ||
+  (process.env.LOG_LEVEL || 'info') === 'trace';
 
 /**
  * Parse the .env file and return values for the requested keys.
@@ -14,7 +28,11 @@ export function readEnvFile(keys: string[]): Record<string, string> {
   try {
     content = fs.readFileSync(envFile, 'utf-8');
   } catch (err) {
-    logger.debug({ err }, '.env file not found, using defaults');
+    if (ENV_DEBUG_ENABLED) {
+      process.stderr.write(
+        `[env] .env file not found at ${envFile}, using defaults\n`,
+      );
+    }
     return {};
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw",
-  "version": "1.2.52",
+  "version": "1.2.54",
   "description": "Personal Claude assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
@@ -34,6 +34,7 @@
     "eslint-plugin-no-catch-all": "^1.1.0",
     "globals": "^15.12.0",
     "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
     "prettier": "^3.8.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
@@ -41,6 +42,9 @@
     "vitest": "^4.0.18"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.17"
+  },
+  "lint-staged": {
+    "src/**/*.ts": "prettier --write"
   }
 }
