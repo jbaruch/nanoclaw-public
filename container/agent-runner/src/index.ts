@@ -469,6 +469,13 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Track whether the agent invoked an explicit user-facing send tool
+  // during this query. If it did, the SDK's final `result.text` is a
+  // closing-thought / summary aimed at the harness, not a second answer
+  // to the user — and forwarding it to the chat produces visible
+  // duplicates ("Awake, bud" + "Confirmed."). Send-tool calls suppress
+  // the final-text echo at writeOutput time below.
+  let userFacingSendInvoked = false;
 
   // Streaming preview: accumulate assistant text and emit throttled
   let streamingTextAccum = '';
@@ -724,7 +731,7 @@ async function runQuery(
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
       // Extract text content for streaming preview
-      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string; name?: string }> } }).message?.content;
       if (content) {
         const text = content
           .filter((c) => c.type === 'text' && c.text)
@@ -736,6 +743,20 @@ async function runQuery(
           if (now - lastStreamEmit >= STREAM_THROTTLE_MS) {
             writeOutput({ status: 'success', result: null, streamText: streamingTextAccum, newSessionId });
             lastStreamEmit = now;
+          }
+        }
+        // Detect explicit user-facing send tool invocations during this
+        // turn. Once any of these fires, the SDK's terminal result.text
+        // becomes a closing summary aimed at the harness, not a second
+        // user reply — see userFacingSendInvoked declaration above.
+        for (const block of content) {
+          if (
+            block.type === 'tool_use' &&
+            (block.name === 'mcp__nanoclaw__send_message' ||
+              block.name === 'mcp__nanoclaw__send_voice' ||
+              block.name === 'mcp__nanoclaw__send_file')
+          ) {
+            userFacingSendInvoked = true;
           }
         }
       }
@@ -767,9 +788,24 @@ async function runQuery(
       log(
         `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
       );
+      // If the agent used an explicit user-facing send tool during this
+      // query, the SDK's final result.text is a closing summary aimed at
+      // the harness, not a second user reply. Pass result=null so the
+      // orchestrator's onOutput callback skips its sendMessage path
+      // (it's gated on `if (result.result)` in src/index.ts). Without
+      // this, models that don't reliably wrap closing thoughts in
+      // <internal>…</internal> produce visible duplicates: the explicit
+      // send_message goes out, then the closing summary goes out as a
+      // second message ("Awake, bud" + "Confirmed.").
+      const suppressFinalText = userFacingSendInvoked && !!textResult;
+      if (suppressFinalText) {
+        log(
+          `Suppressing result.text echo (send tool already invoked): ${textResult!.slice(0, 80)}`,
+        );
+      }
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: suppressFinalText ? null : textResult || null,
         newSessionId,
       });
       // Break out of the for-await loop after receiving the result.
