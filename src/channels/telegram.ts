@@ -881,11 +881,25 @@ export class TelegramChannel implements Channel {
         !requiresTrigger ||
         getTriggerPattern(group.trigger).test(content.trim()) ||
         !!ctx.message.reply_to_message?.from?.is_bot;
+      // Always record the latest user message so the observer can
+      // attach progress reactions (🤔 → ⚡ → ✍) when the agent
+      // engages. This is just a host-local map — no Telegram API
+      // call, no leak. The 👀 auto-react below IS a leak-surface
+      // for untrusted contexts and stays gated.
+      if (triggerHit) {
+        noteLatestUserMessage(chatJid, msgId);
+      }
+      // Host-side 👀 leak-protection: only auto-react in trust
+      // contexts where engagement is already guaranteed (main +
+      // trusted with triggerHit). Untrusted contexts let the
+      // agent's bad-actor-disengage rule decide whether to leak
+      // "I see you" — if the agent does engage, the observer's
+      // updateReaction will set 🤔/⚡/✍ on the same message it
+      // recorded above.
       if ((group.isMain || group.containerConfig?.trusted) && triggerHit) {
         this.sendReaction(chatJid, msgId, '👀').catch(() => {
           /* already logged */
         });
-        noteLatestUserMessage(chatJid, msgId);
       }
     });
 
