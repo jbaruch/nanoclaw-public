@@ -63,16 +63,24 @@ export async function initObserver(
     return;
   }
   if (!isPrivate) {
-    logger.error(
+    // Operator chose a non-private chat (group / channel). This IS a
+    // leak surface — the observer mirrors thinking, tool-use, and
+    // partial output from EVERY container, and any member of the
+    // observer chat sees that stream. We allow it because some
+    // operators run a deliberate "single-user private group" as the
+    // observer (no third parties added — the group exists just to
+    // get a fixed chat ID separate from a 1:1 DM). Loud warn at
+    // startup so the misconfiguration is visible if it happens by
+    // accident.
+    logger.warn(
       { jid: OBSERVER_CHAT_JID },
-      'Observer disabled: configured chat is a group / channel, not a private DM. Set OBSERVER_CHAT_JID to a 1:1 chat with the bot.',
+      'Observer chat is a group / channel, NOT a 1:1 DM. Anyone in the chat will see all containers reasoning. Use a chat with only the bot + you, or switch OBSERVER_CHAT_JID to a private DM.',
     );
-    return;
   }
   observerEnabledFlag = true;
   logger.info(
-    { jid: OBSERVER_CHAT_JID },
-    'Observer chat enabled (verified private)',
+    { jid: OBSERVER_CHAT_JID, isPrivate },
+    'Observer chat enabled',
   );
   armSelfTest();
 }
