@@ -470,12 +470,15 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
   // Track whether the agent invoked an explicit user-facing send tool
-  // during this query. If it did, the SDK's final `result.text` is a
-  // closing-thought / summary aimed at the harness, not a second answer
-  // to the user — and forwarding it to the chat produces visible
-  // duplicates ("Awake, bud" + "Confirmed."). Send-tool calls suppress
-  // the final-text echo at writeOutput time below.
-  let userFacingSendInvoked = false;
+  // AND the tool actually succeeded during this query. If so, the SDK's
+  // final `result.text` is a closing-thought / summary aimed at the
+  // harness, not a second answer to the user — forwarding it produces
+  // visible duplicates ("Awake, bud" + "Confirmed."). We require a
+  // successful tool_result (not is_error) so a hook-denied or errored
+  // send_message doesn't suppress the final text and leave the user
+  // staring at silence.
+  const pendingUserFacingToolUseIds = new Set<string>();
+  let userFacingSendSucceeded = false;
 
   // Streaming preview: accumulate assistant text and emit throttled
   let streamingTextAccum = '';
@@ -731,7 +734,7 @@ async function runQuery(
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
       // Extract text content for streaming preview
-      const content = (message as { message?: { content?: Array<{ type: string; text?: string; name?: string }> } }).message?.content;
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string; name?: string; id?: string }> } }).message?.content;
       if (content) {
         const text = content
           .filter((c) => c.type === 'text' && c.text)
@@ -746,17 +749,40 @@ async function runQuery(
           }
         }
         // Detect explicit user-facing send tool invocations during this
-        // turn. Once any of these fires, the SDK's terminal result.text
-        // becomes a closing summary aimed at the harness, not a second
-        // user reply — see userFacingSendInvoked declaration above.
+        // turn. Stash the tool_use id so we can match the corresponding
+        // tool_result below — we only suppress the SDK's final text once
+        // we've seen a non-error result for one of these calls.
         for (const block of content) {
           if (
             block.type === 'tool_use' &&
+            block.id &&
             (block.name === 'mcp__nanoclaw__send_message' ||
               block.name === 'mcp__nanoclaw__send_voice' ||
               block.name === 'mcp__nanoclaw__send_file')
           ) {
-            userFacingSendInvoked = true;
+            pendingUserFacingToolUseIds.add(block.id);
+          }
+        }
+      }
+    }
+
+    // Track successful results for the send tools we recorded above.
+    // The SDK emits tool_result blocks inside `user`-typed messages.
+    // If `is_error` is true (rate limit, hook denial, exception), the
+    // user never received the message — leave userFacingSendSucceeded
+    // alone so the SDK's final text still goes out and the user sees
+    // *something*.
+    if (message.type === 'user') {
+      const userContent = (message as { message?: { content?: Array<{ type: string; tool_use_id?: string; is_error?: boolean }> } }).message?.content;
+      if (userContent) {
+        for (const block of userContent) {
+          if (
+            block.type === 'tool_result' &&
+            block.tool_use_id &&
+            pendingUserFacingToolUseIds.has(block.tool_use_id) &&
+            block.is_error !== true
+          ) {
+            userFacingSendSucceeded = true;
           }
         }
       }
@@ -797,10 +823,10 @@ async function runQuery(
       // <internal>…</internal> produce visible duplicates: the explicit
       // send_message goes out, then the closing summary goes out as a
       // second message ("Awake, bud" + "Confirmed.").
-      const suppressFinalText = userFacingSendInvoked && !!textResult;
+      const suppressFinalText = userFacingSendSucceeded && !!textResult;
       if (suppressFinalText) {
         log(
-          `Suppressing result.text echo (send tool already invoked): ${textResult!.slice(0, 80)}`,
+          `Suppressing result.text echo (send tool already succeeded): ${textResult!.slice(0, 80)}`,
         );
       }
       writeOutput({
