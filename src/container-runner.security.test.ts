@@ -741,10 +741,7 @@ describe('buildVolumeMounts — pre-spawn IPC sweep (#287)', () => {
     // drop this message if we GC'd it on respawn (no longer pulled from
     // DB cursor on next spawn).
     const inputDir = seedInputDir();
-    const recentFile = path.join(
-      inputDir,
-      `${Date.now() - 1_000}-bbbb.json`,
-    );
+    const recentFile = path.join(inputDir, `${Date.now() - 1_000}-bbbb.json`);
     fs.writeFileSync(recentFile, '{"type":"message","text":"recent"}');
 
     buildVolumeMounts(makeUntrustedGroup(), false, 'sweep-recent@g.us');
