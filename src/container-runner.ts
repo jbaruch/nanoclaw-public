@@ -244,24 +244,15 @@ export function createFilteredDb(
   const filteredPath = path.join(filteredDir, 'messages.db');
 
   // Build the snapshot in a per-call temp file and atomic-rename onto
-  // `filteredPath` only after the populate phase finishes. This serves
-  // two purposes: (1) clears any leftover `-wal`/`-shm` sidecars from a
-  // pre-#287 version that ran before the `journal_mode = DELETE` pragma
-  // landed (operators upgrading on top of an existing data dir would
-  // otherwise keep the old WAL artefacts and trip the same RO-mount
-  // failure the pragma is supposed to eliminate); (2) avoids a
-  // concurrent-refresh race where two sessions for the same untrusted
-  // group (default + maintenance) call `createFilteredDb` at the same
-  // time — without the temp+rename, both would write to the same path
-  // and a third reader could open a partially-populated DB. Sidecars
-  // are removed unconditionally (independent of whether the main file
-  // existed) because a partial wipe — main DB removed but sidecars
-  // left — is the exact state SQLite refuses to open. `rmSync` with
-  // `force: true` so the cleanup tolerates another caller having
-  // already removed any of these paths.
-  for (const suffix of ['', '-wal', '-shm']) {
-    fs.rmSync(`${filteredPath}${suffix}`, { force: true });
-  }
+  // `filteredPath` only after the populate phase finishes. The
+  // canonical path is NOT pre-removed — POSIX rename(2) overwrites
+  // the destination atomically, so a concurrent reader either sees
+  // the prior snapshot or the fully-built new one and never observes
+  // a missing-file gap. This avoids the concurrent-refresh race where
+  // two sessions for the same untrusted group (default + maintenance)
+  // call `createFilteredDb` at the same time, and also keeps the
+  // filtered DB readable to in-flight tasks that opened it just
+  // before the refresh.
   const tmpSuffix = `${process.pid}-${randomBytes(4).toString('hex')}`;
   const tmpPath = `${filteredPath}.tmp.${tmpSuffix}`;
 
@@ -289,58 +280,81 @@ export function createFilteredDb(
   // The filtered DB is a single-writer one-shot snapshot, so WAL gives it
   // nothing anyway. See issue #287.
   dst.pragma('journal_mode = DELETE');
+  let published = false;
   try {
-    dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
-    dst.exec(
-      `CREATE TABLE chats AS SELECT * FROM src.chats WHERE jid = '${chatJid.replace(/'/g, "''")}'`,
-    );
-    dst.exec(
-      `CREATE TABLE messages AS SELECT * FROM src.messages WHERE chat_jid = '${chatJid.replace(/'/g, "''")}'`,
-    );
-    dst.exec('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)');
-    // Reactions scoped to this chat only. check-unanswered.py joins on this
-    // table to skip messages the bot already 👀-reacted to; without it, the
-    // join hits "no such table: reactions" and the whole script aborts.
-    // Created unconditionally so untrusted containers don't depend on
-    // whether the host happens to have any reactions yet — even an empty
-    // table satisfies the join. CTAS can't run if src.reactions doesn't
-    // exist (fresh install before migrations), so fall back to an empty
-    // table with the known schema in that case.
     try {
-      dst.exec(`
-        CREATE TABLE reactions AS
-          SELECT r.* FROM src.reactions r
-          WHERE r.message_chat_jid = '${chatJid.replace(/'/g, "''")}'
-      `);
-    } catch {
-      dst.exec(`
-        CREATE TABLE reactions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          message_id TEXT NOT NULL,
-          message_chat_jid TEXT NOT NULL,
-          reactor_jid TEXT NOT NULL,
-          reactor_name TEXT NOT NULL,
-          emoji TEXT NOT NULL,
-          timestamp TEXT NOT NULL
-        )
-      `);
+      dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
+      dst.exec(
+        `CREATE TABLE chats AS SELECT * FROM src.chats WHERE jid = '${chatJid.replace(/'/g, "''")}'`,
+      );
+      dst.exec(
+        `CREATE TABLE messages AS SELECT * FROM src.messages WHERE chat_jid = '${chatJid.replace(/'/g, "''")}'`,
+      );
+      dst.exec(
+        'CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)',
+      );
+      // Reactions scoped to this chat only. check-unanswered.py joins on this
+      // table to skip messages the bot already 👀-reacted to; without it, the
+      // join hits "no such table: reactions" and the whole script aborts.
+      // Created unconditionally so untrusted containers don't depend on
+      // whether the host happens to have any reactions yet — even an empty
+      // table satisfies the join. CTAS can't run if src.reactions doesn't
+      // exist (fresh install before migrations), so fall back to an empty
+      // table with the known schema in that case.
+      try {
+        dst.exec(`
+          CREATE TABLE reactions AS
+            SELECT r.* FROM src.reactions r
+            WHERE r.message_chat_jid = '${chatJid.replace(/'/g, "''")}'
+        `);
+      } catch {
+        dst.exec(`
+          CREATE TABLE reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL,
+            message_chat_jid TEXT NOT NULL,
+            reactor_jid TEXT NOT NULL,
+            reactor_name TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+          )
+        `);
+      }
+      dst.exec(
+        'CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid)',
+      );
+      dst.exec('DETACH src');
+    } finally {
+      dst.close();
     }
-    dst.exec(
-      'CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid)',
-    );
-    dst.exec('DETACH src');
-  } finally {
-    dst.close();
-  }
 
-  // Atomic publish: rename the populated temp file onto the canonical
-  // path. POSIX rename(2) is atomic, so any reader that opens
-  // `filteredPath` either sees the prior snapshot or the fully-built
-  // new one — never an in-progress populate. If a concurrent refresh
-  // beats us to the rename, that's fine: both built equivalent content
-  // and one wins the last-write — the loser's temp file is the only
-  // visible side effect, and we clean it up below.
-  fs.renameSync(tmpPath, filteredPath);
+    // Atomic publish: rename the populated temp file onto the canonical
+    // path. POSIX rename(2) is atomic, so any reader that opens
+    // `filteredPath` either sees the prior snapshot or the fully-built
+    // new one — never an in-progress populate. If a concurrent refresh
+    // beats us to the rename, that's fine: both built equivalent content
+    // and rename(2) overwrites atomically.
+    fs.renameSync(tmpPath, filteredPath);
+    published = true;
+
+    // Now that the new snapshot is published, drop any leftover
+    // `-wal`/`-shm` sidecars from a pre-#287 install. They're harmless
+    // for DELETE-journal readers but waste disk and would re-trip the
+    // RO-mount failure on a hypothetical regression to WAL mode. Done
+    // AFTER the rename so a reader between the rename and this cleanup
+    // sees a consistent (DB + sidecars) view at every moment.
+    for (const suffix of ['-wal', '-shm']) {
+      fs.rmSync(`${filteredPath}${suffix}`, { force: true });
+    }
+  } finally {
+    // If the populate or rename threw, the temp file is leftover. Wipe
+    // it so retries don't accumulate `.tmp.<pid>.<rand>` cruft. Skip
+    // when `published` is true: the rename moved the temp inode onto
+    // the canonical path, so nothing is left at `tmpPath`.
+    if (!published) {
+      fs.rmSync(tmpPath, { force: true });
+    }
+  }
 
   // Chown so container user can read
   const uid = HOST_UID ?? 1000;

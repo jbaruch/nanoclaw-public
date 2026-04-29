@@ -12,8 +12,8 @@
  * The fix: surface the FIRST occurrence of each errno code loudly so
  * the next regression of this class is visible at a glance in container
  * logs, then suppress further reports to avoid log spam at the IPC poll
- * cadence (the agent-runner's `IPC_POLL_MS`, currently 500ms, drains
- * the dir for the entire lifetime of the container).
+ * cadence (the agent-runner's `IPC_POLL_MS` drains the dir for the
+ * entire lifetime of the container).
  *
  * State is instance-scoped: each call to `createReadonlyWarner` gets
  * its own `Set<errno>` via closure, so each warner emits at most one
