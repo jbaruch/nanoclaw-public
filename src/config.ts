@@ -44,18 +44,27 @@ export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 // In DooD, process.getuid() returns the orchestrator container's uid (1000).
 // HOST_UID/HOST_GID env vars override this with the actual host user's uid/gid.
 //
-// Validation: a set-but-malformed value (`HOST_UID=foo` → NaN, or
-// `HOST_UID=-1`) becomes `undefined` here so downstream chown sites
-// fall through to their default branch (Mac-host posture / chown to
-// uid 1000) instead of forwarding the malformed value into
-// `fs.chownSync` — `NaN` throws there, `-1` casts to uid 4294967295
-// and silently mis-owns. A stderr warning surfaces the operator typo
-// at startup; without it, the misconfig looks identical to "not
-// running in DooD" and the original permission issue is invisible
-// (issue #258). Stderr (not the `logger`) keeps `config.ts` below
-// `logger.ts` in the import graph — same constraint
-// `resolveAgentAutoCompactWindow` documents above.
-function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
+// Validation: a set-but-malformed value (`HOST_UID=foo`, `-1`, `1.5`,
+// `123abc`, or empty string) resolves to `undefined` here so
+// downstream chown sites fall through to their default branch
+// (Mac-host posture / chown to uid 1000) instead of forwarding the
+// malformed value into `fs.chownSync` — `NaN` throws there, `-1`
+// casts to uid 4294967295 and silently mis-owns. A stderr line
+// surfaces the operator typo at startup; without it, the misconfig
+// looks identical to "not running in DooD" and the original
+// permission issue (#258) is invisible.
+//
+// Stderr is used directly rather than `logger` because this runs at
+// module-evaluation time, before the orchestrator has wired any
+// logger sinks. Stderr is always available and doesn't pull config
+// into a tighter coupling with logger initialization order.
+//
+// Exported so unit tests can call it directly with mutated
+// `process.env`. Re-importing the module via `vi.resetModules()`
+// would re-execute logger.ts each pass and leak
+// `process.on('uncaughtException')` / `unhandledRejection` handlers
+// (Node defaults to a max of 10 before warning).
+export function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
   const raw = process.env[name];
   if (raw === undefined) return undefined;
   // Strict digits-only match: `parseInt` would silently accept partial
