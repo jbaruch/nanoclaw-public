@@ -57,15 +57,18 @@ export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 // `resolveAgentAutoCompactWindow` documents above.
 function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
   const raw = process.env[name];
-  if (!raw) return undefined;
-  const parsed = parseInt(raw, 10);
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  if (raw === undefined) return undefined;
+  // Strict digits-only match: `parseInt` would silently accept partial
+  // parses (`"123abc"` → 123, `"1.5"` → 1) and `!raw` would treat an
+  // explicit empty string as "unset" — both shapes are operator typos
+  // we want to surface, not absorb.
+  if (!/^\d+$/.test(raw)) {
     process.stderr.write(
       `[config] ${name}="${raw}" is not a non-negative integer — ignoring; chowns to host user will fall back to default uid/gid.\n`,
     );
     return undefined;
   }
-  return parsed;
+  return parseInt(raw, 10);
 }
 export const HOST_UID = parseHostId('HOST_UID');
 export const HOST_GID = parseHostId('HOST_GID');

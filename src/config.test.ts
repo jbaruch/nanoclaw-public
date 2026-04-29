@@ -113,6 +113,40 @@ describe('HOST_UID / HOST_GID parsing', () => {
     expect(warning).toContain('"-1"');
   });
 
+  it('warns and returns undefined for partial-numeric input (parseInt trap)', async () => {
+    // `parseInt("123abc", 10)` returns 123 — a permissive partial
+    // parse that would silently accept operator typos. The strict
+    // digits-only regex rejects it.
+    process.env.HOST_UID = '123abc';
+    const { HOST_UID } = await loadConfig();
+    expect(HOST_UID).toBeUndefined();
+    const warning = stderrWrites.find((line) => line.includes('HOST_UID'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain('"123abc"');
+  });
+
+  it('warns and returns undefined for fractional input (parseInt trap)', async () => {
+    // `parseInt("1.5", 10)` returns 1 — same partial-parse hazard.
+    process.env.HOST_GID = '1.5';
+    const { HOST_GID } = await loadConfig();
+    expect(HOST_GID).toBeUndefined();
+    const warning = stderrWrites.find((line) => line.includes('HOST_GID'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain('"1.5"');
+  });
+
+  it('warns and returns undefined when env is set to empty string', async () => {
+    // An explicitly-set empty string (a `.env` line that lost its
+    // value, e.g. `HOST_UID=`) is an operator typo, not a deliberate
+    // "unset" — surface it the same way as any other malformed value.
+    process.env.HOST_UID = '';
+    const { HOST_UID } = await loadConfig();
+    expect(HOST_UID).toBeUndefined();
+    const warning = stderrWrites.find((line) => line.includes('HOST_UID'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain('HOST_UID=""');
+  });
+
   it('warns and returns undefined when HOST_GID is malformed', async () => {
     // Symmetric coverage — same helper handles both names, but a typo
     // in the GID branch (wrong env-var name passed to the helper)
