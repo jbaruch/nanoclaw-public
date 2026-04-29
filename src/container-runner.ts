@@ -34,6 +34,8 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { isExpectedFsError } from './fs-errors.js';
+import { sweepStaleInputs } from './ipc-input-sweep.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 import { readEnvFile } from './env.js';
@@ -242,55 +244,147 @@ export function createFilteredDb(
   fs.mkdirSync(filteredDir, { recursive: true });
   const filteredPath = path.join(filteredDir, 'messages.db');
 
-  // Remove stale copy from previous run
-  if (fs.existsSync(filteredPath)) {
-    fs.unlinkSync(filteredPath);
-  }
+  // Build the snapshot in a per-call temp file and atomic-rename onto
+  // `filteredPath` only after the populate phase finishes. The
+  // canonical path is NOT pre-removed — POSIX rename(2) overwrites
+  // the destination atomically, so a concurrent reader either sees
+  // the prior snapshot or the fully-built new one and never observes
+  // a missing-file gap. This avoids the concurrent-refresh race where
+  // two sessions for the same untrusted group (default + maintenance)
+  // call `createFilteredDb` at the same time, and also keeps the
+  // filtered DB readable to in-flight tasks that opened it just
+  // before the refresh.
+  const tmpSuffix = `${process.pid}-${randomBytes(4).toString('hex')}`;
+  const tmpPath = `${filteredPath}.tmp.${tmpSuffix}`;
 
   // Use ATTACH to copy schema-agnostically — picks up new columns automatically
-  const dst = new Database(filteredPath);
+  const dst = new Database(tmpPath);
+  // Source `messages.db` is WAL-mode and actively written by the orchestrator
+  // (better-sqlite3's default journal mode for the unfiltered DB). Without
+  // a busy_timeout this connection would fail immediately on any lock
+  // contention against the source (e.g. during a WAL checkpoint or a write
+  // landing concurrently with the ATTACH), so a fresh untrusted-container
+  // spawn that happens to coincide with a write would intermittently fail
+  // to set up its filtered DB. 5000ms is comfortably longer than typical
+  // orchestrator write transactions on this DB (which complete in
+  // milliseconds), small enough that a stuck writer surfaces as a failure
+  // rather than a hung spawn.
+  dst.pragma('busy_timeout = 5000');
+  // Force rollback-journal mode on the snapshot. better-sqlite3 defaults to
+  // WAL, which requires the SQLite reader to write `-wal`/`-shm` sidecar
+  // files even on opens that are logically read-only. The filtered DB is
+  // mounted read-only into untrusted containers (via `fakeowner ro`); a
+  // default `sqlite3.connect(path)` from inside the container then fails
+  // with `unable to open database file` because the sidecars can't be
+  // created. DELETE-journal makes the file self-contained — every reader's
+  // default open works without per-script `?mode=ro&immutable=1` plumbing.
+  // The filtered DB is a single-writer one-shot snapshot, so WAL gives it
+  // nothing anyway. See issue #287.
+  dst.pragma('journal_mode = DELETE');
+  let published = false;
   try {
-    dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
-    dst.exec(
-      `CREATE TABLE chats AS SELECT * FROM src.chats WHERE jid = '${chatJid.replace(/'/g, "''")}'`,
-    );
-    dst.exec(
-      `CREATE TABLE messages AS SELECT * FROM src.messages WHERE chat_jid = '${chatJid.replace(/'/g, "''")}'`,
-    );
-    dst.exec('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)');
-    // Reactions scoped to this chat only. check-unanswered.py joins on this
-    // table to skip messages the bot already 👀-reacted to; without it, the
-    // join hits "no such table: reactions" and the whole script aborts.
-    // Created unconditionally so untrusted containers don't depend on
-    // whether the host happens to have any reactions yet — even an empty
-    // table satisfies the join. CTAS can't run if src.reactions doesn't
-    // exist (fresh install before migrations), so fall back to an empty
-    // table with the known schema in that case.
     try {
-      dst.exec(`
-        CREATE TABLE reactions AS
-          SELECT r.* FROM src.reactions r
-          WHERE r.message_chat_jid = '${chatJid.replace(/'/g, "''")}'
-      `);
-    } catch {
-      dst.exec(`
-        CREATE TABLE reactions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          message_id TEXT NOT NULL,
-          message_chat_jid TEXT NOT NULL,
-          reactor_jid TEXT NOT NULL,
-          reactor_name TEXT NOT NULL,
-          emoji TEXT NOT NULL,
-          timestamp TEXT NOT NULL
-        )
-      `);
+      dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
+      dst.exec(
+        `CREATE TABLE chats AS SELECT * FROM src.chats WHERE jid = '${chatJid.replace(/'/g, "''")}'`,
+      );
+      dst.exec(
+        `CREATE TABLE messages AS SELECT * FROM src.messages WHERE chat_jid = '${chatJid.replace(/'/g, "''")}'`,
+      );
+      dst.exec(
+        'CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)',
+      );
+      // Reactions scoped to this chat only. check-unanswered.py joins on this
+      // table to skip messages the bot already 👀-reacted to; without it, the
+      // join hits "no such table: reactions" and the whole script aborts.
+      // Created unconditionally so untrusted containers don't depend on
+      // whether the host happens to have any reactions yet — even an empty
+      // table satisfies the join. CTAS can't run if src.reactions doesn't
+      // exist (fresh install before migrations), so fall back to an empty
+      // table with the known schema in that case.
+      try {
+        dst.exec(`
+          CREATE TABLE reactions AS
+            SELECT r.* FROM src.reactions r
+            WHERE r.message_chat_jid = '${chatJid.replace(/'/g, "''")}'
+        `);
+      } catch {
+        dst.exec(`
+          CREATE TABLE reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL,
+            message_chat_jid TEXT NOT NULL,
+            reactor_jid TEXT NOT NULL,
+            reactor_name TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+          )
+        `);
+      }
+      dst.exec(
+        'CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid)',
+      );
+      dst.exec('DETACH src');
+    } finally {
+      dst.close();
     }
-    dst.exec(
-      'CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid)',
-    );
-    dst.exec('DETACH src');
+
+    // Atomic publish: rename the populated temp file onto the canonical
+    // path. POSIX rename(2) is atomic, so any reader that opens
+    // `filteredPath` either sees the prior snapshot or the fully-built
+    // new one — never an in-progress populate. If a concurrent refresh
+    // beats us to the rename, that's fine: both built equivalent content
+    // and rename(2) overwrites atomically.
+    fs.renameSync(tmpPath, filteredPath);
+    published = true;
+
+    // Now that the new snapshot is published, drop any leftover
+    // `-wal`/`-shm` sidecars from a pre-#287 install. They're harmless
+    // for DELETE-journal readers but waste disk and would re-trip the
+    // RO-mount failure on a hypothetical regression to WAL mode. Done
+    // AFTER the rename so a reader between the rename and this cleanup
+    // sees a consistent (DB + sidecars) view at every moment.
+    //
+    // Best-effort: a permission glitch or transient FS error here must
+    // not fail the spawn — the new snapshot is already published. Only
+    // expected fs errnos are absorbed (a real bug like TypeError still
+    // propagates).
+    for (const suffix of ['-wal', '-shm']) {
+      const sidecarPath = `${filteredPath}${suffix}`;
+      try {
+        fs.rmSync(sidecarPath, { force: true });
+      } catch (err) {
+        if (!isExpectedFsError(err)) throw err;
+        logger.warn(
+          { err, sidecarPath },
+          'Failed to clean stale filtered-DB sidecar (best-effort, snapshot already published)',
+        );
+      }
+    }
   } finally {
-    dst.close();
+    // If the populate or rename threw, the temp file is leftover. Wipe
+    // it so retries don't accumulate `.tmp.<pid>.<rand>` cruft. Skip
+    // when `published` is true: the rename moved the temp inode onto
+    // the canonical path, so nothing is left at `tmpPath`.
+    //
+    // Best-effort: this finally runs both on success and on failure,
+    // and we MUST NOT mask the original error if cleanup itself
+    // throws. Catch expected fs errnos (the only kind we'd plausibly
+    // see on a temp file in our own scratch dir) and log; anything
+    // else still propagates so a real bug surfaces. The original
+    // error from the try block (if any) keeps bubbling because the
+    // catch swallows only the SECONDARY error from rmSync.
+    if (!published) {
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch (err) {
+        if (!isExpectedFsError(err)) throw err;
+        logger.warn(
+          { err, tmpPath },
+          'Failed to clean filtered-DB temp file after build/rename failure (leaks one .tmp.<pid>.<rand> file)',
+        );
+      }
+    }
   }
 
   // Chown so container user can read
@@ -1181,6 +1275,27 @@ export function buildVolumeMounts(
       );
     }
   }
+
+  // Wipe leftover IPC inputs from previous container lifecycles.
+  // Without this, untrusted spawns inherit the entire backlog as their
+  // first prompt and cross the auto-compact threshold mid-query — the
+  // exact #287 failure mode (a 1604-file pile poisoning the new
+  // session). graceMs is set to IDLE_TIMEOUT so files older than the
+  // longest natural-respawn window are GC'd (those came from a
+  // previous container that drained them in-memory but couldn't unlink
+  // due to the RO mount), while files newer than IDLE_TIMEOUT are
+  // preserved — they could plausibly be unconsumed crash-recovery
+  // messages: GroupQueue.sendMessage() writes the IPC file AND advances
+  // `lastAgentTimestamp` before the agent acks, so a container crash
+  // between write and drain would otherwise drop messages that no
+  // longer get re-pulled from the DB cursor. The trade-off accepted:
+  // some duplicate processing if an agent crashes within IDLE_TIMEOUT
+  // of having drained a file (rare and self-correcting — agent sees
+  // "you said X earlier") vs hard message loss (silent failure). An
+  // explicit ack channel from agent to host is the cleaner long-term
+  // fix and is filed as a follow-up to #287.
+  sweepStaleInputs(sessionInputDir, IDLE_TIMEOUT);
+
   if (isTrustedIpc) {
     fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   }
