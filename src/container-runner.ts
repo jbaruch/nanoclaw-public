@@ -622,6 +622,12 @@ export function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   // Write settings.json only if content has changed — unnecessary rewrites
   // invalidate the SDK's prompt cache (file mtime changes trigger cache misses).
+  // Invariant: this object is built from a pure literal that branches only
+  // on `isMain` and trust tier (no per-session inputs), so `default` and
+  // `maintenance` sessions of the same group produce byte-identical output
+  // and cannot drift. If you add per-session branching here, or merge in
+  // any user-editable input, the file stops being pure-generated and needs
+  // to move to the shared-memory mount alongside auto-memory.
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const newSettings =
     JSON.stringify(
