@@ -201,6 +201,58 @@ describe('createFilteredDb (untrusted DB isolation)', () => {
       db.close();
     }
   });
+
+  // Issue #287 follow-up — operators upgrading from a pre-fix version
+  // can have stale `-wal`/`-shm` sidecars on disk from when the snapshot
+  // ran in WAL mode. The next `createFilteredDb` call must wipe those
+  // sidecars too, not just the main DB file. A partial state (main DB
+  // gone, sidecars present) is the exact scenario SQLite refuses to
+  // open with `unable to open database file`.
+  it('createFilteredDb removes leftover -wal/-shm sidecars from a pre-fix snapshot', () => {
+    seedMessagesDb();
+    // First call to create the filtered dir + main DB.
+    const filtered = createFilteredDb('chatA@g.us', 'folder-a');
+    expect(filtered).not.toBe(null);
+    // Plant fake sidecars as if a pre-fix WAL-mode snapshot had run.
+    const walPath = `${filtered}-wal`;
+    const shmPath = `${filtered}-shm`;
+    fs.writeFileSync(walPath, 'stale-wal');
+    fs.writeFileSync(shmPath, 'stale-shm');
+    expect(fs.existsSync(walPath)).toBe(true);
+    expect(fs.existsSync(shmPath)).toBe(true);
+
+    // Re-run — the stale-copy cleanup must take both sidecars with it.
+    const refresh = createFilteredDb('chatA@g.us', 'folder-a');
+    expect(refresh).toBe(filtered);
+    expect(fs.existsSync(walPath)).toBe(false);
+    expect(fs.existsSync(shmPath)).toBe(false);
+  });
+
+  // Issue #287 — filtered DB must use a rollback journal, not WAL.
+  // Untrusted containers receive this DB on a read-only mount (`fakeowner
+  // ro`); a WAL-mode DB cannot be opened even for reads on a RO mount
+  // because SQLite needs to write `-wal`/`-shm` sidecars. Forcing
+  // `journal_mode = DELETE` makes the file self-contained so every
+  // reader's default open succeeds. A regression here surfaces inside
+  // untrusted containers as `OperationalError: unable to open database
+  // file` from any default-mode reader (Python `sqlite3.connect(path)`,
+  // node `new Database(path)`).
+  it('filtered DB is created with journal_mode = DELETE (not WAL) — #287', () => {
+    seedMessagesDb();
+    const filtered = createFilteredDb('chatA@g.us', 'folder-a');
+    expect(filtered).not.toBe(null);
+    const db = new Database(filtered!, { readonly: true });
+    try {
+      const mode = db.pragma('journal_mode', { simple: true });
+      expect(mode).toBe('delete');
+    } finally {
+      db.close();
+    }
+    // No `-wal`/`-shm` sidecars should be present after creation. Their
+    // existence is the visible symptom of WAL mode.
+    expect(fs.existsSync(`${filtered}-wal`)).toBe(false);
+    expect(fs.existsSync(`${filtered}-shm`)).toBe(false);
+  });
 });
 
 // -----------------------------------------------------------------------------
@@ -625,5 +677,53 @@ describe('buildVolumeMounts — shared-memory mount', () => {
       );
       expect(fs.existsSync(sharedMemoryDir)).toBe(false);
     });
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Issue #287 — pre-spawn IPC sweep wipes leftover inputs from previous
+// container lifecycles. Without this the next fresh untrusted spawn re-drains
+// the entire backlog as its initial prompt and crosses the auto-compact
+// threshold mid-query.
+// -----------------------------------------------------------------------------
+describe('buildVolumeMounts — pre-spawn IPC sweep (#287)', () => {
+  beforeEach(() => {
+    seedMessagesDb();
+  });
+
+  function makeUntrustedGroup(): RegisteredGroup {
+    return {
+      name: 'Untrusted',
+      folder: 'sweep-prespawn-test',
+      trigger: '@U',
+      added_at: new Date().toISOString(),
+      containerConfig: { trusted: false },
+    };
+  }
+
+  it('sweeps stale IPC inputs from a previous container lifecycle', () => {
+    // buildVolumeMounts calls fs.mkdirSync(sessionInputDir, { recursive: true })
+    // and only THEN runs the sweep. Pre-create the dir + a planted file so
+    // the sweep sees something to remove.
+    const inputDir = path.join(
+      DATA_DIR,
+      'ipc',
+      'sweep-prespawn-test',
+      'input-default',
+    );
+    fs.mkdirSync(inputDir, { recursive: true });
+    fs.mkdirSync(path.join(GROUPS_DIR, 'sweep-prespawn-test'), {
+      recursive: true,
+    });
+    const plantedFile = path.join(
+      inputDir,
+      `${Date.now() - 999_999_999}-aaaa.json`,
+    );
+    fs.writeFileSync(plantedFile, '{"type":"message","text":"unread"}');
+    expect(fs.existsSync(plantedFile)).toBe(true);
+
+    buildVolumeMounts(makeUntrustedGroup(), false, 'sweep-prespawn@g.us');
+
+    expect(fs.existsSync(plantedFile)).toBe(false);
   });
 });

@@ -837,6 +837,30 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
+            // Note: an earlier draft swept stale IPC inputs here on every
+            // confirmed cursor advance. That created a race (caught in
+            // PR #288 review): the agent-runner only drains IPC between
+            // queries, not during one. A long-running query (tool calls,
+            // subagent work) means files written during that query sit
+            // unread on disk; an age-based sweep at write time can then
+            // unlink them before the agent ever sees them, dropping
+            // messages while `lastAgentTimestamp` has already advanced.
+            // The pre-spawn sweep in `buildVolumeMounts` handles the
+            // actual #287 symptom — the cross-lifetime backlog (the
+            // 1604-file pile that accumulated across many respawns).
+            // Within-lifetime accumulation on an untrusted RO mount is
+            // NOT zero — the agent can't unlink consumed files, so the
+            // dir grows for as long as the container stays up. For a
+            // continuously-busy group that keeps the idle timer reset,
+            // that lifetime can be days. If `drainIpcInput`'s
+            // `readdirSync(...).filter(...).sort()` cost ever shows up
+            // in profiles, the right next step is an explicit ack
+            // channel (agent writes consumed filenames to the writable
+            // `messages/` mount, host sweeps acked files) — see #287
+            // follow-up. The pre-spawn sweep keeps the upper bound
+            // tied to "longest container lifetime" rather than
+            // "lifetime of the install", which is the change that
+            // actually unblocks untrusted containers today.
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)

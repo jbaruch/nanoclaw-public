@@ -7,6 +7,7 @@ import {
   DEFAULT_SESSION_NAME,
   sessionInputDirName,
 } from './container-runner.js';
+import { isExpectedFsError } from './fs-errors.js';
 import { logger } from './logger.js';
 
 // Re-export so callers that already imported it from group-queue keep working.
@@ -32,45 +33,6 @@ interface QueuedTask {
 
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
-
-/**
- * Filesystem error codes we expect on best-effort writes to per-group input
- * dirs and tolerate by logging + continuing. Anything outside this set
- * (a thrown non-Error value, or an Error without a `.code` field — typical
- * shape of TypeError / ReferenceError from a programming bug) propagates so
- * it surfaces instead of being silently swallowed, matching the
- * `no-catch-all` and `preserve-caught-error` rules in `eslint.config.js`.
- *
- * Codes covered:
- * - EACCES / EPERM — permission denied
- * - ENOSPC — disk full
- * - EROFS — read-only filesystem (e.g. failover read-only mount)
- * - ENOENT — input dir vanished mid-iteration
- * - EISDIR — path collision (a directory exists where the file would go)
- * - EBUSY — file in use by another writer
- * - ENOTDIR — a path component isn't a directory
- * - EMFILE / ENFILE — process / system fd table full
- * - ENAMETOOLONG — synthesised path exceeds the OS limit
- */
-const EXPECTED_FS_ERROR_CODES = new Set([
-  'EACCES',
-  'EPERM',
-  'ENOSPC',
-  'EROFS',
-  'ENOENT',
-  'EISDIR',
-  'EBUSY',
-  'ENOTDIR',
-  'EMFILE',
-  'ENFILE',
-  'ENAMETOOLONG',
-]);
-
-function isExpectedFsError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const code = (err as NodeJS.ErrnoException).code;
-  return typeof code === 'string' && EXPECTED_FS_ERROR_CODES.has(code);
-}
 
 interface GroupState {
   groupJid: string;

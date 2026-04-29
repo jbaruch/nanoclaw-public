@@ -34,6 +34,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { sweepStaleInputs } from './ipc-input-sweep.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 import { readEnvFile } from './env.js';
@@ -242,13 +243,41 @@ export function createFilteredDb(
   fs.mkdirSync(filteredDir, { recursive: true });
   const filteredPath = path.join(filteredDir, 'messages.db');
 
-  // Remove stale copy from previous run
-  if (fs.existsSync(filteredPath)) {
-    fs.unlinkSync(filteredPath);
+  // Remove stale copy from previous run, including any `-wal`/`-shm`
+  // sidecars left behind by a pre-#287 version that ran before the
+  // `journal_mode = DELETE` pragma below was in place. Without this,
+  // operators upgrading on top of an existing data dir keep the old
+  // WAL artefacts indefinitely — both as wasted disk and as the same
+  // RO-mount-can't-open failure the pragma is supposed to eliminate.
+  // Sidecars are removed unconditionally (independent of whether the
+  // main file existed) because a partial wipe — main DB removed but
+  // sidecars left — is the exact state SQLite refuses to open.
+  // `rmSync({ force: true })` so concurrent refreshes (default +
+  // maintenance session for the same untrusted group) tolerate
+  // another caller having already removed one or more of these paths.
+  for (const suffix of ['', '-wal', '-shm']) {
+    fs.rmSync(`${filteredPath}${suffix}`, { force: true });
   }
 
   // Use ATTACH to copy schema-agnostically — picks up new columns automatically
   const dst = new Database(filteredPath);
+  // Source `messages.db` is WAL-mode and actively written by the orchestrator.
+  // Without busy_timeout this connection would fail immediately on any lock
+  // contention against the source (e.g. during a checkpoint), defeating the
+  // whole point of the orchestrator-side WAL setup. Match the orchestrator
+  // value (5000ms) so contention smoothing is symmetric across readers.
+  dst.pragma('busy_timeout = 5000');
+  // Force rollback-journal mode on the snapshot. better-sqlite3 defaults to
+  // WAL, which requires the SQLite reader to write `-wal`/`-shm` sidecar
+  // files even on opens that are logically read-only. The filtered DB is
+  // mounted read-only into untrusted containers (via `fakeowner ro`); a
+  // default `sqlite3.connect(path)` from inside the container then fails
+  // with `unable to open database file` because the sidecars can't be
+  // created. DELETE-journal makes the file self-contained — every reader's
+  // default open works without per-script `?mode=ro&immutable=1` plumbing.
+  // The filtered DB is a single-writer one-shot snapshot, so WAL gives it
+  // nothing anyway. See issue #287.
+  dst.pragma('journal_mode = DELETE');
   try {
     dst.exec(`ATTACH DATABASE '${srcDb.replace(/'/g, "''")}' AS src`);
     dst.exec(
@@ -1181,6 +1210,16 @@ export function buildVolumeMounts(
       );
     }
   }
+
+  // Wipe leftover IPC inputs from previous container lifecycles. The
+  // previous container's drain has already happened (or never will, if it
+  // crashed) and the fresh spawn will rebuild its initial-prompt context
+  // from the messages.db cursor. Without this, untrusted spawns inherit
+  // the entire backlog as their first prompt and cross the auto-compact
+  // threshold mid-query (issue #287). `graceMs = 0` is safe here — the
+  // previous container is gone and the new one isn't drained from yet.
+  sweepStaleInputs(sessionInputDir, 0);
+
   if (isTrustedIpc) {
     fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   }
