@@ -59,11 +59,16 @@ export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 // logger sinks. Stderr is always available and doesn't pull config
 // into a tighter coupling with logger initialization order.
 //
-// Exported so unit tests can call it directly with mutated
-// `process.env`. Re-importing the module via `vi.resetModules()`
-// would re-execute logger.ts each pass and leak
-// `process.on('uncaughtException')` / `unhandledRejection` handlers
-// (Node defaults to a max of 10 before warning).
+/**
+ * @internal exported ONLY for `config.test.ts`. Re-importing the
+ * module via `vi.resetModules()` to flip env values per case would
+ * re-execute logger.ts each pass and leak
+ * `process.on('uncaughtException')` / `unhandledRejection` handlers
+ * (Node defaults to a max of 10 before warning). Direct invocation
+ * with mutated `process.env` gives equivalent coverage of the
+ * validation contract without the leak. `stripInternal: true` keeps
+ * this out of generated `.d.ts` so the public API stays minimal.
+ */
 export function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
   const raw = process.env[name];
   if (raw === undefined) return undefined;
