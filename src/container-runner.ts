@@ -1410,9 +1410,16 @@ function buildContainerArgs(
   // unused locally — preserves the upstream-merge surface.
   const containerEnvVars: string[] = ['GITHUB_TOKEN'];
   const secretEnv: Record<string, string> = {};
+  // The orchestrator runs under launchd which doesn't auto-load .env into
+  // process.env, and no dotenv.config() call exists. Without this fallback
+  // GITHUB_TOKEN sits in .env but never reaches a container — the
+  // SECRET_CONTAINER_VARS path silently produces an empty env-file. Match
+  // src/config.ts's established pattern: prefer process.env, fall back to
+  // a readEnvFile() lookup of the same key from .env.
+  const fileEnv = readEnvFile(Array.from(SECRET_CONTAINER_VARS));
   if (isMain || group.containerConfig?.trusted === true) {
     for (const name of containerEnvVars) {
-      const v = process.env[name];
+      const v = process.env[name] || fileEnv[name];
       if (v && SECRET_CONTAINER_VARS.has(name)) {
         secretEnv[name] = v;
       }

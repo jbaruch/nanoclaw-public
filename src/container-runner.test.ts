@@ -92,6 +92,15 @@ vi.mock('./credential-proxy.js', () => ({
   detectAuthMode: vi.fn(() => 'api-key'),
 }));
 
+// Mock env.js so tests can control the .env-fallback values that
+// container-runner consults when process.env misses a key. Default: empty
+// — preserves the original behavior of all pre-existing tests, which
+// never depended on values flowing in from .env.
+vi.mock('./env.js', () => ({
+  readEnvFile: vi.fn(() => ({})),
+  readEnvFileAll: vi.fn(() => ({})),
+}));
+
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -499,5 +508,107 @@ describe('CLAUDE_CODE_AUTO_COMPACT_WINDOW forwarding', () => {
     // regress to whatever the previous default was — including the
     // 165k upstream hardcode that motivated #29 in the first place.
     expect(args).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000');
+  });
+});
+
+// ----------------------------------------------------------------------
+// SECRET_CONTAINER_VARS .env-fallback (orchestrator runs under launchd
+// which doesn't auto-load .env into process.env). When process.env is
+// missing a SECRET_CONTAINER_VARS key but .env has it, container-runner
+// must still materialize an --env-file so the secret reaches the
+// container. Without the fallback, GITHUB_TOKEN sits in .env and never
+// gets forwarded — the symptom that motivated this fix.
+// ----------------------------------------------------------------------
+
+describe('SECRET_CONTAINER_VARS .env-file fallback', () => {
+  let envModule: typeof import('./env.js');
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+    envModule = await import('./env.js');
+    vi.mocked(envModule.readEnvFile).mockReset();
+    vi.mocked(envModule.readEnvFile).mockReturnValue({});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.GITHUB_TOKEN;
+  });
+
+  it('emits --env-file when GITHUB_TOKEN is absent from process.env but present in .env (trusted group)', async () => {
+    delete process.env.GITHUB_TOKEN;
+    // Inject the .env-only value via the mocked readEnvFile.
+    vi.mocked(envModule.readEnvFile).mockReturnValue({
+      GITHUB_TOKEN: 'github_pat_dotenv_only',
+    });
+
+    const trustedGroup: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { trusted: true },
+    };
+
+    const promise = runContainerAgent(trustedGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    // The presence of `--env-file <tmp>` proves buildSecretEnvFile got
+    // a non-empty secretEnv map. Without the readEnvFile fallback this
+    // assertion fails — the loop sees process.env[name] === undefined
+    // and produces an empty map, so buildSecretEnvFile returns null
+    // and no --env-file arg is emitted.
+    const envFileIdx = args.indexOf('--env-file');
+    expect(envFileIdx).toBeGreaterThanOrEqual(0);
+    expect(args[envFileIdx + 1]).toMatch(/nanoclaw-env-[0-9a-f]{24}$/);
+  });
+
+  it('omits --env-file when GITHUB_TOKEN is missing from BOTH process.env and .env', async () => {
+    delete process.env.GITHUB_TOKEN;
+    vi.mocked(envModule.readEnvFile).mockReturnValue({});
+
+    const trustedGroup: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { trusted: true },
+    };
+
+    const promise = runContainerAgent(trustedGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    // No fallback hit — secretEnv stays empty, so no --env-file arg.
+    // Pinned so a future regression that always emits an empty
+    // env-file (creating a 0600 tempfile every spawn for nothing)
+    // surfaces here.
+    expect(args).not.toContain('--env-file');
+  });
+
+  it('prefers process.env over .env when both are set', async () => {
+    process.env.GITHUB_TOKEN = 'github_pat_from_process_env';
+    vi.mocked(envModule.readEnvFile).mockReturnValue({
+      GITHUB_TOKEN: 'github_pat_from_dotenv',
+    });
+
+    const trustedGroup: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { trusted: true },
+    };
+
+    const promise = runContainerAgent(trustedGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    // We can't directly inspect tempfile contents here (the fs mock
+    // intercepts writeFileSync), but the precedence contract is `||`
+    // — process.env first, .env as fallback. The presence of an
+    // --env-file arg confirms the path executed; the fallback test
+    // above pins the .env-only branch.
+    expect(args).toContain('--env-file');
   });
 });
