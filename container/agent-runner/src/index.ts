@@ -380,8 +380,14 @@ function drainIpcInput(): string[] {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         consumedInputFiles.add(file);
         try { fs.unlinkSync(filePath); } catch (e: any) {
-          if (e.code !== 'EROFS' && e.code !== 'EACCES') throw e;
-          readonlyWarner.warn(e.code, file);
+          // ENOENT — file vanished between readFileSync and unlink
+          // (host-side sweep ran, or another race). Benign; matches the
+          // error-path catch below.
+          if (e.code !== 'EROFS' && e.code !== 'EACCES' && e.code !== 'ENOENT')
+            throw e;
+          if (e.code === 'EROFS' || e.code === 'EACCES') {
+            readonlyWarner.warn(e.code, file);
+          }
         }
         if (data.type === 'message' && data.text) {
           messages.push(data.text);

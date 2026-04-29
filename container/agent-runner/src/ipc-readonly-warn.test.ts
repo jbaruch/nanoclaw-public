@@ -24,10 +24,13 @@ describe('createReadonlyWarner (#287 EROFS visibility)', () => {
     w.warn('EROFS', 'second.json');
     w.warn('EROFS', 'third.json');
 
-    // Only the first call must log — subsequent ones are silent so the
-    // agent-runner's IPC poll loop (which fires every IPC_POLL_MS for
-    // the entire lifetime of the container) doesn't bury the rest of
-    // the log stream.
+    // Only the first call must log — subsequent ones are silent so
+    // the agent-runner's between-query IPC poll (`waitForIpcMessage`,
+    // which calls `drainIpcInput` on every IPC_POLL_MS tick) doesn't
+    // bury the rest of the log stream over the lifetime of the
+    // container. During an in-flight query, only the close sentinel
+    // is polled, but across many queries the cumulative count of
+    // poll-and-fail can still be high without suppression.
     expect(log).toHaveBeenCalledTimes(1);
   });
 
