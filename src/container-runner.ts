@@ -475,6 +475,31 @@ export function sessionInputDirName(sessionName: string): string {
 const CLAUDE_PROJECT_SLUG = '-workspace-group';
 
 /**
+ * Publish files from a tile's `<skill>/scripts/` source dir into the
+ * group's flat `tmpScriptsDir`. The flat dir is reachable from agents
+ * as `/workspace/group/scripts/<name>`, so the publish surface is
+ * regular files and symlinks — nothing else. Symlink targets are not
+ * inspected; the tile owns whether what its links point to is
+ * sensible. Subdirectories (notably Python's `__pycache__/`, written
+ * next to a `.py` script after the first import) and any other
+ * dirent kind (FIFOs, sockets, devices, which `fs.cpSync` rejects
+ * anyway) are skipped via an explicit `isFile() || isSymbolicLink()`
+ * allowlist so the spawn never trips on a stray entry the runtime
+ * put there.
+ *
+ * No-op when the source dir doesn't exist (skill ships no scripts).
+ *
+ * @internal Exported for tests only.
+ */
+export function copyTileScriptsToFlatDir(srcDir: string, dstDir: string): void {
+  if (!fs.existsSync(srcDir)) return;
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+    fs.cpSync(path.join(srcDir, entry.name), path.join(dstDir, entry.name));
+  }
+}
+
+/**
  * @internal Exported for tests only — mount-list construction is
  *   security-critical (trust tiers, secret shadowing, untrusted read-only).
  */
@@ -757,15 +782,10 @@ export function buildVolumeMounts(
           // after all tiles' skills are processed. Scripts at this path are
           // used by named host operations and referenced from skills as
           // `/workspace/group/scripts/<name>`.
-          const skillScriptsDir = path.join(skillSrcDir, 'scripts');
-          if (fs.existsSync(skillScriptsDir)) {
-            for (const scriptFile of fs.readdirSync(skillScriptsDir)) {
-              fs.cpSync(
-                path.join(skillScriptsDir, scriptFile),
-                path.join(tmpScriptsDir, scriptFile),
-              );
-            }
-          }
+          copyTileScriptsToFlatDir(
+            path.join(skillSrcDir, 'scripts'),
+            tmpScriptsDir,
+          );
         }
       }
     }
