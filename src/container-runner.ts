@@ -475,6 +475,27 @@ export function sessionInputDirName(sessionName: string): string {
 const CLAUDE_PROJECT_SLUG = '-workspace-group';
 
 /**
+ * Publish files from a tile's `<skill>/scripts/` source dir into the
+ * group's flat `tmpScriptsDir`. The flat dir is reachable from agents
+ * as `/workspace/group/scripts/<name>` — that contract has no place
+ * for subdirectories, so any directory entry (e.g. Python's
+ * `__pycache__/` written next to a `.py` script after the first
+ * import) is skipped. Anything else (regular files, symlinks)
+ * is copied with `fs.cpSync`'s default semantics.
+ *
+ * No-op when the source dir doesn't exist (skill ships no scripts).
+ *
+ * @internal Exported for tests only.
+ */
+export function copyTileScriptsToFlatDir(srcDir: string, dstDir: string): void {
+  if (!fs.existsSync(srcDir)) return;
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    if (entry.isDirectory()) continue;
+    fs.cpSync(path.join(srcDir, entry.name), path.join(dstDir, entry.name));
+  }
+}
+
+/**
  * @internal Exported for tests only — mount-list construction is
  *   security-critical (trust tiers, secret shadowing, untrusted read-only).
  */
@@ -757,23 +778,10 @@ export function buildVolumeMounts(
           // after all tiles' skills are processed. Scripts at this path are
           // used by named host operations and referenced from skills as
           // `/workspace/group/scripts/<name>`.
-          const skillScriptsDir = path.join(skillSrcDir, 'scripts');
-          if (fs.existsSync(skillScriptsDir)) {
-            for (const scriptFile of fs.readdirSync(skillScriptsDir, {
-              withFileTypes: true,
-            })) {
-              // tmpScriptsDir is a flat dir of executables published as
-              // `/workspace/group/scripts/<name>`; subdirs (e.g. Python's
-              // __pycache__/ created at runtime when a container imports a
-              // .py script) aren't reachable through that contract and
-              // would crash the non-recursive cpSync below.
-              if (!scriptFile.isFile()) continue;
-              fs.cpSync(
-                path.join(skillScriptsDir, scriptFile.name),
-                path.join(tmpScriptsDir, scriptFile.name),
-              );
-            }
-          }
+          copyTileScriptsToFlatDir(
+            path.join(skillSrcDir, 'scripts'),
+            tmpScriptsDir,
+          );
         }
       }
     }
