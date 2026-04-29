@@ -60,12 +60,14 @@ describe('copyTileScriptsToFlatDir', () => {
 
   it('does not drop symlink entries (regression guard from PR review)', () => {
     // Pre-fix the loop walked names and let cpSync handle them, which
-    // included symlinks via cpSync's default deref-and-copy. The
-    // allowlist (`isFile() || isSymbolicLink()`) keeps that path open
-    // so a symlinked executable a tile ships under scripts/ still
-    // reaches /workspace/group/scripts/<name>. Asserting reachability
-    // and content — not symlink-ness on the destination — because
-    // cpSync's default semantics dereference symlinks during the copy.
+    // included symlinks. The allowlist (`isFile() || isSymbolicLink()`)
+    // keeps that path open so a symlinked executable a tile ships
+    // under scripts/ still reaches /workspace/group/scripts/<name>.
+    // Assert reachability and content here as the regression guard,
+    // rather than asserting whether the destination remains a symlink
+    // — Node's cpSync defaults to `dereference: false` so the dst is
+    // a symlink, but a future flip wouldn't be a regression of the
+    // bug this test exists to guard against (silent drop in the loop).
     const target = path.join(tmpRoot, 'real-script.sh');
     fs.writeFileSync(target, '#!/bin/sh\necho real\n');
     const linkName = 'aliased.sh';
