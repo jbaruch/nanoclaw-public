@@ -477,11 +477,13 @@ const CLAUDE_PROJECT_SLUG = '-workspace-group';
 /**
  * Publish files from a tile's `<skill>/scripts/` source dir into the
  * group's flat `tmpScriptsDir`. The flat dir is reachable from agents
- * as `/workspace/group/scripts/<name>` — that contract has no place
- * for subdirectories, so any directory entry (e.g. Python's
- * `__pycache__/` written next to a `.py` script after the first
- * import) is skipped. Anything else (regular files, symlinks)
- * is copied with `fs.cpSync`'s default semantics.
+ * as `/workspace/group/scripts/<name>`, so the publish surface is
+ * regular files and symlinks to regular files — nothing else.
+ * Subdirectories (notably Python's `__pycache__/`, written next to a
+ * `.py` script after the first import) and any other dirent kind
+ * (FIFOs, sockets, devices, which `fs.cpSync` rejects anyway) are
+ * skipped via an explicit `isFile() || isSymbolicLink()` allowlist
+ * so the spawn never trips on a stray entry the runtime put there.
  *
  * No-op when the source dir doesn't exist (skill ships no scripts).
  *
@@ -490,7 +492,7 @@ const CLAUDE_PROJECT_SLUG = '-workspace-group';
 export function copyTileScriptsToFlatDir(srcDir: string, dstDir: string): void {
   if (!fs.existsSync(srcDir)) return;
   for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-    if (entry.isDirectory()) continue;
+    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
     fs.cpSync(path.join(srcDir, entry.name), path.join(dstDir, entry.name));
   }
 }

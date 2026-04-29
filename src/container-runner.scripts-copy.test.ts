@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -57,12 +58,14 @@ describe('copyTileScriptsToFlatDir', () => {
     );
   });
 
-  it('preserves symlink entries (regression guard from PR review)', () => {
-    // Pre-fix the loop walked names and let cpSync handle them; that
-    // included symlinks. Filter chosen as `!isDirectory()` rather than
-    // `isFile()` so a symlinked executable still publishes under
-    // /workspace/group/scripts/<name> instead of being silently
-    // dropped along with the actual __pycache__ crash fix.
+  it('does not drop symlink entries (regression guard from PR review)', () => {
+    // Pre-fix the loop walked names and let cpSync handle them, which
+    // included symlinks via cpSync's default deref-and-copy. The
+    // allowlist (`isFile() || isSymbolicLink()`) keeps that path open
+    // so a symlinked executable a tile ships under scripts/ still
+    // reaches /workspace/group/scripts/<name>. Asserting reachability
+    // and content — not symlink-ness on the destination — because
+    // cpSync's default semantics dereference symlinks during the copy.
     const target = path.join(tmpRoot, 'real-script.sh');
     fs.writeFileSync(target, '#!/bin/sh\necho real\n');
     const linkName = 'aliased.sh';
@@ -74,6 +77,22 @@ describe('copyTileScriptsToFlatDir', () => {
     expect(fs.readFileSync(path.join(dstDir, linkName), 'utf8')).toBe(
       '#!/bin/sh\necho real\n',
     );
+  });
+
+  it('skips a FIFO entry (allowlist guard)', () => {
+    // Anything that isn't a regular file or symlink would crash
+    // `fs.cpSync` with EINVAL and reintroduce the spawn-time crash
+    // class the original `__pycache__/` bug was in. FIFO is the
+    // cheapest non-{file,symlink,dir} kind to create cross-platform.
+    fs.writeFileSync(path.join(srcDir, 'normal.py'), 'normal');
+    const fifoPath = path.join(srcDir, 'channel.fifo');
+    // Node's fs has no mkfifo binding; shell out to the POSIX tool.
+    // Available on macOS and every CI Linux distro this repo targets.
+    execFileSync('mkfifo', [fifoPath]);
+
+    expect(() => copyTileScriptsToFlatDir(srcDir, dstDir)).not.toThrow();
+
+    expect(fs.readdirSync(dstDir).sort()).toEqual(['normal.py']);
   });
 
   it('is a no-op when the source dir does not exist', () => {
