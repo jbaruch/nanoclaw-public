@@ -36,9 +36,13 @@ const SWEEPABLE_FILENAME_RE = /^(\d+)-[A-Za-z0-9]+\.json$/;
  * `graceMs` keeps the sweep from racing the agent's drain on currently-
  * active containers — only files older than `graceMs` are eligible. The
  * sole caller today is the pre-spawn site in `buildVolumeMounts`, which
- * passes `0` (no live agent to race). The parameter remains exposed
- * because any future caller that wants to GC during a container's
- * lifetime needs it; an earlier draft of #287 included a per-write
+ * passes `IDLE_TIMEOUT` (30 min default): files older than the longest
+ * natural-respawn window are GC'd (those came from a previous container
+ * that drained them in-memory but couldn't unlink due to the RO mount,
+ * so they're confirmed-stale), but files newer than IDLE_TIMEOUT are
+ * preserved as potential unconsumed crash-recovery messages. The
+ * parameter remains exposed because any future caller may want a
+ * different window; an earlier draft of #287 included a per-write
  * sweep with a 60s grace, dropped after Copilot review surfaced the
  * race against long-running queries that don't drain mid-flight.
  *

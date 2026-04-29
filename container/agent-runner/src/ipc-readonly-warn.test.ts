@@ -25,9 +25,9 @@ describe('createReadonlyWarner (#287 EROFS visibility)', () => {
     w.warn('EROFS', 'third.json');
 
     // Only the first call must log — subsequent ones are silent so the
-    // IPC poll loop (which fires every IPC_POLL_INTERVAL ms for the
-    // entire lifetime of the container) doesn't bury the rest of the
-    // log stream.
+    // agent-runner's IPC poll loop (which fires every IPC_POLL_MS for
+    // the entire lifetime of the container) doesn't bury the rest of
+    // the log stream.
     expect(log).toHaveBeenCalledTimes(1);
   });
 
