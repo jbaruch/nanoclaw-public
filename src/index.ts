@@ -63,6 +63,7 @@ import {
 } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { initBotPool } from './channels/telegram.js';
+import { runIpcGcSafe } from './ipc-gc.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { ChannelType } from './text-styles.js';
@@ -1194,6 +1195,22 @@ async function main(): Promise<void> {
       );
     }
   }
+
+  // IPC GC (issue #47): drain the per-group `_consumed_inputs.log` the agent
+  // appends to and unlink the matching files in `input-default/` and
+  // `input-maintenance/`. Untrusted containers can't unlink their own
+  // consumed files (RO mount) so without this the dir grows without bound
+  // and every restart re-drains the whole backlog as one giant prompt.
+  // Startup pass also recovers any `.processing` leftover from a crashed
+  // prior run.
+  for (const group of Object.values(registeredGroups)) {
+    runIpcGcSafe(group.folder);
+  }
+  setInterval(() => {
+    for (const group of Object.values(registeredGroups)) {
+      runIpcGcSafe(group.folder);
+    }
+  }, 60_000);
 
   // Periodic tile update from registry (every 15 min)
   // Heartbeat runs in the container and can't call tessl update.

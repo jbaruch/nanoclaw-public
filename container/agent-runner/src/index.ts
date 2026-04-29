@@ -94,6 +94,14 @@ const IPC_INPUT_DIR = fs.existsSync(IPC_SESSION_INPUT_DIR)
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
+// Persistent log of input basenames this group has already consumed. Lives in
+// `messages/` because that dir is RW even for untrusted containers (input/ is
+// RO for untrusted — see `src/container-runner.ts:1311-1320`). The host GC
+// (`src/ipc-gc.ts`) drains this log to delete the matching files from
+// `input-default/` and `input-maintenance/`. Issue #47.
+const IPC_MESSAGES_DIR = '/workspace/ipc/messages';
+const IPC_CONSUMED_LOG = path.join(IPC_MESSAGES_DIR, '_consumed_inputs.log');
+
 /**
  * Did the latest assistant turn consist of only thinking blocks and
  * end with `stop_reason: end_turn`? That's the SDK-internal "model
@@ -391,25 +399,91 @@ function shouldClose(): boolean {
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
  * Tracks consumed files in memory so read-only mounts don't cause infinite loops.
+ *
+ * The Set is persisted across container restarts via `IPC_CONSUMED_LOG` —
+ * appended on every successful drain, replayed on agent startup by
+ * `loadConsumedInputs()`. Without this, untrusted containers (which mount
+ * `input/` read-only) re-drain every file ever written for their group on
+ * every restart. See issue #47.
  */
 const REPLY_TO_FILE = path.join(IPC_INPUT_DIR, '_reply_to');
 const consumedInputFiles = new Set<string>();
 
-function drainIpcInput(): string[] {
+interface ConsumedLogPaths {
+  consumedLog: string;
+  messagesDir: string;
+}
+
+interface DrainPaths extends ConsumedLogPaths {
+  inputDir: string;
+  replyToFile: string;
+}
+
+const DEFAULT_DRAIN_PATHS: DrainPaths = {
+  inputDir: IPC_INPUT_DIR,
+  replyToFile: REPLY_TO_FILE,
+  messagesDir: IPC_MESSAGES_DIR,
+  consumedLog: IPC_CONSUMED_LOG,
+};
+
+/**
+ * Replay the persisted consumed-input log into the in-memory Set on agent
+ * startup. Called once before the first `drainIpcInput()`. Tolerates a
+ * missing file (first run for this group).
+ *
+ * `consumed` and `paths` are exposed as optional injection points for tests.
+ * Production callers leave them at the defaults.
+ */
+export function loadConsumedInputs(
+  consumed: Set<string> = consumedInputFiles,
+  paths: ConsumedLogPaths = DEFAULT_DRAIN_PATHS,
+): number {
+  let raw: string;
   try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+    raw = fs.readFileSync(paths.consumedLog, 'utf-8');
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') {
+      log('No consumed-inputs log found (first run for this group)');
+      return 0;
+    }
+    throw e;
+  }
+  let loaded = 0;
+  for (const line of raw.split('\n')) {
+    const name = line.trim();
+    if (!name) continue;
+    if (!consumed.has(name)) {
+      consumed.add(name);
+      loaded++;
+    }
+  }
+  log(`Loaded ${loaded} entries from consumed-inputs log`);
+  return loaded;
+}
+
+export function drainIpcInputAt(
+  consumed: Set<string>,
+  paths: DrainPaths,
+): string[] {
+  try {
+    fs.mkdirSync(paths.inputDir, { recursive: true });
     const files = fs
-      .readdirSync(IPC_INPUT_DIR)
-      .filter((f) => f.endsWith('.json') && !f.startsWith('_script_result_') && !consumedInputFiles.has(f))
+      .readdirSync(paths.inputDir)
+      .filter((f) => f.endsWith('.json') && !f.startsWith('_script_result_') && !consumed.has(f))
       .sort();
 
     const messages: string[] = [];
+    const newlyConsumed: string[] = [];
     let latestReplyTo: string | undefined;
     for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
+      const filePath = path.join(paths.inputDir, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        consumedInputFiles.add(file);
+        if (!consumed.has(file)) {
+          consumed.add(file);
+          newlyConsumed.push(file);
+        }
         try { fs.unlinkSync(filePath); } catch (e: any) {
           if (e.code !== 'EROFS' && e.code !== 'EACCES' && e.code !== 'ENOENT') throw e;
         }
@@ -423,21 +497,48 @@ function drainIpcInput(): string[] {
         log(
           `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
         );
-        consumedInputFiles.add(file);
+        if (!consumed.has(file)) {
+          consumed.add(file);
+          newlyConsumed.push(file);
+        }
         try { fs.unlinkSync(filePath); } catch (e: any) {
           if (e.code !== 'EROFS' && e.code !== 'EACCES' && e.code !== 'ENOENT') throw e;
         }
       }
     }
+    // Persist newly-consumed basenames so a restart doesn't re-drain them.
+    // `messages/` is writable even on untrusted containers, but tolerate the
+    // RO/EACCES codes defensively to match the existing `unlinkSync` style.
+    if (newlyConsumed.length > 0) {
+      try {
+        fs.mkdirSync(paths.messagesDir, { recursive: true });
+        fs.appendFileSync(
+          paths.consumedLog,
+          newlyConsumed.map((n) => n + '\n').join(''),
+        );
+      } catch (e: unknown) {
+        const code = (e as NodeJS.ErrnoException)?.code;
+        if (code !== 'EROFS' && code !== 'EACCES' && code !== 'ENOENT') {
+          throw e;
+        }
+        log(
+          `Could not persist consumed-inputs log (${code}); restart will re-drain ${newlyConsumed.length} files`,
+        );
+      }
+    }
     // Write the latest replyToMessageId so the MCP server can pick it up
     if (latestReplyTo) {
-      try { fs.writeFileSync(REPLY_TO_FILE, latestReplyTo); } catch { /* ignore */ }
+      try { fs.writeFileSync(paths.replyToFile, latestReplyTo); } catch { /* ignore */ }
     }
     return messages;
   } catch (err) {
     log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
+}
+
+function drainIpcInput(): string[] {
+  return drainIpcInputAt(consumedInputFiles, DEFAULT_DRAIN_PATHS);
 }
 
 /**
@@ -1288,6 +1389,17 @@ async function main(): Promise<void> {
     fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
   } catch {
     /* ignore */
+  }
+
+  // Replay the persisted consumed-input log so we don't re-drain files this
+  // group already processed in a prior container run. Critical for untrusted
+  // groups whose `input/` mount is read-only (issue #47).
+  try {
+    loadConsumedInputs();
+  } catch (err) {
+    log(
+      `loadConsumedInputs failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   // Build initial prompt (drain any pending IPC messages too)
