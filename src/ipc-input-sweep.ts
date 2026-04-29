@@ -46,17 +46,24 @@ const SWEEPABLE_FILENAME_RE = /^(\d+)-[A-Za-z0-9]+\.json$/;
  * sweep with a 60s grace, dropped after Copilot review surfaced the
  * race against long-running queries that don't drain mid-flight.
  *
- * Returns the number of files unlinked. ENOENT (the dir doesn't exist
- * yet, or a file vanished between readdir and unlink — both benign
- * races on a busy IPC dir) is silently absorbed since seeing nothing
- * is the correct outcome. Other expected best-effort filesystem
- * errnos (`isExpectedFsError`: EACCES, EBUSY, EROFS, …) are logged at
- * WARN and continue so the sweep never blocks the message-delivery
- * path on a transient race. Any error outside that allowlist
- * (TypeError from a programming bug, EIO from hardware failure,
- * anything else) is deliberately rethrown — the orchestrator must
- * surface those at the call site rather than have the sweep silently
- * swallow a real bug.
+ * Returns the number of files unlinked. Error-handling contract:
+ *
+ * - `readdirSync` ENOENT (the dir doesn't exist yet, e.g. first spawn
+ *   for a group): silently absorbed; returns 0. Seeing nothing is the
+ *   correct outcome.
+ * - `readdirSync` other expected errnos (`isExpectedFsError`: EACCES,
+ *   EBUSY, EROFS, …): logged at WARN and returns 0 — the function
+ *   can't continue without an entry list, so it bows out cleanly.
+ * - `unlinkSync` ENOENT (a file vanished between readdir and unlink —
+ *   benign race with another sweep / agent): silently skipped; the
+ *   sweep continues to the next entry.
+ * - `unlinkSync` other expected errnos: logged at WARN; the sweep
+ *   continues to the next entry, and the unswept file remains on
+ *   disk for the next call.
+ * - Anything outside `isExpectedFsError` (TypeError from a programming
+ *   bug, EIO from hardware failure, anything else): deliberately
+ *   rethrown — the orchestrator must surface those at the call site
+ *   rather than have the sweep silently swallow a real bug.
  */
 export function sweepStaleInputs(
   sessionInputDir: string,

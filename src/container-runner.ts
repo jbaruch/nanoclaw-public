@@ -34,6 +34,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { isExpectedFsError } from './fs-errors.js';
 import { sweepStaleInputs } from './ipc-input-sweep.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
@@ -343,8 +344,22 @@ export function createFilteredDb(
     // RO-mount failure on a hypothetical regression to WAL mode. Done
     // AFTER the rename so a reader between the rename and this cleanup
     // sees a consistent (DB + sidecars) view at every moment.
+    //
+    // Best-effort: a permission glitch or transient FS error here must
+    // not fail the spawn — the new snapshot is already published. Only
+    // expected fs errnos are absorbed (a real bug like TypeError still
+    // propagates).
     for (const suffix of ['-wal', '-shm']) {
-      fs.rmSync(`${filteredPath}${suffix}`, { force: true });
+      const sidecarPath = `${filteredPath}${suffix}`;
+      try {
+        fs.rmSync(sidecarPath, { force: true });
+      } catch (err) {
+        if (!isExpectedFsError(err)) throw err;
+        logger.warn(
+          { err, sidecarPath },
+          'Failed to clean stale filtered-DB sidecar (best-effort, snapshot already published)',
+        );
+      }
     }
   } finally {
     // If the populate or rename threw, the temp file is leftover. Wipe
