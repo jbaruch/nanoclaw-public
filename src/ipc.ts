@@ -65,6 +65,23 @@ export interface IpcDeps {
     groupFolder: string,
     session: 'default' | 'maintenance' | 'all',
   ) => void;
+  /**
+   * Signal every currently-active container across all groups and sessions
+   * to wind down (write `_close` sentinels). Called by the post-promote
+   * tessl update handler after the registry pulls in new tile content so
+   * running containers respawn and pick up the fresh tiles on the next
+   * inbound message — without this, a long-lived container keeps the old
+   * skills/ snapshot it copied at spawn time until its 30-min idle
+   * timeout (issue #64).
+   *
+   * Implemented in `GroupQueue.closeAllActiveContainers()`. The dep is
+   * injected (not imported directly) for the same reason `nukeSession`
+   * is: ipc.ts mustn't reach into the orchestrator's queue singleton, and
+   * tests need to substitute a stub.
+   *
+   * Returns the number of containers signaled.
+   */
+  closeAllActiveContainers: () => number;
 }
 
 let ipcWatcherRunning = false;
@@ -1086,12 +1103,42 @@ export async function processTaskIpc(
                       );
                     } else {
                       const cleared = deleteAllSessions();
+                      // Close every currently-running container so it
+                      // respawns on the next inbound message with the
+                      // freshly-installed tile content. Without this,
+                      // a container that's mid-idle-loop right now keeps
+                      // its old skills/ snapshot until its 30-min idle
+                      // timeout fires (issue #64).
+                      //
+                      // Guarded because `closeAllActiveContainers()`
+                      // rethrows unexpected (non-fs) errors by contract.
+                      // Narrow to Error so non-Error throws propagate
+                      // (matches the `no-catch-all` /
+                      // `preserve-caught-error` rules in
+                      // `eslint.config.js`); logged at ERROR level so
+                      // bugs surface instead of being silently
+                      // swallowed.
+                      let closed = 0;
+                      let closeErr: Error | null = null;
+                      try {
+                        closed = deps.closeAllActiveContainers();
+                      } catch (e) {
+                        if (!(e instanceof Error)) throw e;
+                        closeErr = e;
+                        logger.error(
+                          { err: e, sessionsCleared: cleared },
+                          'closeAllActiveContainers threw an unexpected error during post-promote tessl update — sessions still cleared, but live containers will not respawn until idle timeout',
+                        );
+                      }
                       logger.info(
                         {
                           sessionsCleared: cleared,
+                          containersClosed: closed,
                           output: updateStdout.trim().slice(-200),
                         },
-                        'Post-promote tessl update completed — sessions cleared',
+                        closeErr
+                          ? 'Post-promote tessl update completed — sessions cleared, but signaling running containers to restart failed (will refresh on idle timeout)'
+                          : 'Post-promote tessl update completed — sessions cleared and running containers signaled to restart',
                       );
                     }
                   },

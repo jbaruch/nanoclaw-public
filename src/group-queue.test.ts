@@ -877,4 +877,245 @@ describe('GroupQueue', () => {
     expect(order).toEqual(['link-0', 'link-1', 'link-2']);
     expect(peakInFlight).toBe(1);
   });
+
+  // --- closeAllActiveContainers (issue #64: post-tessl-update restart) ---
+
+  it('closeAllActiveContainers writes _close to every active session across groups', async () => {
+    // One group with both default and maintenance running. After a
+    // post-promote tessl update finds new tile content, every active slot
+    // must get a close sentinel so the next inbound message respawns it
+    // with the new skills/ snapshot. (Pattern mirrors the existing
+    // closeStdin parallel-sessions test on this codebase — same harness
+    // limitation around interleaving multiple groups under
+    // vi.advanceTimersByTimeAsync.)
+    const fs = await import('fs');
+    const releases: Array<() => void> = [];
+
+    const makeBlockingTask = () =>
+      vi.fn(async () => {
+        await new Promise<void>((r) => releases.push(r));
+      });
+
+    queue.enqueueTask(
+      'group1@g.us',
+      'g1-default',
+      DEFAULT_SESSION_NAME,
+      makeBlockingTask(),
+    );
+    queue.enqueueTask(
+      'group1@g.us',
+      'g1-maint',
+      MAINTENANCE_SESSION_NAME,
+      makeBlockingTask(),
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // runTask flips active=true but clears process/groupFolder during its
+    // setup path in the test harness; re-register so the close path sees
+    // a non-null groupFolder (mirrors the closeStdin parallel-sessions
+    // test above).
+    for (const session of [DEFAULT_SESSION_NAME, MAINTENANCE_SESSION_NAME]) {
+      queue.registerProcess(
+        'group1@g.us',
+        session,
+        {} as unknown as import('child_process').ChildProcess,
+        `container-group1-${session}`,
+        'group1-folder',
+      );
+    }
+
+    const writeFileSync = vi.mocked(fs.default.writeFileSync);
+    writeFileSync.mockClear();
+
+    const signaled = queue.closeAllActiveContainers();
+
+    expect(signaled).toBe(2);
+
+    const closeWrites = writeFileSync.mock.calls
+      .map((c) => (typeof c[0] === 'string' ? c[0] : ''))
+      .filter((p) => p.endsWith('_close'));
+
+    expect(closeWrites).toHaveLength(2);
+    // Each (group, session) pair landed in its own per-session input dir.
+    expect(
+      closeWrites.some(
+        (p) => p.includes('group1-folder') && p.includes('input-default'),
+      ),
+    ).toBe(true);
+    expect(
+      closeWrites.some(
+        (p) => p.includes('group1-folder') && p.includes('input-maintenance'),
+      ),
+    ).toBe(true);
+
+    releases.forEach((r) => r());
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('closeAllActiveContainers skips slots that have never run', () => {
+    // Pure read against an untouched queue — no slots created, no writes
+    // expected. Guards against the "iterate map" path accidentally
+    // creating phantom entries (would leak memory) or writing _close
+    // sentinels into directories no container is reading.
+    const signaled = queue.closeAllActiveContainers();
+    expect(signaled).toBe(0);
+  });
+
+  it('closeAllActiveContainers skips inactive (crashed/cooling-down) slots', async () => {
+    // A slot whose container exited (active=false) MUST NOT receive a
+    // _close sentinel — there's no process to signal, and a stale
+    // sentinel on the next spawn forces an immediate exit before the new
+    // container can do useful work. The spawn path cleans these up via
+    // the staleClose unlink in `container-runner.ts`, but the cheaper
+    // guarantee is to not write the file in the first place.
+    const fs = await import('fs');
+    const releases: Array<() => void> = [];
+
+    queue.enqueueTask(
+      'live-group@g.us',
+      'live-task',
+      DEFAULT_SESSION_NAME,
+      vi.fn(async () => {
+        await new Promise<void>((r) => releases.push(r));
+      }),
+    );
+    // A second task that completes synchronously — by the time we call
+    // closeAllActiveContainers it should be back to inactive.
+    queue.enqueueTask(
+      'finished-group@g.us',
+      'done-task',
+      DEFAULT_SESSION_NAME,
+      vi.fn(async () => {
+        // Resolves immediately — slot transitions back to active=false.
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    queue.registerProcess(
+      'live-group@g.us',
+      DEFAULT_SESSION_NAME,
+      {} as unknown as import('child_process').ChildProcess,
+      'container-live',
+      'live-folder',
+    );
+
+    const writeFileSync = vi.mocked(fs.default.writeFileSync);
+    writeFileSync.mockClear();
+
+    const signaled = queue.closeAllActiveContainers();
+
+    // Only the still-blocking live-group should get a sentinel.
+    expect(signaled).toBe(1);
+    const closeWrites = writeFileSync.mock.calls
+      .map((c) => (typeof c[0] === 'string' ? c[0] : ''))
+      .filter((p) => p.endsWith('_close'));
+    expect(closeWrites).toHaveLength(1);
+    expect(closeWrites[0]).toContain('live-folder');
+    expect(closeWrites[0]).not.toContain('finished-folder');
+
+    releases.forEach((r) => r());
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('closeAllActiveContainers keeps going when one slot fails to write', async () => {
+    // A permission glitch on one group's input dir must not strand every
+    // other group on stale tile content — the loop logs the per-slot
+    // failure and continues so the rest of the fleet still gets the
+    // restart signal.
+    const fs = await import('fs');
+    const releases: Array<() => void> = [];
+
+    queue.enqueueTask(
+      'good-group@g.us',
+      'good-task',
+      DEFAULT_SESSION_NAME,
+      vi.fn(async () => {
+        await new Promise<void>((r) => releases.push(r));
+      }),
+    );
+    queue.enqueueTask(
+      'bad-group@g.us',
+      'bad-task',
+      DEFAULT_SESSION_NAME,
+      vi.fn(async () => {
+        await new Promise<void>((r) => releases.push(r));
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    queue.registerProcess(
+      'good-group@g.us',
+      DEFAULT_SESSION_NAME,
+      {} as unknown as import('child_process').ChildProcess,
+      'container-good',
+      'good-folder',
+    );
+    queue.registerProcess(
+      'bad-group@g.us',
+      DEFAULT_SESSION_NAME,
+      {} as unknown as import('child_process').ChildProcess,
+      'container-bad',
+      'bad-folder',
+    );
+
+    const writeFileSync = vi.mocked(fs.default.writeFileSync);
+    writeFileSync.mockClear();
+    // First call (bad-folder OR good-folder, depending on Map iteration
+    // order) throws an expected fs error; subsequent calls succeed. The
+    // implementation must catch the throw and keep iterating.
+    writeFileSync.mockImplementationOnce(() => {
+      const err = new Error('permission denied') as NodeJS.ErrnoException;
+      err.code = 'EACCES';
+      throw err;
+    });
+
+    const signaled = queue.closeAllActiveContainers();
+
+    // One write threw, one succeeded — signaled count reflects only the
+    // success.
+    expect(signaled).toBe(1);
+
+    releases.forEach((r) => r());
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('closeAllActiveContainers propagates unexpected (non-fs) errors', async () => {
+    // The error-handling rule forbids bare catch-alls — a TypeError or
+    // other programming bug from inside the loop must not be swallowed
+    // alongside expected fs errors. If it were, a regression in a helper
+    // (e.g. sessionInputDirName throws on a malformed sessionName) would
+    // be silently logged forever.
+    const fs = await import('fs');
+    const releases: Array<() => void> = [];
+
+    queue.enqueueTask(
+      'group@g.us',
+      'task',
+      DEFAULT_SESSION_NAME,
+      vi.fn(async () => {
+        await new Promise<void>((r) => releases.push(r));
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group@g.us',
+      DEFAULT_SESSION_NAME,
+      {} as unknown as import('child_process').ChildProcess,
+      'container',
+      'folder',
+    );
+
+    const writeFileSync = vi.mocked(fs.default.writeFileSync);
+    writeFileSync.mockClear();
+    writeFileSync.mockImplementationOnce(() => {
+      throw new TypeError('not a function');
+    });
+
+    expect(() => queue.closeAllActiveContainers()).toThrow(TypeError);
+
+    releases.forEach((r) => r());
+    await vi.advanceTimersByTimeAsync(10);
+  });
 });

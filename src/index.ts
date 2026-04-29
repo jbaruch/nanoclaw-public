@@ -1146,6 +1146,7 @@ async function main(): Promise<void> {
         );
       }
     },
+    closeAllActiveContainers: () => queue.closeAllActiveContainers(),
   });
   startSessionCleanup();
   queue.setProcessMessagesFn(processGroupMessages);
@@ -1185,9 +1186,51 @@ async function main(): Promise<void> {
           logger.warn({ error: err.message }, 'Periodic tessl update failed');
         } else if (stdout.includes('Updated')) {
           const cleared = deleteAllSessions();
+          // Companion to the on-demand `tessl_update` IPC handler in
+          // `ipc.ts`: any path that pulls new tile content into the
+          // registry must also signal currently-running containers to
+          // restart, otherwise they keep serving requests from the
+          // skills/.tessl/ snapshot they copied at spawn time until
+          // their 30-min idle timeout (issue #64).
+          //
+          // Wrapped because `closeAllActiveContainers()` rethrows
+          // unexpected (non-fs) errors by contract — without this guard,
+          // a programming bug surfacing through that path would propagate
+          // out of the `setInterval` callback as an uncaught exception
+          // and crash the orchestrator. Sessions stay cleared either way;
+          // we degrade to "containers will pick up new tiles on idle
+          // timeout" rather than taking the process down.
+          let closed = 0;
+          let closeErr: Error | null = null;
+          try {
+            closed = queue.closeAllActiveContainers();
+          } catch (e) {
+            // Narrow to Error instances (the only thing realistic
+            // production code throws). Non-Error throws (a bare string,
+            // `null`, etc.) are themselves a programming bug and
+            // propagate as uncaught exceptions, matching the
+            // `no-catch-all` / `preserve-caught-error` rules in
+            // `eslint.config.js`. This catch is the outer-boundary
+            // guard for an async callback — without it, an Error from
+            // the close path would terminate the orchestrator process;
+            // with it, sessions stay cleared and we degrade to
+            // "containers refresh on idle timeout."
+            if (!(e instanceof Error)) throw e;
+            closeErr = e;
+            logger.error(
+              { err: e, sessionsCleared: cleared },
+              'closeAllActiveContainers threw an unexpected error during periodic tessl update — sessions still cleared, but live containers will not respawn until idle timeout',
+            );
+          }
           logger.info(
-            { sessionsCleared: cleared, output: stdout.trim().slice(-200) },
-            'Periodic tessl update found new tiles — sessions cleared',
+            {
+              sessionsCleared: cleared,
+              containersClosed: closed,
+              output: stdout.trim().slice(-200),
+            },
+            closeErr
+              ? 'Periodic tessl update found new tiles — sessions cleared, but signaling running containers to restart failed (will refresh on idle timeout)'
+              : 'Periodic tessl update found new tiles — sessions cleared and running containers signaled to restart',
           );
         }
       },
