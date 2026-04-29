@@ -5,6 +5,23 @@ import * as os from 'os';
 import * as path from 'path';
 import { copyTileScriptsToFlatDir } from './container-runner.js';
 
+function mkfifoAvailable(): boolean {
+  // Probe by actually creating a FIFO in tmpdir — also exercises the
+  // filesystem's FIFO support, not just the binary's presence. If
+  // either is missing the test is irrelevant on this platform.
+  const probe = path.join(
+    os.tmpdir(),
+    `mkfifo-probe-${process.pid}-${Date.now()}`,
+  );
+  try {
+    execFileSync('mkfifo', [probe], { stdio: 'ignore' });
+    fs.rmSync(probe, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Standalone test file — no `vi.mock('fs')`. The companion
 // container-runner.test.ts mocks fs globally for security-critical
 // mount-construction assertions; here we need real fs to exercise the
@@ -81,21 +98,25 @@ describe('copyTileScriptsToFlatDir', () => {
     );
   });
 
-  it('skips a FIFO entry (allowlist guard)', () => {
-    // Anything that isn't a regular file or symlink would crash
-    // `fs.cpSync` with EINVAL and reintroduce the spawn-time crash
-    // class the original `__pycache__/` bug was in. FIFO is the
-    // cheapest non-{file,symlink,dir} kind to create cross-platform.
-    fs.writeFileSync(path.join(srcDir, 'normal.py'), 'normal');
-    const fifoPath = path.join(srcDir, 'channel.fifo');
-    // Node's fs has no mkfifo binding; shell out to the POSIX tool.
-    // Available on macOS and every CI Linux distro this repo targets.
-    execFileSync('mkfifo', [fifoPath]);
+  it.skipIf(!mkfifoAvailable())(
+    'skips a FIFO entry (allowlist guard)',
+    () => {
+      // Anything that isn't a regular file or symlink would crash
+      // `fs.cpSync` with EINVAL and reintroduce the spawn-time crash
+      // class the original `__pycache__/` bug was in. FIFO is the
+      // cheapest non-{file,symlink,dir} kind to create on POSIX;
+      // gated on `mkfifoAvailable()` so a minimal env (no mkfifo
+      // binary, FIFO-incapable fs) skips this case rather than fails.
+      fs.writeFileSync(path.join(srcDir, 'normal.py'), 'normal');
+      const fifoPath = path.join(srcDir, 'channel.fifo');
+      // Node's fs has no mkfifo binding; shell out to the POSIX tool.
+      execFileSync('mkfifo', [fifoPath]);
 
-    expect(() => copyTileScriptsToFlatDir(srcDir, dstDir)).not.toThrow();
+      expect(() => copyTileScriptsToFlatDir(srcDir, dstDir)).not.toThrow();
 
-    expect(fs.readdirSync(dstDir).sort()).toEqual(['normal.py']);
-  });
+      expect(fs.readdirSync(dstDir).sort()).toEqual(['normal.py']);
+    },
+  );
 
   it('is a no-op when the source dir does not exist', () => {
     const missing = path.join(tmpRoot, 'never-existed');
