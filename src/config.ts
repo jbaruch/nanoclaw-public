@@ -43,12 +43,44 @@ export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 
 // In DooD, process.getuid() returns the orchestrator container's uid (1000).
 // HOST_UID/HOST_GID env vars override this with the actual host user's uid/gid.
-export const HOST_UID = process.env.HOST_UID
-  ? parseInt(process.env.HOST_UID, 10)
-  : undefined;
-export const HOST_GID = process.env.HOST_GID
-  ? parseInt(process.env.HOST_GID, 10)
-  : undefined;
+//
+// Validation: a set-but-malformed value (`HOST_UID=foo`, `-1`, `1.5`,
+// `123abc`, or empty string) resolves to `undefined` here so
+// downstream chown sites fall through to their default branch
+// (Mac-host posture / chown to uid 1000) instead of forwarding the
+// malformed value into `fs.chownSync` — `NaN` throws there, `-1`
+// casts to uid 4294967295 and silently mis-owns. A stderr line
+// surfaces the operator typo at startup; without it, the misconfig
+// looks identical to "not running in DooD" and the original
+// permission issue (#258) is invisible.
+//
+// Stderr is used directly rather than `logger` because this runs at
+// module-evaluation time, before the orchestrator has wired any
+// logger sinks. Stderr is always available and doesn't pull config
+// into a tighter coupling with logger initialization order.
+//
+// Exported so unit tests can call it directly with mutated
+// `process.env`. Re-importing the module via `vi.resetModules()`
+// would re-execute logger.ts each pass and leak
+// `process.on('uncaughtException')` / `unhandledRejection` handlers
+// (Node defaults to a max of 10 before warning).
+export function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  // Strict digits-only match: `parseInt` would silently accept partial
+  // parses (`"123abc"` → 123, `"1.5"` → 1) and `!raw` would treat an
+  // explicit empty string as "unset" — both shapes are operator typos
+  // we want to surface, not absorb.
+  if (!/^\d+$/.test(raw)) {
+    process.stderr.write(
+      `[config] ${name}="${raw}" is not a non-negative integer — ignoring; chowns to host user will fall back to default uid/gid.\n`,
+    );
+    return undefined;
+  }
+  return parseInt(raw, 10);
+}
+export const HOST_UID = parseHostId('HOST_UID');
+export const HOST_GID = parseHostId('HOST_GID');
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH =
