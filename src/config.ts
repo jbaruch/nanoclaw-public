@@ -43,12 +43,32 @@ export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 
 // In DooD, process.getuid() returns the orchestrator container's uid (1000).
 // HOST_UID/HOST_GID env vars override this with the actual host user's uid/gid.
-export const HOST_UID = process.env.HOST_UID
-  ? parseInt(process.env.HOST_UID, 10)
-  : undefined;
-export const HOST_GID = process.env.HOST_GID
-  ? parseInt(process.env.HOST_GID, 10)
-  : undefined;
+//
+// Validation: a set-but-malformed value (`HOST_UID=foo` → NaN, or
+// `HOST_UID=-1`) becomes `undefined` here so downstream chown sites
+// fall through to their default branch (Mac-host posture / chown to
+// uid 1000) instead of forwarding the malformed value into
+// `fs.chownSync` — `NaN` throws there, `-1` casts to uid 4294967295
+// and silently mis-owns. A stderr warning surfaces the operator typo
+// at startup; without it, the misconfig looks identical to "not
+// running in DooD" and the original permission issue is invisible
+// (issue #258). Stderr (not the `logger`) keeps `config.ts` below
+// `logger.ts` in the import graph — same constraint
+// `resolveAgentAutoCompactWindow` documents above.
+function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    process.stderr.write(
+      `[config] ${name}="${raw}" is not a non-negative integer — ignoring; chowns to host user will fall back to default uid/gid.\n`,
+    );
+    return undefined;
+  }
+  return parsed;
+}
+export const HOST_UID = parseHostId('HOST_UID');
+export const HOST_GID = parseHostId('HOST_GID');
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH =
