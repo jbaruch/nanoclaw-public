@@ -9,6 +9,7 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
 // Mock config
 vi.mock('./config.js', () => ({
+  AGENT_AUTO_COMPACT_WINDOW: 800000,
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
   CONTAINER_TIMEOUT: 1800000, // 30min
@@ -463,5 +464,40 @@ describe('resolveAgentModel', () => {
     );
     expect(resolveAgentModel('\topus\n')).toBe('opus');
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+// ----------------------------------------------------------------------
+// CLAUDE_CODE_AUTO_COMPACT_WINDOW forwarding (#29).
+//
+// The orchestrator forwards the configured AGENT_AUTO_COMPACT_WINDOW
+// (default 800k) to the SDK via CLAUDE_CODE_AUTO_COMPACT_WINDOW. This
+// replaces the prior 165k hardcode in the agent-runner that clamped the
+// SDK's working window to ~16% of the paid-for 1M context window.
+// ----------------------------------------------------------------------
+
+describe('CLAUDE_CODE_AUTO_COMPACT_WINDOW forwarding', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('forwards CLAUDE_CODE_AUTO_COMPACT_WINDOW with the configured default', async () => {
+    const promise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    // The mock at the top sets AGENT_AUTO_COMPACT_WINDOW=800000. If
+    // this assertion ever drifts, every container could silently
+    // regress to whatever the previous default was — including the
+    // 165k upstream hardcode that motivated #29 in the first place.
+    expect(args).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000');
   });
 });

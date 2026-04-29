@@ -25,6 +25,7 @@ vi.mock('./config.js', () => ({
   // so tests don't need to match the host's uid.
   HOST_UID: 0,
   HOST_GID: 0,
+  AGENT_AUTO_COMPACT_WINDOW: 800000,
   CONTAINER_IMAGE: 'nanoclaw-agent:test',
   CONTAINER_MAX_OUTPUT_SIZE: 1_000_000,
   CONTAINER_TIMEOUT: 60_000,

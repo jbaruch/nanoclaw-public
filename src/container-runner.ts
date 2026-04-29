@@ -10,6 +10,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  AGENT_AUTO_COMPACT_WINDOW,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -1429,6 +1430,16 @@ function buildContainerArgs(
   // ship with an orchestrator rebuild only.
   args.push('-e', `AGENT_MODEL=${AGENT_MODEL}`);
   args.push('-e', `AGENT_EFFORT=${AGENT_EFFORT}`);
+
+  // SDK auto-compact working window (issue #29). Forwarded unconditionally:
+  // the orchestrator's resolved AGENT_AUTO_COMPACT_WINDOW config (default
+  // 800k) flows through to the SDK's CLAUDE_CODE_AUTO_COMPACT_WINDOW so
+  // auto-compaction has ~200k of headroom on Opus's 1M window. Replaces
+  // the previous 165k hardcode in the agent-runner.
+  args.push(
+    '-e',
+    `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${AGENT_AUTO_COMPACT_WINDOW}`,
+  );
 
   // Pass chat JID so container scripts know which group they're in
   if (chatJid) {

@@ -124,3 +124,52 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+// Model context window in tokens. Used as a soft upper bound on
+// AGENT_AUTO_COMPACT_WINDOW so an operator typo (extra zero) doesn't
+// silently push the SDK's auto-compact past the model's real ceiling.
+// Default 1,000,000 matches the Opus 1M context tier this fork runs on
+// by default. Override via MODEL_CONTEXT_WINDOW env var if running a
+// different model family.
+export const MODEL_CONTEXT_WINDOW = parseInt(
+  process.env.MODEL_CONTEXT_WINDOW || '1000000',
+  10,
+);
+
+// SDK auto-compact working window in tokens (issue #29). Forwarded to
+// the agent-runner as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` so the SDK's
+// auto-compact resolver clamps `min(model_default, this)` and uses it
+// as the working window before triggering a compaction pass.
+//
+// Default 800,000 leaves ~200k of compaction headroom on the 1M Opus
+// window. The previous hardcode of 165,000 (carried over from upstream
+// `qwibitai/nanoclaw@f77f9ce`) capped real-world heartbeat cycles at
+// ~16% of the paid-for context window — see #29.
+//
+// Validation: a non-numeric / non-positive value would forward as
+// `NaN`, which the SDK silently falls back from to its model default —
+// so the blast radius is limited, but a stderr warning surfaces
+// operator typos at startup rather than at first `query()` deep in
+// runtime. We use `process.stderr.write` (not `logger.warn`) because
+// config.ts is below logger.ts in the import graph and a logger import
+// would close a circular dep through host-logs.ts.
+const DEFAULT_AGENT_AUTO_COMPACT_WINDOW = 800_000;
+function resolveAgentAutoCompactWindow(): number {
+  const raw = process.env.AGENT_AUTO_COMPACT_WINDOW;
+  if (!raw) return DEFAULT_AGENT_AUTO_COMPACT_WINDOW;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `[config] AGENT_AUTO_COMPACT_WINDOW="${raw}" is not a positive integer — falling back to default ${DEFAULT_AGENT_AUTO_COMPACT_WINDOW}.\n`,
+    );
+    return DEFAULT_AGENT_AUTO_COMPACT_WINDOW;
+  }
+  if (parsed > MODEL_CONTEXT_WINDOW) {
+    process.stderr.write(
+      `[config] AGENT_AUTO_COMPACT_WINDOW=${parsed} exceeds MODEL_CONTEXT_WINDOW=${MODEL_CONTEXT_WINDOW} (likely an extra-zero typo) — falling back to default ${DEFAULT_AGENT_AUTO_COMPACT_WINDOW}.\n`,
+    );
+    return DEFAULT_AGENT_AUTO_COMPACT_WINDOW;
+  }
+  return parsed;
+}
+export const AGENT_AUTO_COMPACT_WINDOW = resolveAgentAutoCompactWindow();

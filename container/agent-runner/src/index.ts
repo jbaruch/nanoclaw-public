@@ -1268,10 +1268,15 @@ async function main(): Promise<void> {
 
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
-  const sdkEnv: Record<string, string | undefined> = {
-    ...process.env,
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
-  };
+  //
+  // CLAUDE_CODE_AUTO_COMPACT_WINDOW is forwarded by the orchestrator
+  // (`src/container-runner.ts`) from its resolved AGENT_AUTO_COMPACT_WINDOW
+  // config (issue #29). We deliberately do NOT default it here: a hardcoded
+  // fallback would silently mask a missing forward and reintroduce the bug
+  // — the previous 165k hardcode clamped the SDK's working window to ~16%
+  // of the paid-for 1M context. Whatever the orchestrator placed in
+  // process.env passes through `...process.env`.
+  const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
