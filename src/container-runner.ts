@@ -366,8 +366,24 @@ export function createFilteredDb(
     // it so retries don't accumulate `.tmp.<pid>.<rand>` cruft. Skip
     // when `published` is true: the rename moved the temp inode onto
     // the canonical path, so nothing is left at `tmpPath`.
+    //
+    // Best-effort: this finally runs both on success and on failure,
+    // and we MUST NOT mask the original error if cleanup itself
+    // throws. Catch expected fs errnos (the only kind we'd plausibly
+    // see on a temp file in our own scratch dir) and log; anything
+    // else still propagates so a real bug surfaces. The original
+    // error from the try block (if any) keeps bubbling because the
+    // catch swallows only the SECONDARY error from rmSync.
     if (!published) {
-      fs.rmSync(tmpPath, { force: true });
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch (err) {
+        if (!isExpectedFsError(err)) throw err;
+        logger.warn(
+          { err, tmpPath },
+          'Failed to clean filtered-DB temp file after build/rename failure (leaks one .tmp.<pid>.<rand> file)',
+        );
+      }
     }
   }
 
