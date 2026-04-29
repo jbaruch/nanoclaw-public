@@ -1216,14 +1216,25 @@ export function buildVolumeMounts(
     }
   }
 
-  // Wipe leftover IPC inputs from previous container lifecycles. The
-  // previous container's drain has already happened (or never will, if it
-  // crashed) and the fresh spawn will rebuild its initial-prompt context
-  // from the messages.db cursor. Without this, untrusted spawns inherit
-  // the entire backlog as their first prompt and cross the auto-compact
-  // threshold mid-query (issue #287). `graceMs = 0` is safe here — the
-  // previous container is gone and the new one isn't drained from yet.
-  sweepStaleInputs(sessionInputDir, 0);
+  // Wipe leftover IPC inputs from previous container lifecycles.
+  // Without this, untrusted spawns inherit the entire backlog as their
+  // first prompt and cross the auto-compact threshold mid-query — the
+  // exact #287 failure mode (a 1604-file pile poisoning the new
+  // session). graceMs is set to IDLE_TIMEOUT so files older than the
+  // longest natural-respawn window are GC'd (those came from a
+  // previous container that drained them in-memory but couldn't unlink
+  // due to the RO mount), while files newer than IDLE_TIMEOUT are
+  // preserved — they could plausibly be unconsumed crash-recovery
+  // messages: GroupQueue.sendMessage() writes the IPC file AND advances
+  // `lastAgentTimestamp` before the agent acks, so a container crash
+  // between write and drain would otherwise drop messages that no
+  // longer get re-pulled from the DB cursor. The trade-off accepted:
+  // some duplicate processing if an agent crashes within IDLE_TIMEOUT
+  // of having drained a file (rare and self-correcting — agent sees
+  // "you said X earlier") vs hard message loss (silent failure). An
+  // explicit ack channel from agent to host is the cleaner long-term
+  // fix and is filed as a follow-up to #287.
+  sweepStaleInputs(sessionInputDir, IDLE_TIMEOUT);
 
   if (isTrustedIpc) {
     fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });

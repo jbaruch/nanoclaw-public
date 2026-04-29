@@ -42,9 +42,13 @@ const SWEEPABLE_FILENAME_RE = /^(\d+)-[A-Za-z0-9]+\.json$/;
  * sweep with a 60s grace, dropped after Copilot review surfaced the
  * race against long-running queries that don't drain mid-flight.
  *
- * Returns the number of files unlinked. Errors during readdir are logged
- * and the function returns `0` rather than throwing — sweep failure must
- * not block the message-delivery path.
+ * Returns the number of files unlinked. Expected best-effort filesystem
+ * errnos (`isExpectedFsError`: ENOENT, EACCES, EBUSY, …) are logged and
+ * absorbed so the sweep never blocks the message-delivery path on a
+ * transient race. Any other error (TypeError from a programming bug, EIO
+ * from hardware failure, anything else outside the allowlist) is
+ * deliberately rethrown — the orchestrator must surface those at the
+ * call site rather than have the sweep silently swallow a real bug.
  */
 export function sweepStaleInputs(
   sessionInputDir: string,

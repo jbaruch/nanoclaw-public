@@ -701,10 +701,10 @@ describe('buildVolumeMounts — pre-spawn IPC sweep (#287)', () => {
     };
   }
 
-  it('sweeps stale IPC inputs from a previous container lifecycle', () => {
+  function seedInputDir(): string {
     // buildVolumeMounts calls fs.mkdirSync(sessionInputDir, { recursive: true })
-    // and only THEN runs the sweep. Pre-create the dir + a planted file so
-    // the sweep sees something to remove.
+    // and only THEN runs the sweep. Pre-create the dir so the sweep sees
+    // any planted files at scan time.
     const inputDir = path.join(
       DATA_DIR,
       'ipc',
@@ -715,15 +715,40 @@ describe('buildVolumeMounts — pre-spawn IPC sweep (#287)', () => {
     fs.mkdirSync(path.join(GROUPS_DIR, 'sweep-prespawn-test'), {
       recursive: true,
     });
+    return inputDir;
+  }
+
+  it('sweeps stale IPC inputs older than IDLE_TIMEOUT', () => {
+    // 11 days old — well past any plausible IDLE_TIMEOUT, so it qualifies
+    // as "previous container drained this in-memory but couldn't unlink
+    // due to the RO mount". Safe to GC.
+    const inputDir = seedInputDir();
     const plantedFile = path.join(
       inputDir,
       `${Date.now() - 999_999_999}-aaaa.json`,
     );
-    fs.writeFileSync(plantedFile, '{"type":"message","text":"unread"}');
-    expect(fs.existsSync(plantedFile)).toBe(true);
+    fs.writeFileSync(plantedFile, '{"type":"message","text":"old"}');
 
     buildVolumeMounts(makeUntrustedGroup(), false, 'sweep-prespawn@g.us');
 
     expect(fs.existsSync(plantedFile)).toBe(false);
+  });
+
+  it('preserves recent IPC inputs that may be unconsumed crash-recovery messages', () => {
+    // 1 second old — well within the IDLE_TIMEOUT grace window. Must be
+    // preserved: GroupQueue.sendMessage advances the cursor before the
+    // agent acks, so a container crash between write and drain would
+    // drop this message if we GC'd it on respawn (no longer pulled from
+    // DB cursor on next spawn).
+    const inputDir = seedInputDir();
+    const recentFile = path.join(
+      inputDir,
+      `${Date.now() - 1_000}-bbbb.json`,
+    );
+    fs.writeFileSync(recentFile, '{"type":"message","text":"recent"}');
+
+    buildVolumeMounts(makeUntrustedGroup(), false, 'sweep-recent@g.us');
+
+    expect(fs.existsSync(recentFile)).toBe(true);
   });
 });
