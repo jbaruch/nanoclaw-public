@@ -91,7 +91,11 @@ export interface TaskRunLog {
   task_id: string;
   run_at: string;
   duration_ms: number;
-  status: 'success' | 'error';
+  // 'timeout' was added by the per-task watchdog (#30 Part C) so the
+  // killed-by-watchdog failure mode is queryable separately from
+  // ordinary script/agent errors. Both still set `error` for `last_result`
+  // formatting; only the discriminator on `task_run_logs` differs.
+  status: 'success' | 'error' | 'timeout';
   result: string | null;
   error: string | null;
 }

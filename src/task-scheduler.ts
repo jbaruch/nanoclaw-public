@@ -8,6 +8,7 @@ import {
   runContainerAgent,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { stopContainer } from './container-runtime.js';
 import { MAINTENANCE_SESSION_NAME } from './group-queue.js';
 import {
   getAllTasks,
@@ -135,6 +136,30 @@ export const DORMANT_CRON_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
  * behaviour: a fresh operator deserves to see the current state.
  */
 export const DORMANT_WARN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Hard cap on a single `runTask` invocation. If the container hasn't
+ * produced a terminal status (success / error) by this point, the
+ * watchdog kills the container by name and records the outcome as
+ * `status='timeout'` in `task_run_logs`. Prevents the runaway pattern
+ * #30 documents: a container that streams output but never resolves
+ * keeps `runContainerAgent`'s output-resetting timeout fresh forever,
+ * so the slot stays "active" indefinitely and every queued task on
+ * that slot's group rots in `pendingTasks`.
+ *
+ * 30 min matches `CONTAINER_TIMEOUT`'s default — the longest a healthy
+ * scheduled task should ever run. Configurable via
+ * `NANOCLAW_TASK_RUN_TIMEOUT_MS` for ops who want a tighter cap.
+ */
+export const TASK_RUN_TIMEOUT_MS = (() => {
+  const raw = process.env.NANOCLAW_TASK_RUN_TIMEOUT_MS;
+  if (!raw) return 30 * 60 * 1000;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 30 * 60 * 1000;
+  }
+  return parsed;
+})();
 
 /**
  * Tracks the last time we logged a dormant warning per task id. Pruned
@@ -311,8 +336,47 @@ async function runTask(
     }, TASK_CLOSE_DELAY_MS);
   };
 
+  // Per-task watchdog (#30 Part C): if `runContainerAgent` hasn't
+  // resolved within TASK_RUN_TIMEOUT_MS, kill the container by name and
+  // surface the result as `status='timeout'`. Container-runner already
+  // has an output-resetting idle timeout, but a container that
+  // continuously streams partial output (or silently spins) can keep
+  // resetting it forever. The watchdog is a hard cap regardless of
+  // output activity. The captured `containerName` comes from
+  // `onProcess`, which container-runner invokes as soon as the spawn
+  // returns — by the time the watchdog could ever fire, this is set.
+  let runningContainerName: string | null = null;
+  let watchdogFired = false;
+  // Sentinel symbol the watchdog races against the runContainerAgent
+  // promise. Using a unique symbol (not a string) means a malicious
+  // container that returned the literal string by accident can't be
+  // mistaken for a watchdog hit.
+  const WATCHDOG_TIMEOUT = Symbol('watchdogTimeout');
+  let watchdogResolve: (v: typeof WATCHDOG_TIMEOUT) => void;
+  const watchdogPromise = new Promise<typeof WATCHDOG_TIMEOUT>((resolve) => {
+    watchdogResolve = resolve;
+  });
+  const watchdogTimer = setTimeout(() => {
+    watchdogFired = true;
+    const timeoutMin = Math.round(TASK_RUN_TIMEOUT_MS / 60_000);
+    logger.error(
+      {
+        taskId: task.id,
+        groupFolder: task.group_folder,
+        containerName: runningContainerName,
+        timeoutMs: TASK_RUN_TIMEOUT_MS,
+      },
+      'Task watchdog: killing container after hard timeout',
+    );
+    if (runningContainerName) {
+      stopContainer(runningContainerName);
+    }
+    error = `task watchdog: killed container after ${timeoutMin}min`;
+    watchdogResolve(WATCHDOG_TIMEOUT);
+  }, TASK_RUN_TIMEOUT_MS);
+
   try {
-    const output = await runContainerAgent(
+    const containerPromise = runContainerAgent(
       group,
       {
         prompt: task.prompt,
@@ -339,14 +403,16 @@ async function runTask(
         // if a stringification slipped in.
         continuationCycleId: task.continuation_cycle_id ?? undefined,
       },
-      (proc, containerName) =>
+      (proc, containerName) => {
+        runningContainerName = containerName;
         deps.onProcess(
           task.chat_jid,
           MAINTENANCE_SESSION_NAME,
           proc,
           containerName,
           task.group_folder,
-        ),
+        );
+      },
       async (streamedOutput: ContainerOutput) => {
         // Persist the maintenance session's own sessionId so the NEXT
         // scheduled task on this group can resume the same chain. Only
@@ -389,27 +455,38 @@ async function runTask(
       },
     );
 
+    // Race the container's natural completion against the watchdog.
+    // If the watchdog wins, `containerPromise` is left to settle in the
+    // background — runContainerAgent's own cleanup hooks (the
+    // `container.on('close')` path that fires after `stopContainer`)
+    // will eventually run. We don't await it because by definition the
+    // process is wedged from runTask's perspective.
+    const raced = await Promise.race([containerPromise, watchdogPromise]);
+    clearTimeout(watchdogTimer);
     if (closeTimer) clearTimeout(closeTimer);
 
-    // Same write-back path for the terminal `output` (non-streaming case).
-    // Same `'group'`-only gate as the streaming path above — don't let an
-    // isolated task overwrite the maintenance slot's session chain.
-    if (output.newSessionId && task.context_mode === 'group') {
-      const groupSessions =
-        sessions[task.group_folder] ?? (sessions[task.group_folder] = {});
-      groupSessions[MAINTENANCE_SESSION_NAME] = output.newSessionId;
-      setSession(
-        task.group_folder,
-        MAINTENANCE_SESSION_NAME,
-        output.newSessionId,
-      );
-    }
+    if (raced !== WATCHDOG_TIMEOUT) {
+      const output = raced;
+      // Same write-back path for the terminal `output` (non-streaming case).
+      // Same `'group'`-only gate as the streaming path above — don't let an
+      // isolated task overwrite the maintenance slot's session chain.
+      if (output.newSessionId && task.context_mode === 'group') {
+        const groupSessions =
+          sessions[task.group_folder] ?? (sessions[task.group_folder] = {});
+        groupSessions[MAINTENANCE_SESSION_NAME] = output.newSessionId;
+        setSession(
+          task.group_folder,
+          MAINTENANCE_SESSION_NAME,
+          output.newSessionId,
+        );
+      }
 
-    if (output.status === 'error') {
-      error = output.error || 'Unknown error';
-    } else if (output.result) {
-      // Result was already forwarded to the user via the streaming callback above
-      result = output.result;
+      if (output.status === 'error') {
+        error = output.error || 'Unknown error';
+      } else if (output.result) {
+        // Result was already forwarded to the user via the streaming callback above
+        result = output.result;
+      }
     }
 
     logger.info(
@@ -417,8 +494,14 @@ async function runTask(
       'Task completed',
     );
   } catch (err) {
+    clearTimeout(watchdogTimer);
     if (closeTimer) clearTimeout(closeTimer);
-    error = err instanceof Error ? err.message : String(err);
+    // Watchdog already set `error` to the timeout message; preserve it
+    // — the underlying `runContainerAgent` rejection here is just the
+    // post-kill cleanup (e.g. spawn child exit), not the root cause.
+    if (!watchdogFired) {
+      error = err instanceof Error ? err.message : String(err);
+    }
     logger.error({ taskId: task.id, error }, 'Task failed');
   }
 
@@ -453,11 +536,21 @@ async function runTask(
   // Atomic: write the task_run_logs row AND update scheduled_tasks in a
   // single SQLite transaction. This enforces the single-writer invariant
   // that every last_run write is paired with a run-log row (closes #17).
+  // Watchdog-fired runs are recorded as `'timeout'` (not `'error'`) so
+  // the failure mode is queryable separately from script/agent errors —
+  // #30 Part C distinguishes "the agent took too long" from "the agent
+  // returned an error". Both still set `error` so `last_result` is
+  // populated; only the `task_run_logs.status` enum differs.
+  const runStatus: 'success' | 'error' | 'timeout' = watchdogFired
+    ? 'timeout'
+    : error
+      ? 'error'
+      : 'success';
   logAndUpdateTask(
     {
       task_id: task.id,
       duration_ms: durationMs,
-      status: error ? 'error' : 'success',
+      status: runStatus,
       result,
       error,
     },

@@ -54,6 +54,7 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  logTaskRun,
 } from './db.js';
 import {
   DEFAULT_SESSION_NAME,
@@ -117,6 +118,10 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+// Wire the dispatch-loss watchdog (#30 Part B): the queue
+// records dropped tasks via task_run_logs so a wedged slot surfaces
+// as an error row instead of a silent loss.
+queue.setLogTaskRunFn(logTaskRun);
 
 // Circuit breaker: pause groups that fail repeatedly to avoid burning credits.
 const MAX_CONSECUTIVE_FAILURES = 5;

@@ -720,6 +720,31 @@ export async function processTaskIpc(
             );
             break;
           }
+          // Reject past once-schedules at creation time. Without this,
+          // the row lands in the DB with `next_run` already in the past,
+          // the scheduler picks it up on the next tick, pre-advances it
+          // to status='completed' (the once-task path in startSchedulerLoop
+          // marks completed BEFORE dispatch), and if dispatch then drops
+          // (wedged maintenance slot, host crash) the task is silently
+          // gone — recorded as completed, but never actually ran.
+          // Closes #30 Part A: catch the highest-signal user-facing case
+          // (typo / TZ confusion) at the IPC boundary so the caller
+          // learns immediately the schedule didn't take.
+          const nowMs = Date.now();
+          if (date.getTime() <= nowMs) {
+            logger.warn(
+              {
+                taskId: data.taskId,
+                sourceGroup,
+                targetFolder,
+                scheduleValue: data.schedule_value,
+                parsedAt: date.toISOString(),
+                nowAt: new Date(nowMs).toISOString(),
+              },
+              'Rejecting once-task: schedule_value is in the past — once-tasks must be scheduled in the future',
+            );
+            break;
+          }
           nextRun = date.toISOString();
         }
 

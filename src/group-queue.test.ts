@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 import {
   DEFAULT_SESSION_NAME,
+  DISPATCH_SWEEP_INTERVAL_MS,
   GroupQueue,
   MAINTENANCE_SESSION_NAME,
 } from './group-queue.js';
@@ -946,5 +947,105 @@ describe('GroupQueue', () => {
 
     expect(order).toEqual(['link-0', 'link-1', 'link-2']);
     expect(peakInFlight).toBe(1);
+  });
+
+  // --- Dispatch-loss watchdog (#30 Part B) ---
+
+  describe('dispatch-loss watchdog', () => {
+    it('drops stale pending tasks past threshold and writes task_run_logs row', async () => {
+      // Saturate the slot with an active container, then enqueue a second
+      // task into the same slot — it lands in pendingTasks. Without a
+      // running container draining the slot, the entry sits there
+      // forever. Pre-fix that meant a silent loss; post-fix the sweep
+      // surfaces it as a task_run_logs row.
+      let releaseFirst: () => void;
+      const firstRunning = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const firstFn = vi.fn(async () => {
+        await firstRunning;
+      });
+      queue.enqueueTask(
+        'group1@g.us',
+        'task-running',
+        MAINTENANCE_SESSION_NAME,
+        firstFn,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      const secondFn = vi.fn(async () => {});
+      queue.enqueueTask(
+        'group1@g.us',
+        'task-stuck',
+        MAINTENANCE_SESSION_NAME,
+        secondFn,
+      );
+      // Second task is in pendingTasks now (slot active).
+
+      const logSpy = vi.fn();
+      const SHORT_THRESHOLD_MS = 1000;
+      queue._startDispatchSweepForTests(SHORT_THRESHOLD_MS, logSpy);
+
+      // Advance past threshold + one sweep tick. advanceTimersByTimeAsync
+      // also fires the setInterval-driven sweep at DISPATCH_SWEEP_INTERVAL_MS.
+      await vi.advanceTimersByTimeAsync(
+        SHORT_THRESHOLD_MS + DISPATCH_SWEEP_INTERVAL_MS + 100,
+      );
+
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      const arg = logSpy.mock.calls[0][0];
+      expect(arg.task_id).toBe('task-stuck');
+      expect(arg.status).toBe('error');
+      expect(arg.duration_ms).toBe(0);
+      expect(arg.result).toMatch(/maintenance slot wedged/);
+      expect(arg.error).toMatch(/maintenance slot wedged/);
+
+      // The first task's fn was invoked (it's running, not in pendingTasks),
+      // and the stuck second task's fn must NOT have been invoked — it was
+      // dropped, not drained.
+      expect(firstFn).toHaveBeenCalledTimes(1);
+      expect(secondFn).not.toHaveBeenCalled();
+
+      // Release the first task so the test cleanly tears down.
+      releaseFirst!();
+      await vi.advanceTimersByTimeAsync(20);
+    });
+
+    it('does not drop fresh pending tasks below threshold', async () => {
+      let releaseFirst: () => void;
+      const firstRunning = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const firstFn = vi.fn(async () => {
+        await firstRunning;
+      });
+      queue.enqueueTask(
+        'group1@g.us',
+        'task-running',
+        MAINTENANCE_SESSION_NAME,
+        firstFn,
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      const secondFn = vi.fn(async () => {});
+      queue.enqueueTask(
+        'group1@g.us',
+        'task-fresh',
+        MAINTENANCE_SESSION_NAME,
+        secondFn,
+      );
+
+      const logSpy = vi.fn();
+      const LONG_THRESHOLD_MS = 30 * 60 * 1000;
+      queue._startDispatchSweepForTests(LONG_THRESHOLD_MS, logSpy);
+
+      // One sweep tick, but task is well below threshold.
+      await vi.advanceTimersByTimeAsync(DISPATCH_SWEEP_INTERVAL_MS + 100);
+
+      expect(logSpy).not.toHaveBeenCalled();
+
+      releaseFirst!();
+      await vi.advanceTimersByTimeAsync(20);
+    });
   });
 });

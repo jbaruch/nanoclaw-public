@@ -8,13 +8,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // `vi.hoisted` is required because `vi.mock(...)` itself is hoisted to
 // the top of the file — a plain top-level `const` would be accessed
 // before initialisation inside the factory.
-const { mockRunContainerAgent } = vi.hoisted(() => ({
+const { mockRunContainerAgent, mockStopContainer } = vi.hoisted(() => ({
   mockRunContainerAgent: vi.fn(),
+  mockStopContainer: vi.fn(),
 }));
 vi.mock('./container-runner.js', () => ({
   runContainerAgent: mockRunContainerAgent,
   writeTasksSnapshot: vi.fn(),
   DEFAULT_SESSION_NAME: 'default',
+}));
+vi.mock('./container-runtime.js', () => ({
+  stopContainer: mockStopContainer,
 }));
 
 import {
@@ -35,6 +39,7 @@ import {
   DORMANT_CRON_THRESHOLD_MS,
   DORMANT_WARN_COOLDOWN_MS,
   PRUNE_INTERVAL_MS,
+  TASK_RUN_TIMEOUT_MS,
   _resetSchedulerLoopForTests,
   computeNextRun,
   getCompletedTaskTtlMs,
@@ -49,6 +54,7 @@ describe('task scheduler', () => {
     _initTestDatabase();
     _resetSchedulerLoopForTests();
     mockRunContainerAgent.mockClear();
+    mockStopContainer.mockClear();
     vi.useFakeTimers();
   });
 
@@ -1690,5 +1696,87 @@ describe('task scheduler', () => {
     const logs = getTaskRunLogs('clean-success-task');
     expect(logs).toHaveLength(1);
     expect(logs[0].status).toBe('success');
+  });
+
+  // --- Per-task watchdog (#30 Part C) ---
+
+  it('kills container and records status=timeout when runTask exceeds TASK_RUN_TIMEOUT_MS', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2099-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'hanging-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'hangs forever',
+      schedule_type: 'once',
+      schedule_value: '2099-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2099-01-01T00:00:00.000Z',
+    });
+
+    // The mock invokes onProcess so the watchdog captures the container
+    // name, then returns a never-resolving promise — pre-fix this would
+    // wedge `runTask` indefinitely; post-fix the watchdog kills it.
+    mockRunContainerAgent.mockImplementation(async (_group, _input, onProc) => {
+      onProc({} as never, 'nanoclaw-main-maintenance-test-container');
+      return new Promise(() => {
+        /* never resolves */
+      });
+    });
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        // Don't await — the runTask promise will never resolve naturally
+        // until the watchdog fires, but `fn()` returns immediately at
+        // the watchdog timeout because the watchdog sets `error` and
+        // the catch path completes synchronously with the rejection.
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    // Advance past the watchdog threshold.
+    await vi.advanceTimersByTimeAsync(TASK_RUN_TIMEOUT_MS + 1000);
+
+    // Watchdog must have called stopContainer with the captured name.
+    expect(mockStopContainer).toHaveBeenCalledWith(
+      'nanoclaw-main-maintenance-test-container',
+    );
+
+    // task_run_logs row must record status='timeout' with the
+    // 'task watchdog: killed container' marker in the error.
+    const logs = getTaskRunLogs('hanging-task');
+    expect(logs.length).toBe(1);
+    expect(logs[0].status).toBe('timeout');
+    expect(logs[0].error).toMatch(/task watchdog: killed container/);
+    expect(logs[0].duration_ms).toBeGreaterThanOrEqual(TASK_RUN_TIMEOUT_MS);
+
+    // The scheduled_tasks row's last_run must be set so resurrect
+    // doesn't re-fire the timed-out task on the next loop.
+    const finalTask = getTaskById('hanging-task');
+    expect(finalTask?.last_run).toBeTruthy();
+    // Once-task → status flips to 'completed' since computeNextRun
+    // returns null (logAndUpdateTask CASE).
+    expect(finalTask?.status).toBe('completed');
   });
 });

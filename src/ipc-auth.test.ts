@@ -79,7 +79,7 @@ describe('schedule_task authorization', () => {
         type: 'schedule_task',
         prompt: 'do something',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         targetJid: 'other@g.us',
       },
       'whatsapp_main',
@@ -99,7 +99,7 @@ describe('schedule_task authorization', () => {
         type: 'schedule_task',
         prompt: 'self task',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         targetJid: 'other@g.us',
       },
       'other-group',
@@ -118,7 +118,7 @@ describe('schedule_task authorization', () => {
         type: 'schedule_task',
         prompt: 'unauthorized',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         targetJid: 'main@g.us',
       },
       'other-group',
@@ -136,7 +136,7 @@ describe('schedule_task authorization', () => {
         type: 'schedule_task',
         prompt: 'no target',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         targetJid: 'unknown@g.us',
       },
       'whatsapp_main',
@@ -159,9 +159,9 @@ describe('pause_task authorization', () => {
       chat_jid: 'main@g.us',
       prompt: 'main task',
       schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00',
+      schedule_value: '2099-01-01T00:00:00',
       context_mode: 'isolated',
-      next_run: '2025-06-01T00:00:00.000Z',
+      next_run: '2099-01-01T00:00:00.000Z',
       status: 'active',
       created_at: '2024-01-01T00:00:00.000Z',
     });
@@ -171,9 +171,9 @@ describe('pause_task authorization', () => {
       chat_jid: 'other@g.us',
       prompt: 'other task',
       schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00',
+      schedule_value: '2099-01-01T00:00:00',
       context_mode: 'isolated',
-      next_run: '2025-06-01T00:00:00.000Z',
+      next_run: '2099-01-01T00:00:00.000Z',
       status: 'active',
       created_at: '2024-01-01T00:00:00.000Z',
     });
@@ -220,9 +220,9 @@ describe('resume_task authorization', () => {
       chat_jid: 'other@g.us',
       prompt: 'paused task',
       schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00',
+      schedule_value: '2099-01-01T00:00:00',
       context_mode: 'isolated',
-      next_run: '2025-06-01T00:00:00.000Z',
+      next_run: '2099-01-01T00:00:00.000Z',
       status: 'paused',
       created_at: '2024-01-01T00:00:00.000Z',
     });
@@ -269,7 +269,7 @@ describe('cancel_task authorization', () => {
       chat_jid: 'other@g.us',
       prompt: 'cancel me',
       schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00',
+      schedule_value: '2099-01-01T00:00:00',
       context_mode: 'isolated',
       next_run: null,
       status: 'active',
@@ -292,7 +292,7 @@ describe('cancel_task authorization', () => {
       chat_jid: 'other@g.us',
       prompt: 'my task',
       schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00',
+      schedule_value: '2099-01-01T00:00:00',
       context_mode: 'isolated',
       next_run: null,
       status: 'active',
@@ -315,7 +315,7 @@ describe('cancel_task authorization', () => {
       chat_jid: 'main@g.us',
       prompt: 'not yours',
       schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00',
+      schedule_value: '2099-01-01T00:00:00',
       context_mode: 'isolated',
       next_run: null,
       status: 'active',
@@ -559,6 +559,50 @@ describe('schedule_task schedule types', () => {
 
     expect(getAllTasks()).toHaveLength(0);
   });
+
+  // Closes #30 Part A: a parseable timestamp that's already past must be
+  // rejected at the IPC boundary so the caller learns the schedule didn't
+  // take BEFORE the row lands in the DB and gets pre-advanced to
+  // 'completed' by the scheduler's next tick (which would silently drop
+  // it if dispatch then fails).
+  it('rejects once-task scheduled in the past', async () => {
+    const pastIso = new Date(Date.now() - 60_000).toISOString();
+    await processTaskIpc(
+      {
+        type: 'schedule_task',
+        prompt: 'past once',
+        schedule_type: 'once',
+        schedule_value: pastIso,
+        targetJid: 'other@g.us',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    expect(getAllTasks()).toHaveLength(0);
+  });
+
+  it('rejects once-task whose schedule equals current time', async () => {
+    // Equal-to-now must also be rejected: by the time the scheduler ticks
+    // (SCHEDULER_POLL_INTERVAL later), the row would be due and the same
+    // pre-advance-then-drop window applies.
+    const nowIso = new Date(Date.now()).toISOString();
+    await processTaskIpc(
+      {
+        type: 'schedule_task',
+        prompt: 'now once',
+        schedule_type: 'once',
+        schedule_value: nowIso,
+        targetJid: 'other@g.us',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    expect(getAllTasks()).toHaveLength(0);
+  });
 });
 
 // --- context_mode defaulting ---
@@ -570,7 +614,7 @@ describe('schedule_task context_mode', () => {
         type: 'schedule_task',
         prompt: 'group context',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         context_mode: 'group',
         targetJid: 'other@g.us',
       },
@@ -589,7 +633,7 @@ describe('schedule_task context_mode', () => {
         type: 'schedule_task',
         prompt: 'isolated context',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         context_mode: 'isolated',
         targetJid: 'other@g.us',
       },
@@ -608,7 +652,7 @@ describe('schedule_task context_mode', () => {
         type: 'schedule_task',
         prompt: 'bad context',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         context_mode: 'bogus' as any,
         targetJid: 'other@g.us',
       },
@@ -627,7 +671,7 @@ describe('schedule_task context_mode', () => {
         type: 'schedule_task',
         prompt: 'no context mode',
         schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00',
+        schedule_value: '2099-01-01T00:00:00',
         targetJid: 'other@g.us',
       },
       'whatsapp_main',

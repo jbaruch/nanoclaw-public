@@ -28,10 +28,54 @@ interface QueuedTask {
   groupJid: string;
   sessionName: string;
   fn: () => Promise<void>;
+  /**
+   * Wall-clock ms when this task was first added to `pendingTasks`. The
+   * dispatch-loss watchdog (#30 Part B) uses it to drop tasks that have
+   * been waiting longer than `DISPATCH_DROP_THRESHOLD_MS` — typically
+   * because the slot's container has wedged. Set once at enqueue time.
+   */
+  enqueuedAt: number;
 }
 
 const MAX_RETRIES = 5;
 const BASE_RETRY_MS = 5000;
+
+/**
+ * Threshold past which a task sitting in `pendingTasks` is considered
+ * undeliverable. 30 min matches `CONTAINER_TIMEOUT`'s default
+ * (`config.ts`) — a slot whose container has been "active" longer than
+ * that window has either lost its watchdog or is genuinely wedged.
+ * Either way the queued task isn't going to drain naturally; surfacing
+ * it as a `task_run_logs` row with `status='error'` lets the user-
+ * visible task watchdog see the failure instead of leaving the row in
+ * the silent dropped-dispatch shape #30 documents.
+ */
+export const DISPATCH_DROP_THRESHOLD_MS = 30 * 60 * 1000;
+
+/**
+ * Cadence at which the queue scans `pendingTasks` for stale entries.
+ * 60s is short enough that a freshly-wedged slot surfaces within a
+ * minute of crossing the threshold, long enough that the sweep itself
+ * stays cheap (one pass over a list that's almost always empty).
+ */
+export const DISPATCH_SWEEP_INTERVAL_MS = 60 * 1000;
+
+/**
+ * Shape of the task_run_logs writer the dispatch-loss sweep calls. Kept
+ * structural so the queue stays decoupled from `./db.js` — tests can
+ * inject a spy without spinning up SQLite, the orchestrator wires the
+ * real `logTaskRun` at startup. Mirrors `db.ts`'s `TaskRunLog` shape.
+ */
+export interface DispatchDropLogger {
+  (log: {
+    task_id: string;
+    run_at: string;
+    duration_ms: number;
+    status: 'success' | 'error' | 'timeout';
+    result: string | null;
+    error: string | null;
+  }): void;
+}
 
 interface GroupState {
   groupJid: string;
@@ -89,6 +133,108 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  // Dispatch-loss watchdog hook + sweep handle. Until the orchestrator
+  // wires the real `logTaskRun` via `setLogTaskRunFn`, the sweep is a
+  // no-op — keeps unit tests for the queue from needing a SQLite db.
+  private logTaskRunFn: DispatchDropLogger | null = null;
+  private dispatchSweepTimer: ReturnType<typeof setInterval> | null = null;
+  // Threshold + cadence are instance fields so tests can override.
+  private dispatchDropThresholdMs: number = DISPATCH_DROP_THRESHOLD_MS;
+
+  /**
+   * Wire the task_run_logs writer used by the dispatch-loss watchdog
+   * (#30 Part B). Call once at orchestrator startup with the real
+   * `logTaskRun` from `./db.js`. Also starts the periodic sweep — until
+   * this is called, no sweep runs and stale `pendingTasks` entries sit
+   * silently (the same pre-fix shape, but only during the brief window
+   * before init completes, which is acceptable).
+   */
+  setLogTaskRunFn(fn: DispatchDropLogger): void {
+    this.logTaskRunFn = fn;
+    if (this.dispatchSweepTimer === null && !this.shuttingDown) {
+      this.dispatchSweepTimer = setInterval(
+        () => this.sweepStalePendingTasks(),
+        DISPATCH_SWEEP_INTERVAL_MS,
+      );
+    }
+  }
+
+  /**
+   * @internal — for tests only. Override the dispatch-drop threshold and
+   * start a sweep timer with the supplied logger. Lets tests verify the
+   * watchdog without waiting 30 real minutes.
+   */
+  _startDispatchSweepForTests(
+    thresholdMs: number,
+    fn: DispatchDropLogger,
+  ): void {
+    this.dispatchDropThresholdMs = thresholdMs;
+    this.logTaskRunFn = fn;
+    if (this.dispatchSweepTimer !== null) {
+      clearInterval(this.dispatchSweepTimer);
+    }
+    this.dispatchSweepTimer = setInterval(
+      () => this.sweepStalePendingTasks(),
+      DISPATCH_SWEEP_INTERVAL_MS,
+    );
+  }
+
+  /**
+   * Scan every slot's `pendingTasks` and drop any task that has been
+   * waiting longer than `dispatchDropThresholdMs`. Records a synthetic
+   * `task_run_logs` row per drop so observers (lombot's task_watchdog,
+   * `getTaskRunLogs`) see the failure instead of nothing. The
+   * `pendingTasks` entry is removed so it can't be drained later as a
+   * stale ghost.
+   *
+   * Why a sweep instead of per-enqueue check: a task enqueued BEFORE
+   * the slot wedged would never re-trigger the per-enqueue path; only a
+   * periodic sweep covers it. Sweep does NOT touch `scheduled_tasks`
+   * itself — the once-task pre-advance to `status='completed'` already
+   * happened in the scheduler before enqueue, and resurrecting that
+   * row would re-introduce the storm hazard #6 was created to prevent.
+   * Logging the failure is the load-bearing part; the row's lifecycle
+   * is deliberately left as-is.
+   */
+  private sweepStalePendingTasks(): void {
+    if (this.logTaskRunFn === null) return;
+    const now = Date.now();
+    const threshold = this.dispatchDropThresholdMs;
+    for (const sessions of this.groups.values()) {
+      for (const state of sessions.values()) {
+        if (state.pendingTasks.length === 0) continue;
+        const kept: QueuedTask[] = [];
+        for (const t of state.pendingTasks) {
+          const ageMs = now - t.enqueuedAt;
+          if (ageMs >= threshold) {
+            const ageMin = Math.round(ageMs / 60_000);
+            const error = `dispatch dropped: maintenance slot wedged for ${ageMin}min`;
+            logger.error(
+              {
+                taskId: t.id,
+                groupJid: t.groupJid,
+                sessionName: t.sessionName,
+                ageMs,
+                thresholdMs: threshold,
+              },
+              'Dispatch-loss watchdog dropping stale pending task',
+            );
+            this.logTaskRunFn({
+              task_id: t.id,
+              run_at: new Date(now).toISOString(),
+              duration_ms: 0,
+              status: 'error',
+              result: error,
+              error,
+            });
+          } else {
+            kept.push(t);
+          }
+        }
+        state.pendingTasks = kept;
+      }
+    }
+  }
 
   private getGroup(groupJid: string, sessionName: string): GroupState {
     let sessions = this.groups.get(groupJid);
@@ -235,7 +381,13 @@ export class GroupQueue {
       return;
     }
 
-    const task: QueuedTask = { id: taskId, groupJid, sessionName, fn };
+    const task: QueuedTask = {
+      id: taskId,
+      groupJid,
+      sessionName,
+      fn,
+      enqueuedAt: Date.now(),
+    };
 
     if (state.active) {
       state.pendingTasks.push(task);
@@ -563,6 +715,10 @@ export class GroupQueue {
 
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
+    if (this.dispatchSweepTimer !== null) {
+      clearInterval(this.dispatchSweepTimer);
+      this.dispatchSweepTimer = null;
+    }
 
     // Count active containers but don't kill them — they'll finish on their own
     // via idle timeout or container timeout. The --rm flag cleans them up on exit.
