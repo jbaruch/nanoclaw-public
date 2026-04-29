@@ -261,11 +261,16 @@ export function createFilteredDb(
 
   // Use ATTACH to copy schema-agnostically — picks up new columns automatically
   const dst = new Database(filteredPath);
-  // Source `messages.db` is WAL-mode and actively written by the orchestrator.
-  // Without busy_timeout this connection would fail immediately on any lock
-  // contention against the source (e.g. during a checkpoint), defeating the
-  // whole point of the orchestrator-side WAL setup. Match the orchestrator
-  // value (5000ms) so contention smoothing is symmetric across readers.
+  // Source `messages.db` is WAL-mode and actively written by the orchestrator
+  // (better-sqlite3's default journal mode for the unfiltered DB). Without
+  // a busy_timeout this connection would fail immediately on any lock
+  // contention against the source (e.g. during a WAL checkpoint or a write
+  // landing concurrently with the ATTACH), so a fresh untrusted-container
+  // spawn that happens to coincide with a write would intermittently fail
+  // to set up its filtered DB. 5000ms is comfortably longer than typical
+  // orchestrator write transactions on this DB (which complete in
+  // milliseconds), small enough that a stuck writer surfaces as a failure
+  // rather than a hung spawn.
   dst.pragma('busy_timeout = 5000');
   // Force rollback-journal mode on the snapshot. better-sqlite3 defaults to
   // WAL, which requires the SQLite reader to write `-wal`/`-shm` sidecar
