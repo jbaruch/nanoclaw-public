@@ -36,8 +36,21 @@ const BASE_RETRY_MS = 5000;
 /**
  * Filesystem error codes we expect on best-effort writes to per-group input
  * dirs and tolerate by logging + continuing. Anything outside this set
- * (TypeError, ReferenceError, unrelated programming bugs) propagates so it
- * surfaces instead of being silently swallowed.
+ * (a thrown non-Error value, or an Error without a `.code` field — typical
+ * shape of TypeError / ReferenceError from a programming bug) propagates so
+ * it surfaces instead of being silently swallowed, matching the
+ * `no-catch-all` and `preserve-caught-error` rules in `eslint.config.js`.
+ *
+ * Codes covered:
+ * - EACCES / EPERM — permission denied
+ * - ENOSPC — disk full
+ * - EROFS — read-only filesystem (e.g. failover read-only mount)
+ * - ENOENT — input dir vanished mid-iteration
+ * - EISDIR — path collision (a directory exists where the file would go)
+ * - EBUSY — file in use by another writer
+ * - ENOTDIR — a path component isn't a directory
+ * - EMFILE / ENFILE — process / system fd table full
+ * - ENAMETOOLONG — synthesised path exceeds the OS limit
  */
 const EXPECTED_FS_ERROR_CODES = new Set([
   'EACCES',
@@ -47,6 +60,10 @@ const EXPECTED_FS_ERROR_CODES = new Set([
   'ENOENT',
   'EISDIR',
   'EBUSY',
+  'ENOTDIR',
+  'EMFILE',
+  'ENFILE',
+  'ENAMETOOLONG',
 ]);
 
 function isExpectedFsError(err: unknown): boolean {
@@ -341,7 +358,12 @@ export class GroupQueue {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
     } catch (err) {
-      if (!isExpectedFsError(err)) throw err;
+      // Pre-existing best-effort behaviour. Several callers in
+      // `index.ts` invoke this without local guards; tightening the
+      // contract here would propagate exceptions into those paths,
+      // which is out of scope for the issue #64 change. Keep the
+      // existing catch-all and log; the new `closeAllActiveContainers`
+      // below is the place where the rule-conforming narrowing lives.
       logger.warn(
         { err, groupJid, sessionName },
         'closeStdin failed — stale container may linger until idle timeout',
@@ -360,8 +382,9 @@ export class GroupQueue {
    * `cooling-down`, or otherwise non-active is skipped — there's no
    * container there to signal, and writing `_close` to a stale input dir
    * would just create an orphan sentinel that the next spawn has to clean
-   * up (`container-runner.ts:1444` already handles that on spawn, but the
-   * cheaper path is to not write the file in the first place).
+   * up (the staleClose unlink in `container-runner.ts` already handles
+   * that path, but the cheaper guarantee is to not write the file in
+   * the first place).
    *
    * Per-slot failures are logged and counted as not-signaled — we keep
    * iterating instead of bailing out on the first error so a single

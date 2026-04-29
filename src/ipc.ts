@@ -1112,16 +1112,21 @@ export async function processTaskIpc(
                       //
                       // Guarded because `closeAllActiveContainers()`
                       // rethrows unexpected (non-fs) errors by contract.
-                      // Narrow to Error so non-Error throws propagate per
-                      // error-handling.md; logged at ERROR level so bugs
-                      // surface instead of being silently swallowed.
+                      // Narrow to Error so non-Error throws propagate
+                      // (matches the `no-catch-all` /
+                      // `preserve-caught-error` rules in
+                      // `eslint.config.js`); logged at ERROR level so
+                      // bugs surface instead of being silently
+                      // swallowed.
                       let closed = 0;
+                      let closeErr: Error | null = null;
                       try {
                         closed = deps.closeAllActiveContainers();
-                      } catch (closeErr) {
-                        if (!(closeErr instanceof Error)) throw closeErr;
+                      } catch (e) {
+                        if (!(e instanceof Error)) throw e;
+                        closeErr = e;
                         logger.error(
-                          { err: closeErr, sessionsCleared: cleared },
+                          { err: e, sessionsCleared: cleared },
                           'closeAllActiveContainers threw an unexpected error during post-promote tessl update — sessions still cleared, but live containers will not respawn until idle timeout',
                         );
                       }
@@ -1131,7 +1136,9 @@ export async function processTaskIpc(
                           containersClosed: closed,
                           output: updateStdout.trim().slice(-200),
                         },
-                        'Post-promote tessl update completed — sessions cleared and running containers signaled to restart',
+                        closeErr
+                          ? 'Post-promote tessl update completed — sessions cleared, but signaling running containers to restart failed (will refresh on idle timeout)'
+                          : 'Post-promote tessl update completed — sessions cleared and running containers signaled to restart',
                       );
                     }
                   },

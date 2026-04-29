@@ -966,9 +966,9 @@ describe('GroupQueue', () => {
     // A slot whose container exited (active=false) MUST NOT receive a
     // _close sentinel — there's no process to signal, and a stale
     // sentinel on the next spawn forces an immediate exit before the new
-    // container can do useful work. The spawn path cleans these up
-    // (container-runner.ts:1444), but the cheaper guarantee is to not
-    // write the file in the first place.
+    // container can do useful work. The spawn path cleans these up via
+    // the staleClose unlink in `container-runner.ts`, but the cheaper
+    // guarantee is to not write the file in the first place.
     const fs = await import('fs');
     const releases: Array<() => void> = [];
 

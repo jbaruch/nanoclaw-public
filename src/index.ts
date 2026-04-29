@@ -1201,21 +1201,24 @@ async function main(): Promise<void> {
           // we degrade to "containers will pick up new tiles on idle
           // timeout" rather than taking the process down.
           let closed = 0;
+          let closeErr: Error | null = null;
           try {
             closed = queue.closeAllActiveContainers();
-          } catch (closeErr) {
+          } catch (e) {
             // Narrow to Error instances (the only thing realistic
             // production code throws). Non-Error throws (a bare string,
             // `null`, etc.) are themselves a programming bug and
-            // propagate as uncaught exceptions per error-handling.md
-            // ("let unexpected propagate"). This catch is the
-            // outer-boundary guard for an async callback — without it,
-            // an Error from the close path would terminate the
-            // orchestrator process; with it, sessions stay cleared and
-            // we degrade to "containers refresh on idle timeout."
-            if (!(closeErr instanceof Error)) throw closeErr;
+            // propagate as uncaught exceptions, matching the
+            // `no-catch-all` / `preserve-caught-error` rules in
+            // `eslint.config.js`. This catch is the outer-boundary
+            // guard for an async callback — without it, an Error from
+            // the close path would terminate the orchestrator process;
+            // with it, sessions stay cleared and we degrade to
+            // "containers refresh on idle timeout."
+            if (!(e instanceof Error)) throw e;
+            closeErr = e;
             logger.error(
-              { err: closeErr, sessionsCleared: cleared },
+              { err: e, sessionsCleared: cleared },
               'closeAllActiveContainers threw an unexpected error during periodic tessl update — sessions still cleared, but live containers will not respawn until idle timeout',
             );
           }
@@ -1225,7 +1228,9 @@ async function main(): Promise<void> {
               containersClosed: closed,
               output: stdout.trim().slice(-200),
             },
-            'Periodic tessl update found new tiles — sessions cleared and running containers signaled to restart',
+            closeErr
+              ? 'Periodic tessl update found new tiles — sessions cleared, but signaling running containers to restart failed (will refresh on idle timeout)'
+              : 'Periodic tessl update found new tiles — sessions cleared and running containers signaled to restart',
           );
         }
       },
