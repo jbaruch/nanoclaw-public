@@ -46,18 +46,33 @@ const SWEEPABLE_FILENAME_RE = /^(\d+)-[A-Za-z0-9]+\.json$/;
  * sweep with a 60s grace, dropped after Copilot review surfaced the
  * race against long-running queries that don't drain mid-flight.
  *
- * Returns the number of files unlinked. Expected best-effort filesystem
- * errnos (`isExpectedFsError`: ENOENT, EACCES, EBUSY, …) are logged and
- * absorbed so the sweep never blocks the message-delivery path on a
- * transient race. Any other error (TypeError from a programming bug, EIO
- * from hardware failure, anything else outside the allowlist) is
- * deliberately rethrown — the orchestrator must surface those at the
- * call site rather than have the sweep silently swallow a real bug.
+ * Returns the number of files unlinked. ENOENT (the dir doesn't exist
+ * yet, or a file vanished between readdir and unlink — both benign
+ * races on a busy IPC dir) is silently absorbed since seeing nothing
+ * is the correct outcome. Other expected best-effort filesystem
+ * errnos (`isExpectedFsError`: EACCES, EBUSY, EROFS, …) are logged at
+ * WARN and continue so the sweep never blocks the message-delivery
+ * path on a transient race. Any error outside that allowlist
+ * (TypeError from a programming bug, EIO from hardware failure,
+ * anything else) is deliberately rethrown — the orchestrator must
+ * surface those at the call site rather than have the sweep silently
+ * swallow a real bug.
  */
 export function sweepStaleInputs(
   sessionInputDir: string,
   graceMs: number,
 ): number {
+  // Guard against NaN / undefined / negative `graceMs` from a buggy caller
+  // (mis-parsed env, accidental `Number(undefined)`, etc.). With NaN the
+  // `now - graceMs` cutoff becomes NaN and `writtenAtMs > cutoff` is
+  // always false, which would silently delete every sweepable file —
+  // surprise message loss. Throw at the call site instead so the bug is
+  // visible: this is a programming error, not a runtime condition.
+  if (!Number.isFinite(graceMs) || graceMs < 0) {
+    throw new Error(
+      `sweepStaleInputs: graceMs must be a non-negative finite number, got ${graceMs}`,
+    );
+  }
   let entries: string[];
   try {
     entries = fs.readdirSync(sessionInputDir);

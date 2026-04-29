@@ -243,24 +243,30 @@ export function createFilteredDb(
   fs.mkdirSync(filteredDir, { recursive: true });
   const filteredPath = path.join(filteredDir, 'messages.db');
 
-  // Remove stale copy from previous run, including any `-wal`/`-shm`
-  // sidecars left behind by a pre-#287 version that ran before the
-  // `journal_mode = DELETE` pragma below was in place. Without this,
-  // operators upgrading on top of an existing data dir keep the old
-  // WAL artefacts indefinitely — both as wasted disk and as the same
-  // RO-mount-can't-open failure the pragma is supposed to eliminate.
-  // Sidecars are removed unconditionally (independent of whether the
-  // main file existed) because a partial wipe — main DB removed but
-  // sidecars left — is the exact state SQLite refuses to open.
-  // `rmSync({ force: true })` so concurrent refreshes (default +
-  // maintenance session for the same untrusted group) tolerate
-  // another caller having already removed one or more of these paths.
+  // Build the snapshot in a per-call temp file and atomic-rename onto
+  // `filteredPath` only after the populate phase finishes. This serves
+  // two purposes: (1) clears any leftover `-wal`/`-shm` sidecars from a
+  // pre-#287 version that ran before the `journal_mode = DELETE` pragma
+  // landed (operators upgrading on top of an existing data dir would
+  // otherwise keep the old WAL artefacts and trip the same RO-mount
+  // failure the pragma is supposed to eliminate); (2) avoids a
+  // concurrent-refresh race where two sessions for the same untrusted
+  // group (default + maintenance) call `createFilteredDb` at the same
+  // time — without the temp+rename, both would write to the same path
+  // and a third reader could open a partially-populated DB. Sidecars
+  // are removed unconditionally (independent of whether the main file
+  // existed) because a partial wipe — main DB removed but sidecars
+  // left — is the exact state SQLite refuses to open. `rmSync` with
+  // `force: true` so the cleanup tolerates another caller having
+  // already removed any of these paths.
   for (const suffix of ['', '-wal', '-shm']) {
     fs.rmSync(`${filteredPath}${suffix}`, { force: true });
   }
+  const tmpSuffix = `${process.pid}-${randomBytes(4).toString('hex')}`;
+  const tmpPath = `${filteredPath}.tmp.${tmpSuffix}`;
 
   // Use ATTACH to copy schema-agnostically — picks up new columns automatically
-  const dst = new Database(filteredPath);
+  const dst = new Database(tmpPath);
   // Source `messages.db` is WAL-mode and actively written by the orchestrator
   // (better-sqlite3's default journal mode for the unfiltered DB). Without
   // a busy_timeout this connection would fail immediately on any lock
@@ -326,6 +332,15 @@ export function createFilteredDb(
   } finally {
     dst.close();
   }
+
+  // Atomic publish: rename the populated temp file onto the canonical
+  // path. POSIX rename(2) is atomic, so any reader that opens
+  // `filteredPath` either sees the prior snapshot or the fully-built
+  // new one — never an in-progress populate. If a concurrent refresh
+  // beats us to the rename, that's fine: both built equivalent content
+  // and one wins the last-write — the loser's temp file is the only
+  // visible side effect, and we clean it up below.
+  fs.renameSync(tmpPath, filteredPath);
 
   // Chown so container user can read
   const uid = HOST_UID ?? 1000;

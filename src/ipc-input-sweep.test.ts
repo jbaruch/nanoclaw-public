@@ -146,4 +146,25 @@ describe('sweepStaleInputs (#287 IPC backlog GC)', () => {
     expect(fs.existsSync(b)).toBe(false);
     expect(logger.warn).not.toHaveBeenCalled();
   });
+
+  it('throws on NaN graceMs to prevent silent "delete all" surprise', () => {
+    const dir = makeSessionDir('nan-guard');
+    const ts = Date.now() - 999_999_999;
+    const planted = writeFile(dir, `${ts}-aaaa.json`);
+
+    // Without the guard, `now - NaN = NaN` and `writtenAtMs > NaN` is
+    // always false → every sweepable file is unlinked. That's a
+    // surprise message-loss path on a buggy caller (mis-parsed env
+    // var, accidental `Number(undefined)`). The guard makes the bug
+    // visible at the call site.
+    expect(() => sweepStaleInputs(dir, NaN)).toThrow(/non-negative finite/);
+
+    // No file should have been deleted before the throw.
+    expect(fs.existsSync(planted)).toBe(true);
+  });
+
+  it('throws on negative graceMs (programming error, not a runtime case)', () => {
+    const dir = makeSessionDir('negative-guard');
+    expect(() => sweepStaleInputs(dir, -1)).toThrow(/non-negative finite/);
+  });
 });

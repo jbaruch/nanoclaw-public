@@ -208,6 +208,25 @@ describe('createFilteredDb (untrusted DB isolation)', () => {
   // sidecars too, not just the main DB file. A partial state (main DB
   // gone, sidecars present) is the exact scenario SQLite refuses to
   // open with `unable to open database file`.
+  // Issue #287 follow-up — concurrent refreshes for the same untrusted
+  // group (default + maintenance session both call createFilteredDb)
+  // must not leave readers seeing a partially-populated DB or trip on
+  // each other's mid-write state. The implementation builds the
+  // snapshot in a per-call temp file and atomic-renames into place
+  // after the populate phase. Verify no leftover `.tmp.<pid>.<rand>`
+  // file remains after a clean call, AND that a stale temp file from
+  // a previous crashed call doesn't break the next one.
+  it('createFilteredDb cleans up its temp file after a successful publish', () => {
+    seedMessagesDb();
+    const filtered = createFilteredDb('chatA@g.us', 'folder-a');
+    expect(filtered).not.toBe(null);
+    const filteredDir = path.dirname(filtered!);
+    const leftoverTmps = fs
+      .readdirSync(filteredDir)
+      .filter((f) => f.startsWith('messages.db.tmp.'));
+    expect(leftoverTmps).toEqual([]);
+  });
+
   it('createFilteredDb removes leftover -wal/-shm sidecars from a pre-fix snapshot', () => {
     seedMessagesDb();
     // First call to create the filtered dir + main DB.
