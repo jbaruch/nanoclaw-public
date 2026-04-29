@@ -98,25 +98,22 @@ describe('copyTileScriptsToFlatDir', () => {
     );
   });
 
-  it.skipIf(!mkfifoAvailable())(
-    'skips a FIFO entry (allowlist guard)',
-    () => {
-      // Anything that isn't a regular file or symlink would crash
-      // `fs.cpSync` with EINVAL and reintroduce the spawn-time crash
-      // class the original `__pycache__/` bug was in. FIFO is the
-      // cheapest non-{file,symlink,dir} kind to create on POSIX;
-      // gated on `mkfifoAvailable()` so a minimal env (no mkfifo
-      // binary, FIFO-incapable fs) skips this case rather than fails.
-      fs.writeFileSync(path.join(srcDir, 'normal.py'), 'normal');
-      const fifoPath = path.join(srcDir, 'channel.fifo');
-      // Node's fs has no mkfifo binding; shell out to the POSIX tool.
-      execFileSync('mkfifo', [fifoPath]);
+  it.skipIf(!mkfifoAvailable())('skips a FIFO entry (allowlist guard)', () => {
+    // Anything that isn't a regular file or symlink would crash
+    // `fs.cpSync` with EINVAL and reintroduce the spawn-time crash
+    // class the original `__pycache__/` bug was in. FIFO is the
+    // cheapest non-{file,symlink,dir} kind to create on POSIX;
+    // gated on `mkfifoAvailable()` so a minimal env (no mkfifo
+    // binary, FIFO-incapable fs) skips this case rather than fails.
+    fs.writeFileSync(path.join(srcDir, 'normal.py'), 'normal');
+    const fifoPath = path.join(srcDir, 'channel.fifo');
+    // Node's fs has no mkfifo binding; shell out to the POSIX tool.
+    execFileSync('mkfifo', [fifoPath]);
 
-      expect(() => copyTileScriptsToFlatDir(srcDir, dstDir)).not.toThrow();
+    expect(() => copyTileScriptsToFlatDir(srcDir, dstDir)).not.toThrow();
 
-      expect(fs.readdirSync(dstDir).sort()).toEqual(['normal.py']);
-    },
-  );
+    expect(fs.readdirSync(dstDir).sort()).toEqual(['normal.py']);
+  });
 
   it('is a no-op when the source dir does not exist', () => {
     const missing = path.join(tmpRoot, 'never-existed');
