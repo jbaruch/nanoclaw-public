@@ -759,10 +759,18 @@ export function buildVolumeMounts(
           // `/workspace/group/scripts/<name>`.
           const skillScriptsDir = path.join(skillSrcDir, 'scripts');
           if (fs.existsSync(skillScriptsDir)) {
-            for (const scriptFile of fs.readdirSync(skillScriptsDir)) {
+            for (const scriptFile of fs.readdirSync(skillScriptsDir, {
+              withFileTypes: true,
+            })) {
+              // tmpScriptsDir is a flat dir of executables published as
+              // `/workspace/group/scripts/<name>`; subdirs (e.g. Python's
+              // __pycache__/ created at runtime when a container imports a
+              // .py script) aren't reachable through that contract and
+              // would crash the non-recursive cpSync below.
+              if (!scriptFile.isFile()) continue;
               fs.cpSync(
-                path.join(skillScriptsDir, scriptFile),
-                path.join(tmpScriptsDir, scriptFile),
+                path.join(skillScriptsDir, scriptFile.name),
+                path.join(tmpScriptsDir, scriptFile.name),
               );
             }
           }
