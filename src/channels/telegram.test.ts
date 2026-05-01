@@ -1415,6 +1415,165 @@ describe('TelegramChannel', () => {
         'Failed to send Telegram reaction',
       );
     });
+
+    // The transient downgrade originally covered only the
+    // `message to react to not found` 400. Production logs (12h
+    // window, 363 reaction errors) showed three further buckets that
+    // are equally unactionable but were still landing at ERROR:
+    //   - 97x  HttpError "Network request for 'setMessageReaction' failed!"
+    //   - 126x Grammy 400 "429: Too Many Requests: retry after N"
+    //   - 96x  sendMessage "not enough rights to send …" (covered below)
+    // Each bucket gets its own assertion so a future regression that
+    // re-promotes one to ERROR fails specifically.
+    it('downgrades transport-level HttpError to WARN (Grammy `Network request for ... failed!`)', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.raw.setMessageReaction.mockRejectedValueOnce(
+        new Error("Network request for 'setMessageReaction' failed!"),
+      );
+      await channel.sendReaction('tg:100200300', '485', '👍');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300', messageId: '485' }),
+        expect.stringContaining('Telegram reaction skipped'),
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('downgrades Telegram 429 rate-limit responses to WARN', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.raw.setMessageReaction.mockRejectedValueOnce(
+        new Error(
+          "Call to 'setMessageReaction' failed! (429: Too Many Requests: retry after 33)",
+        ),
+      );
+      await channel.sendReaction('tg:100200300', '485', '👍');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300', messageId: '485' }),
+        expect.stringContaining('Telegram reaction skipped'),
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('downgrades the production "message to react not found" string (no trailing "to") to WARN', async () => {
+      // Telegram's actual 400 message body in the production logs is
+      // "message to react not found" — no second "to". The original
+      // regex `/message to react.*not found/i` matches both that and
+      // the historical "message to react to not found" form. Pin the
+      // exact production string so a future regex tightening can't
+      // re-introduce the gap that originally fired 53 ERRORs / 12h.
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.raw.setMessageReaction.mockRejectedValueOnce(
+        new Error(
+          "Call to 'setMessageReaction' failed! (400: Bad Request: message to react not found)",
+        ),
+      );
+      await channel.sendReaction('tg:100200300', '485', '👍');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300', messageId: '485' }),
+        expect.stringContaining('Telegram reaction skipped'),
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- sendMessage transient-error downgrade ---
+
+  describe('sendMessage transient-error handling', () => {
+    // sendMessage's catch was logging EVERY failure at ERROR. The 12h
+    // log window had 121 entries dominated by `not enough rights to
+    // send text messages to the chat` (96, admin removed bot post
+    // perm) and `Network request for 'sendMessage' failed!` (19,
+    // transport blip). Neither is actionable mid-flight; both now
+    // route through the shared `_isUnactionableTelegramError` gate.
+    // `sendTelegramMessage` retries on HTML-mode failure WITHOUT
+    // parse_mode (so a Markdown-with-bad-HTML message still goes
+    // through). For these tests we want the BOTH calls to fail so the
+    // outer catch in TelegramChannel.sendMessage runs — use the
+    // persistent `mockRejectedValue` rather than `…Once`.
+    it('downgrades "not enough rights to send" 400 to WARN', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.sendMessage.mockRejectedValue(
+        new Error(
+          "Call to 'sendMessage' failed! (400: Bad Request: not enough rights to send text messages to the chat)",
+        ),
+      );
+      await channel.sendMessage('tg:100200300', 'hello');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300' }),
+        expect.stringContaining('Telegram message dropped'),
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('downgrades transport-level HttpError to WARN', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.sendMessage.mockRejectedValue(
+        new Error("Network request for 'sendMessage' failed!"),
+      );
+      await channel.sendMessage('tg:100200300', 'hello');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300' }),
+        expect.stringContaining('Telegram message dropped'),
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('still logs at ERROR for unexpected sendMessage failures', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.sendMessage.mockRejectedValue(
+        new Error('Internal Server Error'),
+      );
+      await channel.sendMessage('tg:100200300', 'hello');
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300' }),
+        'Failed to send Telegram message',
+      );
+    });
+  });
+
+  // --- _isUnactionableTelegramError (helper, exported for tests) ---
+
+  describe('_isUnactionableTelegramError', () => {
+    // Pin every classified pattern from production logs so a future
+    // refactor of the regex bouquet can't silently drop one.
+    it.each([
+      // bucket 1 — target gone / forbidden
+      ['Bad Request: message to react not found'],
+      ['Bad Request: message to react to not found'],
+      ['Bad Request: message to be replied not found'],
+      ['Bad Request: MESSAGE_ID_INVALID'],
+      ['Bad Request: chat not found'],
+      ['Forbidden: bot was blocked by the user'],
+      ['Forbidden: bot was kicked from the supergroup chat'],
+      ['Forbidden: user is deactivated'],
+      // bucket 2 — perms changed
+      ['Bad Request: not enough rights to send text messages to the chat'],
+      // bucket 3 — rate limits
+      ["Call to 'setMessageReaction' failed! (429: Too Many Requests: retry after 33)"],
+      ["Call to 'sendMessage' failed! (429: Too Many Requests: retry after 5)"],
+      // bucket 4 — transport
+      ["Network request for 'setMessageReaction' failed!"],
+      ["Network request for 'sendMessage' failed!"],
+    ])('classifies %s as unactionable', async (msg) => {
+      const { _isUnactionableTelegramError } = await import('./telegram.js');
+      expect(_isUnactionableTelegramError(msg)).toBe(true);
+    });
+
+    it.each([
+      // Genuine errors that SHOULD stay at ERROR.
+      ['Internal Server Error'],
+      ['ETIMEDOUT'],
+      ['Bad Request: chat_id is empty'],
+      ['Bad Request: PARSE_ENTITIES_FAILED'],
+    ])('classifies %s as actionable (stays at ERROR)', async (msg) => {
+      const { _isUnactionableTelegramError } = await import('./telegram.js');
+      expect(_isUnactionableTelegramError(msg)).toBe(false);
+    });
   });
 });
 

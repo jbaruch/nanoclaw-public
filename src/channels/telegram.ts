@@ -282,6 +282,52 @@ export function _isAllowedReaction(emoji: string): boolean {
  */
 export const _EMOJI_SHORTCODE_TO_UNICODE = EMOJI_SHORTCODE_TO_UNICODE;
 
+/**
+ * Classify a Telegram API failure as a known-unactionable transient
+ * error so the caller can downgrade it from ERROR to WARN.
+ *
+ * Covers four buckets, all of which produced ERROR-level log noise
+ * that the operator can do nothing about:
+ *
+ *   1. Target message gone / forbidden
+ *      - "message to react … not found" (400)
+ *      - "message to be replied not found" (400)
+ *      - "MESSAGE_ID_INVALID"
+ *      - "chat not found" (chat deleted, bot kicked)
+ *      - "bot was blocked" / "bot was kicked"
+ *      - "user is deactivated"
+ *
+ *   2. Permission changes after registration
+ *      - "not enough rights to send …" (admin removed send permission)
+ *
+ *   3. Rate limits — Telegram tells us to back off, the call will
+ *      simply retry on the next agent turn:
+ *      - "429: Too Many Requests"
+ *
+ *   4. Transport-level transient — network blip on the way to
+ *      Telegram's edge, recovers on next attempt:
+ *      - "Network request for '<method>' failed!" (Grammy `HttpError`)
+ *
+ * Exported so call sites in this module (sendReaction, sendMessage,
+ * future sendFile/sendVoice paths) share one definition rather than
+ * each inlining a regex bouquet that drifts out of sync. Exported
+ * with `_` prefix because it's only consumed by tests + co-located
+ * helpers in this file.
+ */
+export function _isUnactionableTelegramError(msg: string): boolean {
+  return (
+    /message to react.*not found/i.test(msg) ||
+    /message to be replied not found/i.test(msg) ||
+    /MESSAGE_ID_INVALID/i.test(msg) ||
+    /chat not found/i.test(msg) ||
+    /bot was (blocked|kicked)/i.test(msg) ||
+    /user is deactivated/i.test(msg) ||
+    /not enough rights to send/i.test(msg) ||
+    /\b429:\s*Too Many Requests/i.test(msg) ||
+    /Network request for .* failed/i.test(msg)
+  );
+}
+
 // Telegram's allowed reaction emoji (as of Bot API 7.x)
 const TELEGRAM_ALLOWED_REACTIONS = new Set([
   '👍',
@@ -1319,7 +1365,20 @@ export class TelegramChannel implements Channel {
       );
       return lastMsgId?.toString();
     } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Telegram message');
+      // Same downgrade rationale as sendReaction: 96+ entries / 12h
+      // for "not enough rights to send" alone (admin removed bot
+      // post permission), plus transport blips and rate limits.
+      // None are actionable mid-flight. See
+      // `_isUnactionableTelegramError` for the full set.
+      const msg = err instanceof Error ? err.message : String(err ?? '');
+      if (_isUnactionableTelegramError(msg)) {
+        logger.warn(
+          { jid, err: msg },
+          'Telegram message dropped (transient or unactionable)',
+        );
+      } else {
+        logger.error({ jid, err }, 'Failed to send Telegram message');
+      }
     }
   }
 
@@ -1602,26 +1661,16 @@ export class TelegramChannel implements Channel {
         'Telegram reaction sent',
       );
     } catch (err) {
-      // Reactions to deleted / forbidden messages are a known,
-      // unactionable Telegram 400. Downgrade those to warn so the
-      // ERROR-level log stays meaningful — see #50 out-of-scope
-      // note. Anything else stays at error.
+      // Reactions to deleted / forbidden messages, rate-limit
+      // pushback, and transport blips are all known-unactionable —
+      // downgrade to WARN so the ERROR-level log stays meaningful.
+      // See `_isUnactionableTelegramError` for the full bucket.
+      // Anything else stays at error.
       const msg = err instanceof Error ? err.message : String(err ?? '');
-      // Telegram surfaces this as either "message to react to not found"
-      // (Bot API string) or "message to be replied not found" / similar
-      // when the bot has been kicked / the chat is gone. Treat known
-      // unactionable 400s as warn so the ERROR-level log stays
-      // meaningful — see #50 out-of-scope note.
-      const isKnownTransient =
-        /message to react.*not found/i.test(msg) ||
-        /message to be replied not found/i.test(msg) ||
-        /MESSAGE_ID_INVALID/i.test(msg) ||
-        /chat not found/i.test(msg) ||
-        /bot was blocked/i.test(msg);
-      if (isKnownTransient) {
+      if (_isUnactionableTelegramError(msg)) {
         logger.warn(
           { jid, messageId, emoji: validEmoji, err: msg },
-          'Telegram reaction skipped (target message gone or forbidden)',
+          'Telegram reaction skipped (transient or unactionable)',
         );
       } else {
         logger.error(
