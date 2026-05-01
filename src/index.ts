@@ -47,6 +47,7 @@ import {
   getMessagesSince,
   getTaskById,
   createTask,
+  updateTask,
   getNewMessages,
   getRouterState,
   initDatabase,
@@ -235,6 +236,14 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // Auto-create a lightweight heartbeat for trigger-required groups.
   // These groups have their own container and can only send to their own chat,
   // preventing cross-group message routing bugs from the main heartbeat.
+  //
+  // The `script` field gates agent wake-up via the agent-runner's
+  // `runScript` / `wakeAgent` mechanism: the precheck runs first and
+  // emits `{"wakeAgent": false}` when there are no new candidates, so
+  // the container exits without invoking the SDK at all (zero tokens).
+  // When the precheck reports new work — or fails — the agent runs
+  // with the original prompt. Closes part of #62 (heartbeat containers
+  // spawning to run zero queries).
   if (group.requiresTrigger !== false && !group.isMain) {
     const heartbeatId = `heartbeat-${group.folder}`;
     if (!getTaskById(heartbeatId)) {
@@ -242,6 +251,8 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
         id: heartbeatId,
         group_folder: group.folder,
         chat_jid: jid,
+        script:
+          'python3 /home/node/.claude/skills/tessl__check-unanswered/scripts/unanswered-precheck.py',
         prompt:
           'Run the check-unanswered script only: python3 /home/node/.claude/skills/tessl__check-unanswered/scripts/check-unanswered.py — then react and reply to each unanswered message. Do NOT query the database directly. Do NOT check email, calendar, or system health.',
         schedule_type: 'cron',
@@ -904,11 +915,47 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+/**
+ * One-shot startup migration: backfill the precheck `script` column
+ * on existing non-main `heartbeat-*` rows so already-deployed installs
+ * pick up the precheck-gate without needing a manual DB edit. New
+ * installs hit the `script` field at task-create time in
+ * `registerGroup`; this function exists purely to migrate the rows
+ * that were created before the gate was wired in (closes part of #62
+ * — heartbeat containers spawning to run zero queries).
+ *
+ * Idempotent: rows that already have the precheck `script` set are
+ * skipped. The main-group `heartbeat-*` row uses a different prompt
+ * (the `tessl__heartbeat` skill, not check-unanswered) so it is left
+ * untouched — its prompt is matched by the `check-unanswered` literal
+ * substring check so we don't accidentally graft the precheck onto a
+ * task whose semantics it doesn't understand.
+ */
+function backfillHeartbeatPrecheckScript(): void {
+  const PRECHECK =
+    'python3 /home/node/.claude/skills/tessl__check-unanswered/scripts/unanswered-precheck.py';
+  let updated = 0;
+  for (const task of getAllTasks()) {
+    if (!task.id.startsWith('heartbeat-')) continue;
+    if (task.script === PRECHECK) continue;
+    if (!task.prompt || !task.prompt.includes('check-unanswered')) continue;
+    updateTask(task.id, { script: PRECHECK });
+    updated++;
+  }
+  if (updated > 0) {
+    logger.info(
+      { updated },
+      'Backfilled precheck script on existing heartbeat tasks',
+    );
+  }
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  backfillHeartbeatPrecheckScript();
   restoreRemoteControl();
 
   // Start credential proxy (containers route API calls through this)

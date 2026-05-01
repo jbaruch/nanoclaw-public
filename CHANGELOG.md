@@ -4,6 +4,11 @@ All notable changes to NanoClaw will be documented in this file.
 
 For detailed release notes, see the [full changelog on the documentation site](https://docs.nanoclaw.dev/changelog).
 
+## [Unreleased]
+
+- New canonical writable per-group state mount at `/workspace/state/` — sourced from `data/state/<folder>/` on the host and mounted into every container regardless of trust tier (ported from jbaruch/nanoclaw#220, addressing #99 Cat 4). Gives every tier a single canonical writable location for skills that persist state across runs, replacing per-skill workarounds. Per-group scoping (not per-session) so a scheduled task and a user-facing turn in the same group can read each other's state.
+- Heartbeat now uses the precheck-gate `script` field — the non-main heartbeat task runs `unanswered-precheck.py` first, and the agent only wakes when the precheck reports new candidates (or errors). Closes part of #62 (heartbeat container spawns running 0 queries) by skipping spawn entirely when there is nothing to do. A one-shot startup migration backfills the `script` column on existing `heartbeat-*` rows so deployed installs pick up the gate without manual DB edits.
+
 ## [1.2.36] - 2026-03-26
 
 - [BREAKING] Replaced pino logger with built-in logger. WhatsApp users must re-merge the WhatsApp fork to pick up the Baileys logger compatibility fix: `git fetch whatsapp main && git merge whatsapp/main`. If the `whatsapp` remote is not configured: `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git`.

@@ -64,6 +64,14 @@ vi.mock('fs', async () => {
       copyFileSync: vi.fn(),
       renameSync: vi.fn(),
       rmSync: vi.fn(),
+      // chownSync is a no-op so the post-mkdir chown on the
+      // /workspace/state mount (and the trusted-dir mount above) doesn't
+      // ENOENT against the never-created mock path. Pre-#99-Cat-4 the
+      // production code swallowed all chown errors via a broad catch;
+      // the narrowed catch (EPERM/EACCES only) lets ENOENT propagate,
+      // so the mock must satisfy the call rather than rely on a
+      // catch-all.
+      chownSync: vi.fn(),
       symlinkSync: vi.fn(),
       readlinkSync: vi.fn(() => ''),
       lstatSync: vi.fn(() => {
@@ -321,6 +329,103 @@ describe('selectTiles', () => {
   it('admin tile is NEVER in trusted or untrusted selections', () => {
     expect(names(selectTiles(false, true))).not.toContain('nanoclaw-admin');
     expect(names(selectTiles(false, false))).not.toContain('nanoclaw-admin');
+  });
+});
+
+// --- /workspace/state mount: writable, all tiers (#99 Cat 4) ---
+//
+// Per-group canonical writable state directory. Must be present for
+// every container regardless of trust tier, and must be writable
+// (no `:ro` suffix). The whole point of the convention is that skills
+// can persist state without caring about the trust tier they're
+// running in — the silent-EACCES failure mode that motivated #99 only
+// disappears if untrusted ALSO gets the mount.
+
+describe('/workspace/state mount (#99 Cat 4)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function expectStateMount(args: string[]) {
+    // Writable mounts are emitted as `-v <host>:<container>` (no `:ro`
+    // suffix); readonly mounts go through readonlyMountArgs which the
+    // mock formats as `<host>:<container>:ro`. Asserting the absence
+    // of the `:ro` suffix on the state mount is the contract — a
+    // future change that flipped this to readonly would silently
+    // reintroduce the trust-tier write-failure mode.
+    const stateArg = args.find((a) => a.endsWith(':/workspace/state'));
+    expect(stateArg).toBeDefined();
+    expect(args.some((a) => a.includes(':/workspace/state:ro'))).toBe(false);
+  }
+
+  it('admin (isMain=true) gets /workspace/state writable', async () => {
+    const adminGroup: RegisteredGroup = { ...testGroup, isMain: true };
+    const promise = runContainerAgent(
+      adminGroup,
+      { ...testInput, isMain: true },
+      () => {},
+    );
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    expectStateMount(vi.mocked(spawn).mock.calls[0]![1] as string[]);
+  });
+
+  it('trusted non-main group gets /workspace/state writable', async () => {
+    const trustedGroup: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { trusted: true },
+    };
+    const promise = runContainerAgent(
+      trustedGroup,
+      { ...testInput, isMain: false, isTrusted: true },
+      () => {},
+    );
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    expectStateMount(vi.mocked(spawn).mock.calls[0]![1] as string[]);
+  });
+
+  it('untrusted group gets /workspace/state writable', async () => {
+    // The whole point of the convention. If this assertion ever fires,
+    // the silent-EACCES failure mode #99 Cat 4 was filed against has
+    // returned: untrusted skills will appear to write state but the
+    // bind-mount layer will reject silently, and the next run will
+    // re-do whatever the state was supposed to remember.
+    const promise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    expectStateMount(vi.mocked(spawn).mock.calls[0]![1] as string[]);
+  });
+
+  it('host path is per-group: <DATA_DIR>/state/<folder>', async () => {
+    // Per-group scoping is intentional — see the rationale comment
+    // above the mount in container-runner.ts. Cross-group leakage is
+    // impossible by virtue of the bind being scoped to <folder>.
+    // Mock sets DATA_DIR=/tmp/nanoclaw-test-data, so the bind resolves
+    // to /tmp/nanoclaw-test-data/state/<folder>:/workspace/state.
+    const promise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    const stateArg = args.find((a) => a.endsWith(':/workspace/state'));
+    expect(stateArg).toBeDefined();
+    expect(stateArg).toBe(
+      '/tmp/nanoclaw-test-data/state/test-group:/workspace/state',
+    );
   });
 });
 

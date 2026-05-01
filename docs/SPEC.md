@@ -56,6 +56,7 @@ A personal Claude assistant with multi-channel support, persistent memory per co
 │  │  Volume mounts:                                                │    │
 │  │    • groups/{name}/ → /workspace/group                         │    │
 │  │    • groups/global/ → /workspace/global/ (non-main only)       │    │
+│  │    • data/state/{name}/ → /workspace/state (RW, all tiers)     │    │
 │  │    • data/sessions/{group}/.claude/ → /home/node/.claude/      │    │
 │  │    • Additional dirs → /workspace/extra/*                      │    │
 │  │                                                                │    │
@@ -310,6 +311,7 @@ nanoclaw/
 │
 ├── data/                          # Application state (gitignored)
 │   ├── sessions/                  # Per-group session data (.claude/ dirs with JSONL transcripts)
+│   ├── state/                     # Per-group writable state, mounted at /workspace/state in every container regardless of trust tier (#99 Cat 4)
 │   ├── env/env                    # Copy of .env for container mounting
 │   └── ipc/                       # Container IPC (messages/, tasks/)
 │
@@ -321,6 +323,26 @@ nanoclaw/
 └── launchd/
     └── com.nanoclaw.plist         # macOS service configuration
 ```
+
+### Container Workspace Layout
+
+Inside every spawned container, the `/workspace/` tree is laid out as follows. Skills should pick the right path based on what they're doing — the wrong choice is the path-hygiene failure mode #99 was filed against (silent EACCES on untrusted tiers when skills wrote to a read-only mount).
+
+| Path | Source | Tier | RW? | Use for |
+|---|---|---|---|---|
+| `/workspace/group/` | `groups/<folder>/` | all | trusted/main: RW · untrusted: RO | The group's content workspace — CLAUDE.md, MEMORY.md, agent-curated files. Untrusted tiers can only read; writes silently EACCES. |
+| `/workspace/global/` | `groups/global/` | trusted/main: full · untrusted: SOUL.md only | RO | Shared identity (SOUL.md), shared formatting rules. |
+| `/workspace/trusted/` | `trusted/` | trusted/main only | RW | Cross-tier shared writable state (skills that ONLY run on trusted/main). Untrusted containers do NOT get this mount at all. |
+| **`/workspace/state/`** | **`data/state/<folder>/`** | **all** | **RW** | **Canonical per-group writable state for skills that need to persist across runs. Always available regardless of trust tier (#99 Cat 4). Use this when a skill needs a writable analog of `/workspace/group/`.** |
+| `/workspace/store/` | `store/` (filtered DB on untrusted) | all | RO | `messages.db` SQLite — read-only. |
+| `/workspace/host-logs/` | `data/host-logs/` | main only | RO | Orchestrator stdout/stderr + per-container streaming logs. Admin-tile-only by construction (#103). |
+| `/workspace/extra/<name>/` | operator-configured | per `containerConfig.additionalMounts` | per-mount | Operator-specified extra mounts (e.g. local code repos). |
+| `/home/node/.claude/` | `data/sessions/<group>/<slot>/.claude/` | all | RW | Per-session SDK state (transcripts under `projects/`, settings, memory). Skills generally shouldn't write here directly — let the SDK manage it. |
+
+**Choosing between `/workspace/group/` and `/workspace/state/`** for skill state:
+
+- `/workspace/group/` — pick this for files an operator might want to read or edit by hand (MEMORY.md, hand-tuned rules). Trust-tier-conditional readonly is a feature here: untrusted skills should not be writing to this surface.
+- `/workspace/state/` — pick this for files that exist purely to make the agent's next run smarter (seen-set caches, last-N pointers, dedup ledgers). The trust-tier-uniform writability is the feature: a skill that runs across tiers should not silently behave differently per tier.
 
 ---
 
