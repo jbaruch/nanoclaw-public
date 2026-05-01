@@ -815,7 +815,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
 
 server.tool(
   'nuke_session',
-  "Kill this group's container(s) and start fresh on the next message/scheduled tick. Use when context is corrupted, rules are stale, or user asks to start fresh. Parallel-maintenance groups run two containers per group (user-facing `default` + scheduled-task `maintenance`) — pass `session` to narrow the nuke: 'default' keeps maintenance running, 'maintenance' keeps user-facing running, 'all' (default) kills both. Omit `session` for pre-parallel behaviour.",
+  "Destructive: kill this group's container(s), drop the session DB row(s), AND delete the on-disk JSONL transcript for the targeted slot(s). Next message/scheduled tick starts a TRULY fresh session — no resumed transcript. Use when context is corrupted, rules are stale, poison reached the model, or user asks to start fresh. Parallel-maintenance groups run two containers per group (user-facing `default` + scheduled-task `maintenance`) — pass `session` to narrow the nuke: 'default' keeps maintenance running, 'maintenance' keeps user-facing running, 'all' (default) wipes both. Cannot be undone — the JSONL is gone after this.",
   {
     session: z
       .enum(['default', 'maintenance', 'all'])
