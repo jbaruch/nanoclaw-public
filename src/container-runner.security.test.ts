@@ -34,6 +34,8 @@ vi.mock('./config.js', () => ({
   TILE_OWNER: 'test-owner',
   TIMEZONE: 'UTC',
   CONTAINER_VARS: {},
+  MAINTENANCE_RULE_BLOCKLIST: new Set<string>(),
+  MAINTENANCE_SKILL_BLOCKLIST: new Set<string>(),
 }));
 
 vi.mock('./logger.js', () => ({

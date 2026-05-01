@@ -5,24 +5,20 @@ import path from 'path';
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
 import {
   DEFAULT_SESSION_NAME,
+  MAINTENANCE_SESSION_NAME,
   sessionInputDirName,
 } from './container-runner.js';
 import { logger } from './logger.js';
 import { captureWedgeDiagnostics } from './wedge-diagnostics.js';
 
-// Re-export so callers that already imported it from group-queue keep working.
-// Container-runner is the canonical definer — this file, the task-scheduler,
-// and index.ts all need the same string, and the session-aware IPC mount
-// lives in container-runner, so that's where the symbol originates.
-export { DEFAULT_SESSION_NAME };
-
-/**
- * Canonical session name for scheduled work (heartbeat, nightly, weekly,
- * reminders). `src/task-scheduler.ts` is the sole writer of this value;
- * no inbound path ever reaches it. Enforced by routing at call sites, not
- * by a runtime check — validated in tests.
- */
-export const MAINTENANCE_SESSION_NAME = 'maintenance';
+// Re-export so callers that already imported these from group-queue keep
+// working. Container-runner is the canonical definer for both — that file,
+// the task-scheduler, and index.ts all need the same strings, and the
+// session-aware IPC mount lives in container-runner, so that's where the
+// symbols originate. `MAINTENANCE_SESSION_NAME` moved here in #337 to
+// break a `container-runner ↔ group-queue` cycle introduced when the
+// install-loop blocklist needed to gate on the maintenance slot.
+export { DEFAULT_SESSION_NAME, MAINTENANCE_SESSION_NAME };
 
 interface QueuedTask {
   id: string;

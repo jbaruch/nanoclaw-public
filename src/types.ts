@@ -85,6 +85,17 @@ export interface ScheduledTask {
    * bypassing whatever lock/state contract the chain depends on.
    */
   continuation_cycle_id?: string | null;
+  /**
+   * Per-task SDK session id (#59 / jbaruch#336). NULL/undefined for tasks
+   * that have never fired, for once-tasks (out of scope), and for recurring
+   * tasks immediately after a `nukeSession` clear. Populated by `runTask`
+   * on first fire of a recurring task and reused as `resume:` on subsequent
+   * fires so the API caches the per-session message-history prefix across
+   * the (otherwise expiring 5-min) prompt-cache window. Persistence is
+   * keyed on `task_id`, so different tasks have different rows hence
+   * different sessions — no #193-style cross-task bleed.
+   */
+  session_id?: string | null;
 }
 
 export interface TaskRunLog {

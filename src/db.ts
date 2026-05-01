@@ -59,7 +59,14 @@ function createSchema(database: Database.Database): void {
       -- checks for; mismatch between the prompt prefix and these env
       -- vars fails closed to fresh, never silently takes a
       -- continuation/lock-skip branch.
-      continuation_cycle_id TEXT
+      continuation_cycle_id TEXT,
+      -- Per-task SDK session id (#59 / jbaruch#336). Recurring tasks
+      -- persist the SDK newSessionId here on first fire and pass it
+      -- as the SDK resume id on subsequent fires, so each fires
+      -- cache_create is incremental rather than full-prefix. NULL
+      -- for tasks that havent fired, for once-tasks, and after a
+      -- maintenance-slot nuke. Keyed on task_id (cf. #193).
+      session_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -139,6 +146,17 @@ function createSchema(database: Database.Database): void {
     database.exec(
       `ALTER TABLE scheduled_tasks ADD COLUMN continuation_cycle_id TEXT`,
     );
+  }
+
+  // Add session_id column for per-task SDK session reuse (#59 /
+  // jbaruch#336). NULL on existing rows; populated on first post-deploy
+  // fire for cron/interval tasks. PRAGMA-gated rather than try/catch
+  // per the no-error-suppression rule.
+  const sessionIdCols = database
+    .prepare('PRAGMA table_info(scheduled_tasks)')
+    .all() as Array<{ name: string }>;
+  if (!sessionIdCols.some((c) => c.name === 'session_id')) {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN session_id TEXT`);
   }
 
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
@@ -753,6 +771,32 @@ export function deleteTask(id: string): void {
   // Delete child records first (FK constraint)
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
+}
+
+// Persist the per-task SDK session id (#59). Called from `runTask`
+// when the SDK reports `newSessionId` on a recurring task fire so the
+// next fire can pass it as `resume:` and reuse the message-history
+// prefix cache. Idempotent — re-writing the same id is a no-op.
+export function setTaskSessionId(id: string, sessionId: string): void {
+  db.prepare('UPDATE scheduled_tasks SET session_id = ? WHERE id = ?').run(
+    sessionId,
+    id,
+  );
+}
+
+// Clear per-task SDK session ids for every scheduled task in a group
+// (#59). Called from the nuke_session IPC handler when the maintenance
+// (or 'all') slot is wiped — without this the next fire would
+// `resume:` an id whose JSONL is gone and the SDK would 404 / start
+// fresh anyway, just noisily. Returns the number of rows cleared.
+export function clearTaskSessionIdsForGroup(groupFolder: string): number {
+  const result = db
+    .prepare(
+      `UPDATE scheduled_tasks SET session_id = NULL
+       WHERE group_folder = ? AND session_id IS NOT NULL`,
+    )
+    .run(groupFolder);
+  return result.changes;
 }
 
 /**

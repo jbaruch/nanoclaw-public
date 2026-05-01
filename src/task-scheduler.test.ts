@@ -16,6 +16,7 @@ vi.mock('./container-runner.js', () => ({
   runContainerAgent: mockRunContainerAgent,
   writeTasksSnapshot: vi.fn(),
   DEFAULT_SESSION_NAME: 'default',
+  MAINTENANCE_SESSION_NAME: 'maintenance',
 }));
 vi.mock('./container-runtime.js', () => ({
   stopContainer: mockStopContainer,
@@ -291,10 +292,12 @@ describe('task scheduler', () => {
     expect(containerInput.sessionId).toBeUndefined();
     expect(containerInput.sessionName).toBe(MAINTENANCE_SESSION_NAME);
 
-    // The newSessionId from the streaming callback IS still persisted to the
-    // MAINTENANCE slot (not default) — the transcript chain keeps growing.
+    // Once-tasks are out of scope for per-task session reuse (#59).
+    // The slot-cache write that used to happen here was dead code
+    // (never read back) and was removed — the pre-seeded slot value
+    // is therefore left untouched.
     expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe(
-      'new-maint-session',
+      'prior-maint-session',
     );
     expect(getSession('main', 'default')).toBeUndefined();
   });
@@ -1215,11 +1218,85 @@ describe('task scheduler', () => {
     // of the previous turn's result, causing cross-attribution (issue #10).
     expect(containerInput.sessionId).toBeUndefined();
 
-    // The newSessionId returned by the container IS still stored so the
-    // per-session transcript chain continues to grow.
+    // Once-tasks: no session persistence anywhere (out of scope for
+    // #59). Pre-seeded slot value is left untouched.
     expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe(
-      'new-session-from-run',
+      'prior-session-must-not-be-used',
     );
+  });
+
+  it('recurring task persists newSessionId on first fire and resumes it on second fire (#59)', async () => {
+    const MAIN_GROUP: RegisteredGroup = {
+      jid: 'main@g.us',
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    const TASK_ID = 'recurring-task';
+    createTask({
+      id: TASK_ID,
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'heartbeat',
+      schedule_type: 'cron',
+      schedule_value: '*/15 * * * *',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const capturedSessionIds: Array<string | undefined> = [];
+    mockRunContainerAgent.mockImplementation(
+      async (_group, input, _onProc, onOutput) => {
+        capturedSessionIds.push(input.sessionId);
+        await onOutput({
+          status: 'success',
+          result: 'ok',
+          newSessionId: 'sdk-session-A',
+        } as ContainerOutput);
+        return { status: 'success', result: 'ok' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    // First fire: no prior session, container gets undefined.
+    await vi.advanceTimersByTimeAsync(10);
+    expect(capturedSessionIds[0]).toBeUndefined();
+
+    // After first fire, the task row holds the new session id.
+    const afterFirst = getTaskById(TASK_ID);
+    expect(afterFirst?.session_id).toBe('sdk-session-A');
+
+    // Force a second due-time and fire again.
+    updateTask(TASK_ID, {
+      next_run: new Date(Date.now() - 1000).toISOString(),
+    });
+    await vi.advanceTimersByTimeAsync(60_000 + 10);
+
+    // Second fire: container receives the persisted id as `resume:`.
+    expect(capturedSessionIds[1]).toBe('sdk-session-A');
   });
 
   it('two sequential context_mode=group tasks get isolated last_result values (no cross-attribution)', async () => {

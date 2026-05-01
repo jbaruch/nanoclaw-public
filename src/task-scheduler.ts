@@ -21,9 +21,10 @@ import {
   logTaskRun,
   pruneCompletedTasks,
   resurrectZombieTasks,
-  setSession,
+  setTaskSessionId,
   updateTask,
 } from './db.js';
+import { SqliteError } from 'better-sqlite3';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -314,23 +315,26 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
-  // Scheduled tasks intentionally do NOT resume a prior SDK session, even for
-  // `context_mode: 'group'`. Session resume causes the SDK to replay the prior
-  // turn's final response as the first streamed output chunk of the new turn —
-  // the agent-runner converts that to an OUTPUT_START/END marker, which
-  // `runTask`'s streaming callback captures as the current task's `result` and
-  // writes to `last_result`. This is the cross-attribution bug: task B sees
-  // task A's output as its own. Always starting fresh avoids the replay.
+  // Per-task SDK session reuse (#59 / jbaruch#336). Recurring tasks
+  // (cron / interval) keep their OWN `session_id` per task row across
+  // fires so the API can cache the per-session message-history prefix
+  // even though the prompt-cache TTL (5 min) expires between
+  // heartbeat fires (15-30 min cadence). One-shot tasks
+  // (`schedule_type === 'once'`) stay fresh-per-fire.
   //
-  // `context_mode: 'group'` still stores the `newSessionId` returned by the
-  // container so the per-session `.claude/` transcript chain grows on disk —
-  // we just never pass an old id to `query()`. The write-back below keeps the
-  // chain for logging/introspection without enabling the replay.
-  //
-  // `context_mode: 'isolated'` never stored or resumed — no change.
-  const sessions = deps.getSessions();
-  // Never pass sessionId to the container (avoids SDK replay of prior turn).
-  const sessionId = undefined;
+  // The #193 cross-task bleed concern (where two distinct tasks
+  // shared `sessions[group][maintenance]` and bled `last_result`)
+  // does NOT apply: persistence here is keyed on `task_id`, so two
+  // distinct tasks land in two distinct rows hence two distinct SDK
+  // sessions — no slot-cache aliasing possible. The
+  // `MAINTENANCE_SESSION_NAME` slot still routes maintenance work
+  // into the parallel queue; the SDK session loaded inside that slot
+  // is now per-task. `context_mode` stays inert on the schema.
+  const isReusable = task.schedule_type !== 'once';
+  const sessionId: string | undefined = isReusable
+    ? (task.session_id ?? undefined)
+    : undefined;
+  let persistedSessionId: string | undefined = sessionId;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -442,20 +446,29 @@ async function runTask(
         );
       },
       async (streamedOutput: ContainerOutput) => {
-        // Persist the maintenance session's own sessionId so the NEXT
-        // scheduled task on this group can resume the same chain. Only
-        // for `context_mode: 'group'` tasks — an isolated task wants a
-        // fresh SDK session and its newSessionId would otherwise overwrite
-        // the slot and contaminate the next 'group' task's resume.
-        if (streamedOutput.newSessionId && task.context_mode === 'group') {
-          const groupSessions =
-            sessions[task.group_folder] ?? (sessions[task.group_folder] = {});
-          groupSessions[MAINTENANCE_SESSION_NAME] = streamedOutput.newSessionId;
-          setSession(
-            task.group_folder,
-            MAINTENANCE_SESSION_NAME,
-            streamedOutput.newSessionId,
-          );
+        // Per-task session reuse (#59): persist `newSessionId` for
+        // recurring tasks so the next fire can `resume:` it. The SDK
+        // can re-issue the id mid-run; last-write-wins — the LATEST
+        // id is the one whose JSONL is alive on disk. Once-tasks stay
+        // fresh-per-fire (out of scope). Catches only SqliteError so
+        // a transient DB hiccup degrades to "next fire starts fresh"
+        // instead of wedging the scheduler loop.
+        if (
+          streamedOutput.newSessionId &&
+          isReusable &&
+          streamedOutput.newSessionId !== persistedSessionId
+        ) {
+          const newId = streamedOutput.newSessionId;
+          try {
+            setTaskSessionId(task.id, newId);
+            persistedSessionId = newId;
+          } catch (dbErr) {
+            if (!(dbErr instanceof SqliteError)) throw dbErr;
+            logger.error(
+              { taskId: task.id, newSessionId: newId, err: dbErr },
+              '[task-scheduler] setTaskSessionId failed during streaming — next fire will start fresh',
+            );
+          }
         }
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -495,18 +508,26 @@ async function runTask(
 
     if (raced !== WATCHDOG_TIMEOUT) {
       const output = raced;
-      // Same write-back path for the terminal `output` (non-streaming case).
-      // Same `'group'`-only gate as the streaming path above — don't let an
-      // isolated task overwrite the maintenance slot's session chain.
-      if (output.newSessionId && task.context_mode === 'group') {
-        const groupSessions =
-          sessions[task.group_folder] ?? (sessions[task.group_folder] = {});
-        groupSessions[MAINTENANCE_SESSION_NAME] = output.newSessionId;
-        setSession(
-          task.group_folder,
-          MAINTENANCE_SESSION_NAME,
-          output.newSessionId,
-        );
+      // Terminal `newSessionId` — same per-task persistence as the
+      // streaming path. Catches only SqliteError; any other throw
+      // propagates to the outer try/catch and is logged as Task
+      // failed.
+      if (
+        output.newSessionId &&
+        isReusable &&
+        output.newSessionId !== persistedSessionId
+      ) {
+        const newId = output.newSessionId;
+        try {
+          setTaskSessionId(task.id, newId);
+          persistedSessionId = newId;
+        } catch (dbErr) {
+          if (!(dbErr instanceof SqliteError)) throw dbErr;
+          logger.error(
+            { taskId: task.id, newSessionId: newId, err: dbErr },
+            '[task-scheduler] setTaskSessionId failed at terminal — next fire will start fresh',
+          );
+        }
       }
 
       if (output.status === 'error') {

@@ -21,6 +21,8 @@ import {
   HOST_PROJECT_ROOT,
   HOST_UID,
   IDLE_TIMEOUT,
+  MAINTENANCE_RULE_BLOCKLIST,
+  MAINTENANCE_SKILL_BLOCKLIST,
   STORE_DIR,
   TILE_OWNER,
   TIMEZONE,
@@ -543,6 +545,18 @@ export const SECRET_FILES = [
 export const DEFAULT_SESSION_NAME = 'default';
 
 /**
+ * Canonical session name for scheduled work (heartbeat, nightly, weekly,
+ * reminders). `src/task-scheduler.ts` is the sole writer of this value;
+ * no inbound path ever reaches it. Defined here (not in `group-queue.ts`
+ * where it used to live) so the install-loop in `buildVolumeMounts`
+ * below can reference it directly without creating a
+ * `container-runner ↔ group-queue` import cycle (#337 review). The
+ * symbol is re-exported from `group-queue.ts` for callers that already
+ * import it from there — no other file needs to change.
+ */
+export const MAINTENANCE_SESSION_NAME = 'maintenance';
+
+/**
  * Per-session subdir name under `<DATA_DIR>/ipc/<folder>/` for the input
  * side of the IPC channel. Each session gets its own subdir so `_close`
  * sentinels and follow-up JSON messages written for one session never
@@ -806,6 +820,19 @@ export function buildVolumeMounts(
   // are equivalent (same installed tile version).
   const groupScriptsDir = path.join(groupDir, 'scripts');
   const rulesContent: string[] = [];
+
+  // #337 maintenance blocklist. Default-class spawns see no filter; the
+  // sets are gated behind sessionName === MAINTENANCE_SESSION_NAME so any
+  // misconfiguration on the default-session path is a no-op. Declared at
+  // function scope so the tile-install loop, the built-in skills copy,
+  // and the staging skills copy all apply the same filter and the
+  // single emitted log line aggregates filtered names across all three.
+  const isMaintenance = sessionName === MAINTENANCE_SESSION_NAME;
+  const ruleBlocklist = isMaintenance ? MAINTENANCE_RULE_BLOCKLIST : null;
+  const skillBlocklist = isMaintenance ? MAINTENANCE_SKILL_BLOCKLIST : null;
+  const filteredRules: string[] = [];
+  const filteredSkills: string[] = [];
+
   // Registry-availability guard: if not a single tile in `tilesToInstall`
   // actually exists under `registryTiles`, skip the whole build-and-swap.
   // Otherwise the tmpdir + atomic flip would publish an EMPTY scripts/
@@ -845,6 +872,10 @@ export function buildVolumeMounts(
       if (fs.existsSync(rulesDir)) {
         for (const ruleFile of fs.readdirSync(rulesDir)) {
           if (!ruleFile.endsWith('.md')) continue;
+          if (ruleBlocklist?.has(ruleFile)) {
+            filteredRules.push(`${tileName}/${ruleFile}`);
+            continue;
+          }
           const ruleSrcFile = path.join(rulesDir, ruleFile);
           const ruleDst = path.join(dstTileDir, 'rules', ruleFile);
           fs.mkdirSync(path.dirname(ruleDst), { recursive: true });
@@ -859,6 +890,10 @@ export function buildVolumeMounts(
         for (const skillDir of fs.readdirSync(tileSkillsDir)) {
           const skillSrcDir = path.join(tileSkillsDir, skillDir);
           if (!fs.statSync(skillSrcDir).isDirectory()) continue;
+          if (skillBlocklist?.has(skillDir)) {
+            filteredSkills.push(`${tileName}/${skillDir}`);
+            continue;
+          }
           fs.cpSync(skillSrcDir, path.join(dstTileDir, 'skills', skillDir), {
             recursive: true,
           });
@@ -1038,6 +1073,12 @@ export function buildVolumeMounts(
       if (!isTrustedContainer && trustedOnlySkills.has(skillDir)) continue;
       const srcDir = path.join(builtinSkillsDir, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
+      // #337 maintenance blocklist applies to built-in skills too. Listing
+      // by bare name (no `tessl__` prefix) covers both surface forms.
+      if (skillBlocklist?.has(skillDir)) {
+        filteredSkills.push(`builtin/${skillDir}`);
+        continue;
+      }
       fs.cpSync(srcDir, path.join(skillsDst, skillDir), { recursive: true });
     }
   }
@@ -1055,6 +1096,11 @@ export function buildVolumeMounts(
         'Staging skills override tile skills — run verify-tiles to clear',
       );
       for (const skillDir of stagingSkills) {
+        // #337 maintenance blocklist applies to staging skills too.
+        if (skillBlocklist?.has(skillDir)) {
+          filteredSkills.push(`staging/${skillDir}`);
+          continue;
+        }
         fs.cpSync(
           path.join(groupSkillsDir, skillDir),
           path.join(skillsDst, skillDir),
@@ -1062,6 +1108,21 @@ export function buildVolumeMounts(
         );
       }
     }
+  }
+
+  // #337 single aggregated emission across all three install sections
+  // (tile rules + tile skills + built-in skills + staging skills). One
+  // log line per spawn — empty filter list = silence.
+  if (filteredRules.length > 0 || filteredSkills.length > 0) {
+    logger.info(
+      {
+        group: group.folder,
+        sessionName,
+        filteredRules,
+        filteredSkills,
+      },
+      'install_blocklist_filtered',
+    );
   }
   // Chown the .claude session dir so the container user (node) can write to it.
   // The SDK creates subdirs like session-env/ at runtime — without this, EACCES.

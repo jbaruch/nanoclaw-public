@@ -23,6 +23,8 @@ vi.mock('./config.js', () => ({
   IDLE_TIMEOUT: 1800000, // 30min
   TILE_OWNER: 'test',
   TIMEZONE: 'America/Los_Angeles',
+  MAINTENANCE_RULE_BLOCKLIST: new Set<string>(),
+  MAINTENANCE_SKILL_BLOCKLIST: new Set<string>(),
 }));
 
 // Mock better-sqlite3 (used by createFilteredDb)

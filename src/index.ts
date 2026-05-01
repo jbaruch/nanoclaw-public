@@ -37,6 +37,7 @@ import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
+  clearTaskSessionIdsForGroup,
   deleteAllSessions,
   deleteSession,
   deleteSessionName,
@@ -1163,6 +1164,20 @@ async function main(): Promise<void> {
             : MAINTENANCE_SESSION_NAME;
         if (sessions[groupFolder]) delete sessions[groupFolder][sessionName];
         deleteSessionName(groupFolder, sessionName);
+      }
+      // Clear per-task session_ids when the maintenance slot was wiped
+      // (#59). Without this, recurring tasks would `resume:` ids whose
+      // JSONL is gone and the SDK would 404 / start fresh anyway, just
+      // noisily. Default-only nukes leave scheduled-task sessions
+      // alone (they live on the maintenance slot).
+      if (session === 'maintenance' || session === 'all') {
+        const cleared = clearTaskSessionIdsForGroup(groupFolder);
+        if (cleared > 0) {
+          logger.info(
+            { groupFolder, count: cleared },
+            'Cleared per-task session_ids — next fire of each starts fresh (#59)',
+          );
+        }
       }
       logger.info({ groupFolder, session }, 'Session nuked via IPC');
     },

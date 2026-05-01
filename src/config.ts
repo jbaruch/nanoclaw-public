@@ -13,6 +13,8 @@ const envConfig = readEnvFile([
   'TZ',
   'TELEGRAM_BOT_POOL',
   'TILE_OWNER',
+  'MAINTENANCE_RULE_BLOCKLIST',
+  'MAINTENANCE_SKILL_BLOCKLIST',
 ]);
 
 export const ASSISTANT_NAME =
@@ -182,3 +184,46 @@ function resolveAgentAutoCompactWindow(): number {
   return parsed;
 }
 export const AGENT_AUTO_COMPACT_WINDOW = resolveAgentAutoCompactWindow();
+
+// --- Maintenance-class spawn blocklists (#337) ---
+//
+// At spawn time the orchestrator copies every installed tile's rules and
+// skills into the container's `.tessl/` and `skills/` dirs (see
+// `src/container-runner.ts` install loop). For non-conversational task
+// classes the bulk of that content is dead weight that still pays full
+// `cache_create` cost on the first turn of every fresh maintenance
+// session. These blocklists let the orchestrator skip irrelevant items
+// when the spawn's `sessionName === 'maintenance'`. Empty / unset =
+// no filter (the regression-safe default).
+//
+// Format: comma-separated names. Whitespace and empty entries trimmed.
+//   MAINTENANCE_RULE_BLOCKLIST  — rule filenames as they appear in
+//     `tiles/<owner>/<tile>/rules/`, e.g. "skill-authoring.md,plugin-evals.md".
+//   MAINTENANCE_SKILL_BLOCKLIST — skill directory names as they appear
+//     in `tiles/<owner>/<tile>/skills/` and `container/skills/`, e.g.
+//     "agent-browser,channel-formatting". The `tessl__` prefix added at
+//     copy-into-container time is NOT part of the blocklist key — list
+//     the bare directory name.
+//
+// Inbound user messages route to `'default'` and bypass the filter
+// entirely; only the maintenance slot (heartbeat, nightly, weekly,
+// reminders) sees a slimmed prompt.
+function parseBlocklist(raw: string | undefined): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+}
+
+export const MAINTENANCE_RULE_BLOCKLIST = parseBlocklist(
+  process.env.MAINTENANCE_RULE_BLOCKLIST ||
+    envConfig.MAINTENANCE_RULE_BLOCKLIST,
+);
+
+export const MAINTENANCE_SKILL_BLOCKLIST = parseBlocklist(
+  process.env.MAINTENANCE_SKILL_BLOCKLIST ||
+    envConfig.MAINTENANCE_SKILL_BLOCKLIST,
+);
