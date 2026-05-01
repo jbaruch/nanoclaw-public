@@ -32,6 +32,18 @@ services:
       - CREDENTIAL_PROXY_HOST=0.0.0.0
       - TZ=America/Chicago
       - NODE_ENV=production
+      # Agent-image override (#69 review): src/config.ts reads
+      # process.env.CONTAINER_IMAGE to decide which image to spawn
+      # agent containers from; scripts/deploy.sh reads the same env
+      # var to decide which image to rebuild locally. Both must come
+      # from the SAME source or the script's "we rebuild what the
+      # orchestrator spawns" promise breaks. Pass through here so an
+      # operator who exports CONTAINER_IMAGE in their shell (or sets
+      # it in `.env`, which Compose reads directly without needing a
+      # shell-export) gets a consistent override across the script and
+      # the orchestrator. scripts/deploy.sh has matching .env-parsing
+      # logic (data-only, no source) so both reach the same value.
+      - CONTAINER_IMAGE=${CONTAINER_IMAGE:-nanoclaw-agent:latest}
     ports:
       # Credential proxy — agent containers reach it via host.docker.internal:3001
       - "3001:3001"
