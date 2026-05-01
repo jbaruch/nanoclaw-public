@@ -650,6 +650,13 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For set_agent_model: target group folder + the override value.
+    // `agentModel: null` clears the override; a string sets it. Validation
+    // (prefix regex, fallback) happens at spawn time in container-runner,
+    // not here — keeps the IPC handler permissive so the operator can
+    // store an experimental model name and discover at spawn time whether
+    // the SDK accepts it.
+    agentModel?: string | null;
     // For host operations / github_backup / promote_staging
     requestId?: string;
     message?: string;
@@ -1025,6 +1032,94 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'set_agent_model': {
+      // Per-group AGENT_MODEL override. Only main can change models for
+      // arbitrary groups; non-main can only set its own. The handler
+      // mutates ONLY `containerConfig.agentModel`, preserving all other
+      // ContainerConfig fields (additionalMounts, timeout, trusted, etc.)
+      // so an operator setting agentModel can't accidentally clobber the
+      // group's mount allowlist or trust flag.
+      if (!data.groupFolder) {
+        logger.warn(
+          { sourceGroup },
+          'Invalid set_agent_model request - missing groupFolder',
+        );
+        break;
+      }
+      // `agentModel` may be `null` (clear), `undefined` (no-op-ish but
+      // treated the same as clear for predictability), or a string. Any
+      // other type → reject.
+      if (
+        data.agentModel !== null &&
+        data.agentModel !== undefined &&
+        typeof data.agentModel !== 'string'
+      ) {
+        logger.warn(
+          { sourceGroup, agentModelType: typeof data.agentModel },
+          'Invalid set_agent_model request - agentModel must be string or null',
+        );
+        break;
+      }
+      const targetFolder = data.groupFolder;
+      if (!isMain && targetFolder !== sourceGroup) {
+        logger.warn(
+          { sourceGroup, targetFolder },
+          'Unauthorized set_agent_model attempt blocked',
+        );
+        break;
+      }
+      // Find the registered group by folder.
+      const targetEntry = Object.entries(registeredGroups).find(
+        ([, g]) => g.folder === targetFolder,
+      );
+      if (!targetEntry) {
+        logger.warn(
+          { sourceGroup, targetFolder },
+          'set_agent_model: target group not registered',
+        );
+        break;
+      }
+      const [targetJid, targetGroup] = targetEntry;
+      // Build the new containerConfig, preserving every existing field
+      // and ONLY touching agentModel. If the resulting config is empty
+      // (no fields set), persist undefined so the column lands as NULL
+      // rather than `{}`.
+      const prevConfig = targetGroup.containerConfig ?? {};
+      const nextConfig: NonNullable<RegisteredGroup['containerConfig']> = {
+        ...prevConfig,
+      };
+      if (data.agentModel === null || data.agentModel === undefined) {
+        delete nextConfig.agentModel;
+      } else {
+        nextConfig.agentModel = data.agentModel;
+      }
+      const hasAnyField = Object.keys(nextConfig).length > 0;
+      const updated: RegisteredGroup = {
+        ...targetGroup,
+        containerConfig: hasAnyField ? nextConfig : undefined,
+      };
+      deps.registerGroup(targetJid, updated);
+      logger.info(
+        {
+          sourceGroup,
+          targetFolder,
+          agentModel: data.agentModel ?? null,
+        },
+        data.agentModel
+          ? 'Per-group AGENT_MODEL override set via IPC'
+          : 'Per-group AGENT_MODEL override cleared via IPC',
+      );
+      // Refresh snapshot so the new config is visible to peers
+      const availableGroups = deps.getAvailableGroups();
+      deps.writeGroupsSnapshot(
+        sourceGroup,
+        isMain,
+        availableGroups,
+        new Set(Object.keys(registeredGroups)),
+      );
+      break;
+    }
 
     case 'nuke_session':
       if (data.groupFolder) {

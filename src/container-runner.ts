@@ -303,6 +303,40 @@ export function resolveAgentModel(raw: string | undefined): string {
 const AGENT_MODEL = resolveAgentModel(process.env.AGENT_MODEL);
 
 /**
+ * Resolve the per-group AGENT_MODEL override against the global default.
+ *
+ * Stricter than the orchestrator-level `resolveAgentModel`: the global
+ * resolver passes through unknown-prefix values with a warn (so a typo
+ * still ships, surfaced loudly), but a per-group override with a typo
+ * shouldn't degrade ONE group's container with an invalid model — it
+ * should fall back to the verified global model. So:
+ *
+ *   - undefined / null / empty / whitespace-only → use global (no warn,
+ *     it just means "no override set")
+ *   - prefix-matches the known regex → use the trimmed override
+ *   - non-empty but unknown prefix → warn and fall back to global
+ *
+ * The validator does NOT crash the spawn — a bad config in
+ * `container_config.agentModel` should never block the agent from running.
+ */
+export function resolvePerGroupAgentModel(
+  override: string | undefined,
+  globalDefault: string,
+  groupFolder: string,
+): string {
+  const trimmed = override?.trim();
+  if (!trimmed) return globalDefault;
+  if (!KNOWN_MODEL_PREFIX_RE.test(trimmed)) {
+    logger.warn(
+      { agentModel: trimmed, groupFolder, globalDefault },
+      'Per-group AGENT_MODEL override does not look like a Claude model ID — falling back to global default. Expected forms: full ID like "claude-opus-4-7[1m]" or alias like "opus" / "sonnet[1m]".',
+    );
+    return globalDefault;
+  }
+  return trimmed;
+}
+
+/**
  * Effort level the agent-runner passes to the SDK's `query()` call.
  * Forwarded as `AGENT_EFFORT` on container spawn.
  *
@@ -1632,7 +1666,27 @@ function buildContainerArgs(
   // — see constants at the top of this file. Keeping these on the env
   // (not baked into the agent image) lets model bumps / effort retuning
   // ship with an orchestrator rebuild only.
-  args.push('-e', `AGENT_MODEL=${AGENT_MODEL}`);
+  //
+  // Per-group override: `containerConfig.agentModel` lets one group run a
+  // cheaper or stronger model than the global default (e.g. Haiku for noisy
+  // chats, Sonnet/Opus for engineering work). Invalid override → warn and
+  // fall back to global; never crashes the spawn. See `resolvePerGroupAgentModel`.
+  const effectiveAgentModel = resolvePerGroupAgentModel(
+    group.containerConfig?.agentModel,
+    AGENT_MODEL,
+    group.folder,
+  );
+  if (effectiveAgentModel !== AGENT_MODEL) {
+    logger.info(
+      {
+        groupFolder: group.folder,
+        agentModel: effectiveAgentModel,
+        globalDefault: AGENT_MODEL,
+      },
+      'Per-group AGENT_MODEL override active',
+    );
+  }
+  args.push('-e', `AGENT_MODEL=${effectiveAgentModel}`);
   args.push('-e', `AGENT_EFFORT=${AGENT_EFFORT}`);
 
   // SDK auto-compact working window (issue #29). Forwarded unconditionally:

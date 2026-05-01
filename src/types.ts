@@ -31,6 +31,21 @@ export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
   trusted?: boolean; // Trusted groups get limited credentials (e.g. voice transcription)
+  /**
+   * Override the global AGENT_MODEL env var for this group. Pass-through to
+   * agent-runner via env. Validated against the same prefix regex as the
+   * global resolver (`resolveAgentModel`) — invalid value (or empty string)
+   * falls back to the global default with a warn log so the container still
+   * spawns instead of refusing to run on a per-group typo.
+   *
+   * Examples: `"haiku"`, `"sonnet"`, `"claude-haiku-4-5-20251001"`,
+   * `"claude-sonnet-4-6[1m]"`.
+   *
+   * Use case: cheap noisy chats (`telegram_old-wtf`) on Haiku, high-value
+   * engineering work (`telegram_main`) on Sonnet/Opus — projected ~$10-20/day
+   * savings versus uniform Sonnet/Opus across all groups.
+   */
+  agentModel?: string;
 }
 
 export interface RegisteredGroup {

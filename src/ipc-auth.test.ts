@@ -371,6 +371,134 @@ describe('register_group authorization', () => {
   });
 });
 
+// --- set_agent_model authorization + behavior ---
+
+describe('set_agent_model', () => {
+  it('main group can set the override on another group', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_agent_model',
+        groupFolder: 'other-group',
+        agentModel: 'haiku',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    const persisted = getRegisteredGroup('other@g.us');
+    expect(persisted?.containerConfig?.agentModel).toBe('haiku');
+  });
+
+  it('non-main group can set the override on itself', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_agent_model',
+        groupFolder: 'other-group',
+        agentModel: 'haiku',
+      },
+      'other-group',
+      false,
+      deps,
+    );
+
+    const persisted = getRegisteredGroup('other@g.us');
+    expect(persisted?.containerConfig?.agentModel).toBe('haiku');
+  });
+
+  it('non-main group cannot set the override on another group', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_agent_model',
+        groupFolder: 'third-group',
+        agentModel: 'haiku',
+      },
+      'other-group',
+      false,
+      deps,
+    );
+
+    const persisted = getRegisteredGroup('third@g.us');
+    expect(persisted?.containerConfig?.agentModel).toBeUndefined();
+  });
+
+  it('clearing the override (agentModel=null) leaves other containerConfig fields intact', async () => {
+    // Pre-populate the group with a richer containerConfig — the new
+    // tool MUST NOT clobber additionalMounts/timeout/trusted when only
+    // agentModel is being touched.
+    setRegisteredGroup('other@g.us', {
+      ...OTHER_GROUP,
+      containerConfig: {
+        agentModel: 'haiku',
+        timeout: 600000,
+        trusted: true,
+        additionalMounts: [{ hostPath: '/tmp/foo', readonly: true }],
+      },
+    });
+    groups['other@g.us'] = getRegisteredGroup('other@g.us')!;
+
+    await processTaskIpc(
+      {
+        type: 'set_agent_model',
+        groupFolder: 'other-group',
+        agentModel: null,
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    const persisted = getRegisteredGroup('other@g.us');
+    expect(persisted?.containerConfig?.agentModel).toBeUndefined();
+    expect(persisted?.containerConfig?.timeout).toBe(600000);
+    expect(persisted?.containerConfig?.trusted).toBe(true);
+    expect(persisted?.containerConfig?.additionalMounts).toEqual([
+      { hostPath: '/tmp/foo', readonly: true },
+    ]);
+  });
+
+  it('setting the override preserves existing containerConfig fields', async () => {
+    setRegisteredGroup('other@g.us', {
+      ...OTHER_GROUP,
+      containerConfig: {
+        timeout: 600000,
+        trusted: true,
+      },
+    });
+    groups['other@g.us'] = getRegisteredGroup('other@g.us')!;
+
+    await processTaskIpc(
+      {
+        type: 'set_agent_model',
+        groupFolder: 'other-group',
+        agentModel: 'sonnet[1m]',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    const persisted = getRegisteredGroup('other@g.us');
+    expect(persisted?.containerConfig?.agentModel).toBe('sonnet[1m]');
+    expect(persisted?.containerConfig?.timeout).toBe(600000);
+    expect(persisted?.containerConfig?.trusted).toBe(true);
+  });
+
+  it('rejects request missing groupFolder', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_agent_model',
+        agentModel: 'haiku',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    // Nothing changed
+    expect(getRegisteredGroup('other@g.us')?.containerConfig).toBeUndefined();
+  });
+});
+
 // --- refresh_groups authorization ---
 
 describe('refresh_groups authorization', () => {

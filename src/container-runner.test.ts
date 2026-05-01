@@ -152,6 +152,7 @@ import {
   ContainerOutput,
   selectTiles,
   resolveAgentModel,
+  resolvePerGroupAgentModel,
 } from './container-runner.js';
 import { logger } from './logger.js';
 import type { RegisteredGroup } from './types.js';
@@ -651,6 +652,184 @@ describe('resolveAgentModel', () => {
     );
     expect(resolveAgentModel('\topus\n')).toBe('opus');
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+// ----------------------------------------------------------------------
+// resolvePerGroupAgentModel — per-group override of AGENT_MODEL.
+// Stricter than the global resolver: invalid prefix falls back to the
+// global default rather than passing through with a warn. This protects
+// against a single group's typo silently routing traffic to a bogus
+// model when the rest of the orchestrator is fine.
+// ----------------------------------------------------------------------
+
+describe('resolvePerGroupAgentModel', () => {
+  const GLOBAL = 'claude-sonnet-4-6[1m]';
+
+  beforeEach(() => {
+    vi.mocked(logger.warn).mockClear();
+  });
+
+  it('returns global default when override is undefined (no warn)', () => {
+    expect(resolvePerGroupAgentModel(undefined, GLOBAL, 'g')).toBe(GLOBAL);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('returns global default when override is empty string (no warn)', () => {
+    expect(resolvePerGroupAgentModel('', GLOBAL, 'g')).toBe(GLOBAL);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('returns global default when override is whitespace-only (no warn)', () => {
+    expect(resolvePerGroupAgentModel('  \t\n ', GLOBAL, 'g')).toBe(GLOBAL);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('uses the override when prefix matches a known model family', () => {
+    expect(resolvePerGroupAgentModel('haiku', GLOBAL, 'g')).toBe('haiku');
+    expect(
+      resolvePerGroupAgentModel('claude-haiku-4-5-20251001', GLOBAL, 'g'),
+    ).toBe('claude-haiku-4-5-20251001');
+    expect(resolvePerGroupAgentModel('opus', GLOBAL, 'g')).toBe('opus');
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('trims surrounding whitespace before validation and pass-through', () => {
+    expect(resolvePerGroupAgentModel('  haiku  ', GLOBAL, 'g')).toBe('haiku');
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('falls back to global default with a warn on unknown-prefix override', () => {
+    // The global resolver passes through unknown prefixes with a warn so
+    // the orchestrator still ships even on a typo. The per-group override
+    // is the opposite: we'd rather the operator's group keeps running on
+    // the verified default than degrade silently to a bogus model.
+    expect(resolvePerGroupAgentModel('garbage', GLOBAL, 'old-wtf')).toBe(
+      GLOBAL,
+    );
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(logger.warn).mock.calls[0][1]).toContain(
+      'Per-group AGENT_MODEL override does not look like a Claude model ID',
+    );
+  });
+});
+
+// ----------------------------------------------------------------------
+// runContainerAgent — per-group AGENT_MODEL spawn-arg forwarding.
+// These guard against either a regression of the global default (when
+// no override is set) or a regression where the override fails to land
+// on the spawn args.
+// ----------------------------------------------------------------------
+
+describe('runContainerAgent per-group AGENT_MODEL', () => {
+  const DEFAULT_GLOBAL = 'claude-sonnet-4-6[1m]';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+    vi.mocked(logger.info).mockClear();
+    vi.mocked(logger.warn).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('uses the global default AGENT_MODEL when containerConfig.agentModel is unset', async () => {
+    const promise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    expect(args).toContain(`AGENT_MODEL=${DEFAULT_GLOBAL}`);
+    // No "override active" log line on the no-override path.
+    const infoCalls = vi.mocked(logger.info).mock.calls;
+    expect(
+      infoCalls.some((c) =>
+        String(c[1] ?? '').includes('Per-group AGENT_MODEL override active'),
+      ),
+    ).toBe(false);
+  });
+
+  it('uses the per-group override when containerConfig.agentModel is set to a valid model', async () => {
+    const groupWithOverride: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { agentModel: 'haiku' },
+    };
+    const promise = runContainerAgent(groupWithOverride, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    expect(args).toContain('AGENT_MODEL=haiku');
+    // Spawn args MUST NOT contain the global default in addition to the
+    // override — the override replaces, not appends.
+    expect(args).not.toContain(`AGENT_MODEL=${DEFAULT_GLOBAL}`);
+    // And the operator-visible info log fires so the override is visible
+    // in deploy logs.
+    const infoCalls = vi.mocked(logger.info).mock.calls;
+    expect(
+      infoCalls.some((c) =>
+        String(c[1] ?? '').includes('Per-group AGENT_MODEL override active'),
+      ),
+    ).toBe(true);
+  });
+
+  it('falls back to the global default when the override has an unknown prefix', async () => {
+    const groupWithBadOverride: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { agentModel: 'garbage-model' },
+    };
+    const promise = runContainerAgent(
+      groupWithBadOverride,
+      testInput,
+      () => {},
+    );
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    expect(args).toContain(`AGENT_MODEL=${DEFAULT_GLOBAL}`);
+    expect(args).not.toContain('AGENT_MODEL=garbage-model');
+    // The validator must have logged a warn so the operator knows the
+    // override was rejected.
+    const warnCalls = vi.mocked(logger.warn).mock.calls;
+    expect(
+      warnCalls.some((c) =>
+        String(c[1] ?? '').includes(
+          'Per-group AGENT_MODEL override does not look like a Claude model ID',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('falls back to the global default when the override is an empty string', async () => {
+    const groupWithEmptyOverride: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { agentModel: '' },
+    };
+    const promise = runContainerAgent(
+      groupWithEmptyOverride,
+      testInput,
+      () => {},
+    );
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await promise;
+
+    const args = vi.mocked(spawn).mock.calls[0]![1] as string[];
+    expect(args).toContain(`AGENT_MODEL=${DEFAULT_GLOBAL}`);
+    // Empty string is "no override", so no warn (treat as undefined).
+    const warnCalls = vi.mocked(logger.warn).mock.calls;
+    expect(
+      warnCalls.some((c) =>
+        String(c[1] ?? '').includes('Per-group AGENT_MODEL override'),
+      ),
+    ).toBe(false);
   });
 });
 
