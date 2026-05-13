@@ -146,6 +146,7 @@ async function walkThroughAppCreation(): Promise<'continue' | 'back'> {
       '     • chat:write',
       '     • users:read',
       '     • reactions:write',
+      '     • files:read, files:write',
       '  3. App Home → enable "Messages Tab" and "Allow users to send',
       '     slash commands and messages from the messages tab"',
       '  4. Basic Information → copy the "Signing Secret"',
