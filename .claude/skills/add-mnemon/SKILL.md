@@ -90,8 +90,9 @@ docker run --rm --entrypoint mnemon nanoclaw-agent:latest --version
 ### Restart the service
 
 ```bash
-systemctl --user restart nanoclaw          # Linux
-# launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
+source setup/lib/install-slug.sh
+systemctl --user restart $(systemd_unit)              # Linux
+# launchctl kickstart -k gui/$(id -u)/$(launchd_label)   # macOS
 ```
 
 ### Confirm mnemon hooks are registered

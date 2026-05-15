@@ -173,7 +173,8 @@ Expected: Both operations succeed.
 
 ```bash
 pnpm run build
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+source setup/lib/install-slug.sh
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)
 ```
 
 Send a message via WhatsApp and verify the agent responds.

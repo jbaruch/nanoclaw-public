@@ -123,8 +123,9 @@ OLLAMA_HOST=http://your-ollama-host:11434
 ### Restart the service
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
-# Linux: systemctl --user restart nanoclaw
+source setup/lib/install-slug.sh
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)  # macOS
+systemctl --user restart $(systemd_unit)              # Linux
 ```
 
 ## Phase 4: Verify

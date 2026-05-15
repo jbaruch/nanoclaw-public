@@ -92,11 +92,12 @@ Always tell the user:
 ```bash
 # Rebuild and restart
 pnpm run build
+source setup/lib/install-slug.sh
 # macOS:
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
+launchctl unload ~/Library/LaunchAgents/$(launchd_label).plist
+launchctl load ~/Library/LaunchAgents/$(launchd_label).plist
 # Linux:
-# systemctl --user restart nanoclaw
+# systemctl --user restart $(systemd_unit)
 ```
 
 ## Example Interaction

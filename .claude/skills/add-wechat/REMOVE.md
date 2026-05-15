@@ -43,7 +43,8 @@ DELETE FROM messaging_groups WHERE channel_type = 'wechat';
 
 ```bash
 pnpm run build
-systemctl --user restart nanoclaw   # Linux
+source setup/lib/install-slug.sh
+systemctl --user restart $(systemd_unit)              # Linux
 # or
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)  # macOS
 ```
