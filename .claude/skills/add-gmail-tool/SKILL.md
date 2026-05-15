@@ -192,8 +192,14 @@ Run from your NanoClaw project root (where `data/v2.db` lives). The `$[#]` place
 
 ```bash
 pnpm run build
-systemctl --user restart nanoclaw  # Linux
-# launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
+```
+
+Run from your NanoClaw project root:
+
+```bash
+source setup/lib/install-slug.sh
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)  # macOS
+systemctl --user restart $(systemd_unit)              # Linux
 ```
 
 ## Phase 5: Verify
@@ -235,7 +241,7 @@ Common signals:
      WHERE agent_group_id = '<group-id>';"
    ```
 3. Remove the `GMAIL_MCP_VERSION` ARG and the `pnpm install -g @gongrzhe/server-gmail-autoauth-mcp` block from `container/Dockerfile`.
-4. `pnpm run build && ./container/build.sh && systemctl --user restart nanoclaw`.
+4. `pnpm run build && ./container/build.sh && systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"`.
 5. (Optional) `rm -rf ~/.gmail-mcp/` if no other host-side tool needs the stubs.
 6. (Optional) Disconnect Gmail in OneCLI: `onecli apps disconnect --provider gmail`.
 

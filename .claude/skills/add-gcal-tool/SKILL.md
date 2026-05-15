@@ -175,8 +175,14 @@ Run from your NanoClaw project root (where `data/v2.db` lives). The `$[#]` place
 
 ```bash
 pnpm run build
-systemctl --user restart nanoclaw   # Linux
-# launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
+```
+
+Run from your NanoClaw project root:
+
+```bash
+source setup/lib/install-slug.sh
+launchctl kickstart -k gui/$(id -u)/$(launchd_label)  # macOS
+systemctl --user restart $(systemd_unit)              # Linux
 ```
 
 Kill any existing agent containers so they respawn with the new mcpServers config:
@@ -220,7 +226,7 @@ Common signals:
      WHERE agent_group_id = '<group-id>';"
    ```
 3. Remove `CALENDAR_MCP_VERSION` ARG and the calendar package from the Dockerfile install block.
-4. `pnpm run build && ./container/build.sh && systemctl --user restart nanoclaw`.
+4. `pnpm run build && ./container/build.sh && systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"`.
 5. Optional: `rm -rf ~/.calendar-mcp/` and `onecli apps disconnect --provider google-calendar`.
 
 No `TOOL_ALLOWLIST` removal step — Phase 2 no longer edits it.
